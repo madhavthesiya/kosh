@@ -697,20 +697,24 @@ TEST(test_aof_rewrite_compaction) {
 }
 
 #ifndef _WIN32
-// Runs `fn` with files limited to `bytes`: writes past that fail with EFBIG,
-// as on a full disk. (SIGXFSZ, which would kill the process, is ignored.)
-template<typename Fn>
-void withFileSizeLimit(rlim_t bytes, Fn fn) {
-    auto old_handler = std::signal(SIGXFSZ, SIG_IGN);
+// While it exists, files are limited to `bytes`: writes past that fail with
+// EFBIG, as on a full disk. (SIGXFSZ, which would kill the process, is
+// ignored.) The destructor restores both, even when an assertion throws.
+struct FileSizeLimit {
+    explicit FileSizeLimit(rlim_t bytes) {
+        old_handler = std::signal(SIGXFSZ, SIG_IGN);
+        getrlimit(RLIMIT_FSIZE, &old_limit);
+        rlimit limit = old_limit;
+        limit.rlim_cur = bytes;
+        setrlimit(RLIMIT_FSIZE, &limit);
+    }
+    ~FileSizeLimit() {
+        setrlimit(RLIMIT_FSIZE, &old_limit);
+        std::signal(SIGXFSZ, old_handler);
+    }
+    void (*old_handler)(int);
     rlimit old_limit;
-    getrlimit(RLIMIT_FSIZE, &old_limit);
-    rlimit limit = old_limit;
-    limit.rlim_cur = bytes;
-    setrlimit(RLIMIT_FSIZE, &limit);
-    fn();
-    setrlimit(RLIMIT_FSIZE, &old_limit);
-    std::signal(SIGXFSZ, old_handler);
-}
+};
 #endif
 
 TEST(test_aof_rewrite_failure_keeps_old_file) {
@@ -727,7 +731,10 @@ TEST(test_aof_rewrite_failure_keeps_old_file) {
     const std::string before = aof.readRaw();      // about 26 KB
 
     std::string reply;
-    withFileSizeLimit(4096, [&] { reply = executeCommand(ctx, {"BGREWRITEAOF"}); });
+    {
+        FileSizeLimit limit(4096);
+        reply = executeCommand(ctx, {"BGREWRITEAOF"});
+    }
     ASSERT_EQ(reply, "-ERR AOF rewrite failed: cannot write " + aof_file + ".tmp: File too large\r\n");
     ASSERT_TRUE(aof.readRaw() == before);
     ASSERT_FALSE(std::ifstream(aof_file + ".tmp").good());    // the partial file is gone
@@ -736,6 +743,66 @@ TEST(test_aof_rewrite_failure_keeps_old_file) {
     InMemoryStorage replayed(1000, &aof);
     replayAOF(replayed, aof);
     ASSERT_EQ(replayed.dumpState().size(), (size_t)201);
+    std::remove(aof_file.c_str());
+#endif
+}
+
+TEST(test_aof_failed_writes_wait_and_are_retried) {
+#ifndef _WIN32
+    // A failed write used to be ignored: its record was missing from the AOF
+    // for good. Now what it didn't write waits, later records queue behind it
+    // in order, and all of it reaches the file once there is room.
+    const std::string aof_file = "test_aof_write_error.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    const std::string record = RespParser::array({"SET", "k", std::string(100, 'v')});
+    std::string expected;
+    {
+        FileSizeLimit limit(1000);
+        while(aof.log(record)) expected += record;
+        expected += record;                         // partly written, the rest waiting
+        ASSERT_EQ(aof.readRaw().size(), (size_t)1000);
+        ASSERT_FALSE(aof.flushPending());
+        ASSERT_EQ(aof.lastWriteError(), "File too large");
+        ASSERT_FALSE(aof.log(record));              // waits behind it
+        expected += record;
+    }
+    ASSERT_TRUE(aof.flushPending());                // room again: everything is written
+    ASSERT_EQ(aof.lastWriteError(), "");
+    ASSERT_TRUE(aof.readRaw() == expected);
+    ASSERT_TRUE(aof.log(record));
+    std::remove(aof_file.c_str());
+#endif
+}
+
+TEST(test_aof_rewrite_replaces_failed_writes) {
+#ifndef _WIN32
+    // What a failed write left waiting belongs at the end of the old file. A
+    // rewrite replaces that file with one holding all the data, so it must be
+    // dropped: written after the new file's last record it would be garbage.
+    const std::string aof_file = "test_aof_rewrite_pending.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(100, &aof);
+        s.set("a", "1");
+        {
+            FileSizeLimit limit(aof.readRaw().size() + 10);
+            s.set("b", std::string(100, 'v'));      // 10 bytes written, the rest waiting
+            ASSERT_FALSE(aof.flushPending());
+        }
+        ASSERT_TRUE(aof.rewrite(s.dumpState()));
+        ASSERT_TRUE(aof.flushPending());            // nothing waits any more
+        s.set("c", "3");
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(100, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.truncated_bytes, (size_t)0);
+        ASSERT_EQ(s.dumpState().size(), (size_t)3);
+    }
     std::remove(aof_file.c_str());
 #endif
 }
@@ -1619,6 +1686,8 @@ int main() {
     RUN_TEST(test_aof_all_types);
     RUN_TEST(test_aof_rewrite_compaction);
     RUN_TEST(test_aof_rewrite_failure_keeps_old_file);
+    RUN_TEST(test_aof_failed_writes_wait_and_are_retried);
+    RUN_TEST(test_aof_rewrite_replaces_failed_writes);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
     RUN_TEST(test_aof_logs_absolute_expiry_times);

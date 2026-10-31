@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -35,7 +36,21 @@ public:
     // No trailing \n is added — RESP already has its own terminators (\r\n).
     // Each call is one write() to the OS: the data survives a process crash,
     // but without fsync a power cut can still lose recent writes.
-    void log(const std::string& data);
+    //
+    // If the write fails (a full disk), the bytes it didn't write wait in
+    // memory, and later calls append after them, so nothing is lost or
+    // reordered; they are written as soon as the file takes them. Returns false
+    // while bytes are waiting. The command that hit the error has already
+    // changed the data in memory, so it still succeeds; the server refuses the
+    // writes after it (see flushPending()), as Redis does.
+    bool log(const std::string& data);
+
+    // Tries again to write what failed writes left waiting. True if nothing
+    // is waiting: then a write command may run (its record can be saved).
+    bool flushPending();
+
+    // Why writing failed, while bytes are waiting
+    std::string lastWriteError() const;
 
     // False if the file could not be opened; log() would then silently drop writes.
     bool isOpen() const { return fd_ >= 0; }
@@ -60,8 +75,16 @@ public:
     std::string getFilename() const { return filename_; }
 
 private:
+    // With mutex_ held. writePending() writes what is waiting; setWriteError()
+    // records why it can't, and returns false.
+    bool writePending();
+    bool setWriteError(const std::string& error);
+
     std::string filename_;
     int fd_ = -1;           // opened for appending; -1 if it couldn't be opened
-    std::string last_error_;
+    std::string last_error_;        // why the last rewrite or truncate failed
+    std::string pending_;           // bytes a failed write left unwritten, in order
+    std::string write_error_;       // why, while pending_ isn't empty
+    std::atomic<bool> failing_{false};  // pending_ isn't empty (read without the lock)
     mutable std::mutex mutex_;      // separate mutex from storage — no contention
 };

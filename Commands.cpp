@@ -393,6 +393,12 @@ std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& 
         return RespParser::error(std::string("ERR wrong number of arguments for '")
                                  + cmd->name + "' command");
     }
+    // While the AOF can't be written (a full disk), refuse writes, as Redis
+    // does: their records couldn't be saved. Reads still work. Each attempt
+    // retries first, so writes resume as soon as the file takes data again.
+    if((cmd->flags & kCmdWrite) && ctx.aof && !ctx.aof->flushPending()) {
+        return RespParser::error("MISCONF Errors writing to the AOF file: " + ctx.aof->lastWriteError());
+    }
     return cmd->handler(ctx, args);
 }
 

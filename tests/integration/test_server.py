@@ -43,9 +43,10 @@ def describe_exit(returncode):
 
 class ServerProcess:
     """A running mini_redis_server on a free port, working in `workdir`.
-    `nofile` limits its open files (POSIX): a soft limit, or (soft, hard)."""
+    `nofile` limits its open files (POSIX): a soft limit, or (soft, hard).
+    `fsize` limits the size of the files it writes, in bytes (soft limit)."""
 
-    def __init__(self, *args, workdir=None, nofile=None):
+    def __init__(self, *args, workdir=None, nofile=None, fsize=None):
         self._tmp = None
         if workdir is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -54,14 +55,18 @@ class ServerProcess:
         self.port = free_port()
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
-        def limit_open_files():
-            soft, hard = nofile if isinstance(nofile, tuple) else \
-                (nofile, resource.getrlimit(resource.RLIMIT_NOFILE)[1])
-            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        def set_limits():
+            if nofile:
+                soft, hard = nofile if isinstance(nofile, tuple) else \
+                    (nofile, resource.getrlimit(resource.RLIMIT_NOFILE)[1])
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            if fsize:
+                resource.setrlimit(resource.RLIMIT_FSIZE,
+                                   (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
-            preexec_fn=limit_open_files if nofile else None)
+            preexec_fn=set_limits if nofile or fsize else None)
         self._wait_until_listening()
 
     def _wait_until_listening(self, timeout=5.0):
@@ -170,8 +175,8 @@ class Client:
 
 
 class ServerTestCase(unittest.TestCase):
-    def start_server(self, *args, workdir=None, nofile=None):
-        server = ServerProcess(*args, workdir=workdir, nofile=nofile)
+    def start_server(self, *args, workdir=None, nofile=None, fsize=None):
+        server = ServerProcess(*args, workdir=workdir, nofile=nofile, fsize=fsize)
         self.addCleanup(server.stop)
         return server
 
@@ -504,6 +509,45 @@ class AofDamageTest(ServerTestCase):
                                     capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 1)
             self.assertIn(b"damaged at byte %d" % len(good), result.stderr)
+
+
+@unittest.skipIf(resource is None or not hasattr(resource, "prlimit"), "needs Linux prlimit")
+class AofWriteErrorTest(ServerTestCase):
+    """A full disk, played by a 4 KB limit on the size of the files the server
+    writes: writes past it fail with EFBIG, as they would with ENOSPC."""
+
+    def test_writes_are_refused_until_the_aof_can_be_written(self):
+        # The server used to ignore the failed write and reply OK, so the AOF
+        # silently lost every write from then on. (Without SIGXFSZ ignored, the
+        # first write past the limit killed the server instead.)
+        value = b"v" * 100
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir, fsize=4096)
+            with Client(server.port) as c:
+                acknowledged, refusal = [], None
+                for i in range(100):     # about 130 bytes each: 4 KB holds about 30
+                    try:
+                        c.call("SET", f"k{i}", value)
+                        acknowledged.append(i)
+                    except RespError as e:
+                        refusal = str(e)
+                        break
+                self.assertIsNotNone(refusal, "every SET was acknowledged")
+                self.assertEqual(refusal, "MISCONF Errors writing to the AOF file: File too large")
+                self.assertEqual(c.call("GET", "k0"), value)     # reads still work
+
+                # Room on the disk again: what was waiting is written, writes resume
+                hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+                resource.prlimit(server.proc.pid, resource.RLIMIT_FSIZE, (hard, hard))
+                self.assertEqual(c.call("SET", "after", "1"), b"OK")
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in acknowledged:
+                    self.assertEqual(c.call("GET", f"k{i}"), value, f"k{i} was acknowledged")
+                self.assertEqual(c.call("GET", "after"), b"1")
+            restarted.stop()
 
 
 class CommandLineTest(ServerTestCase):

@@ -57,19 +57,21 @@ bool syncDirectory(const std::string& file) {
 }
 #endif
 
-// Writes all of `data`. write() may write less than asked (a signal, a full
-// disk), so it continues from where the last call stopped. False on error.
-bool writeAll(int fd, const char* data, size_t size) {
-    while(size > 0) {
-        long long n = writeSome(fd, data, size);
-        if(n < 0) {
-            if(errno == EINTR) continue;
-            return false;
+// Writes as much of `data` as the file takes. write() may write less than asked
+// (a signal, a full disk), so it continues from where the last call stopped.
+// Returns the bytes written: fewer than `size` means an error, in errno.
+size_t writeAll(int fd, const char* data, size_t size) {
+    size_t done = 0;
+    while(done < size) {
+        long long n = writeSome(fd, data + done, size - done);
+        if(n < 0 && errno == EINTR) continue;
+        if(n <= 0) {
+            if(n == 0) errno = EIO;     // no progress and no error: don't spin
+            break;
         }
-        data += n;
-        size -= static_cast<size_t>(n);
+        done += static_cast<size_t>(n);
     }
-    return true;
+    return done;
 }
 
 }  // namespace
@@ -78,12 +80,62 @@ AOFLogger::AOFLogger(const std::string& filename)
     : filename_(filename), fd_(openFile(filename, kAppendFlags)) {}
 
 AOFLogger::~AOFLogger() {
+    // Last chance for bytes an earlier write left waiting (no other thread
+    // can use the logger any more, so no lock)
+    if(!pending_.empty() && !writePending()) {
+        std::cerr << "Warning: " << pending_.size()
+                  << " bytes could not be written to the AOF and are lost\n";
+    }
     if(fd_ >= 0) closeFile(fd_);
 }
 
-void AOFLogger::log(const std::string& data) {
+bool AOFLogger::log(const std::string& data) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if(fd_ >= 0) writeAll(fd_, data.data(), data.size());
+    if(pending_.empty() && fd_ >= 0) {      // the usual case: written straight away
+        size_t written = writeAll(fd_, data.data(), data.size());
+        if(written == data.size()) return true;
+        int error = errno;
+        pending_.assign(data, written, std::string::npos);
+        return setWriteError(std::generic_category().message(error));
+    }
+    // Earlier bytes are waiting: these go after them, so the order is kept
+    pending_ += data;
+    return writePending();
+}
+
+bool AOFLogger::flushPending() {
+    if(!failing_) return true;      // checked without the lock: one load per write command
+    std::lock_guard<std::mutex> lock(mutex_);
+    return writePending();
+}
+
+std::string AOFLogger::lastWriteError() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return write_error_;
+}
+
+bool AOFLogger::writePending() {
+    if(fd_ < 0) return setWriteError("the AOF is not open");
+    size_t written = writeAll(fd_, pending_.data(), pending_.size());
+    int error = errno;
+    pending_.erase(0, written);
+    if(!pending_.empty()) return setWriteError(std::generic_category().message(error));
+    if(failing_) {
+        failing_ = false;
+        write_error_.clear();
+        std::cerr << "AOF writes work again\n";
+    }
+    return true;
+}
+
+bool AOFLogger::setWriteError(const std::string& error) {
+    if(!failing_) {
+        std::cerr << "Error writing to the AOF (" << error
+                  << "): write commands are refused until it can be written\n";
+    }
+    failing_ = true;
+    write_error_ = error;
+    return false;
 }
 
 std::string AOFLogger::readRaw() const {
@@ -107,7 +159,7 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
     }
     bool written = true;
     for(const auto& cmd : commands) {
-        if(!(written = writeAll(out, cmd.data(), cmd.size()))) break;
+        if(!(written = writeAll(out, cmd.data(), cmd.size()) == cmd.size())) break;
     }
     if(written) written = syncFile(out);
     int error = errno;
@@ -131,6 +183,14 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
         last_error_ = "cannot replace " + filename_ + ": " + renamed.message();
         std::filesystem::remove(temp, ignored);
         return false;
+    }
+    // The new file holds all the data, including what earlier failed writes
+    // left waiting: that is no longer needed
+    pending_.clear();
+    if(failing_ && fd_ >= 0) {
+        failing_ = false;
+        write_error_.clear();
+        std::cerr << "AOF writes work again (rewritten)\n";
     }
 
     // 4. Sync the directory, so the rename itself survives a power cut. If that

@@ -91,6 +91,11 @@ bool Server::start() {
     // Redis does the same at startup. (Windows has no SIGPIPE.)
     std::signal(SIGPIPE, SIG_IGN);
 
+    // A write past the file size limit (RLIMIT_FSIZE) raises SIGXFSZ, which
+    // also terminates the process by default. Ignored, the write fails with
+    // EFBIG instead, and the AOF reports it like any other write error.
+    std::signal(SIGXFSZ, SIG_IGN);
+
     // select() watches sockets numbered below FD_SETSIZE. A client beyond that
     // gets socket FD_SETSIZE or higher and is refused with an error reply; the
     // server must be allowed to open that socket to reply at all. With a lower
