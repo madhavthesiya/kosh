@@ -8,6 +8,10 @@
 #include <map>
 #include <random>
 #include <algorithm>
+#ifndef _WIN32
+#include <csignal>
+#include <sys/resource.h>
+#endif
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -678,7 +682,7 @@ TEST(test_aof_rewrite_compaction) {
 
         // Rewrite compacts to minimal state
         auto commands = s.dumpState();
-        aof.rewrite(commands);
+        ASSERT_TRUE(aof.rewrite(commands));
 
         ASSERT_EQ(countRespCommands(aof.readRaw()), (size_t)1);  // only 1 SET needed
     }
@@ -690,6 +694,50 @@ TEST(test_aof_rewrite_compaction) {
         ASSERT_EQ(s.get("key").value, "final");
     }
     std::remove(aof_file.c_str());
+}
+
+#ifndef _WIN32
+// Runs `fn` with files limited to `bytes`: writes past that fail with EFBIG,
+// as on a full disk. (SIGXFSZ, which would kill the process, is ignored.)
+template<typename Fn>
+void withFileSizeLimit(rlim_t bytes, Fn fn) {
+    auto old_handler = std::signal(SIGXFSZ, SIG_IGN);
+    rlimit old_limit;
+    getrlimit(RLIMIT_FSIZE, &old_limit);
+    rlimit limit = old_limit;
+    limit.rlim_cur = bytes;
+    setrlimit(RLIMIT_FSIZE, &limit);
+    fn();
+    setrlimit(RLIMIT_FSIZE, &old_limit);
+    std::signal(SIGXFSZ, old_handler);
+}
+#endif
+
+TEST(test_aof_rewrite_failure_keeps_old_file) {
+#ifndef _WIN32
+    // A rewrite that fails halfway must leave the AOF as it was. The old
+    // rewrite truncated the AOF and then wrote into it, so a full disk or a
+    // crash halfway lost data, and the client was still told OK.
+    const std::string aof_file = "test_aof_rewrite_fail.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    InMemoryStorage s(1000, &aof);
+    CommandContext ctx{s, &aof};
+    for(int i = 0; i < 200; i++) s.set("key" + std::to_string(i), std::string(100, 'v'));
+    const std::string before = aof.readRaw();      // about 26 KB
+
+    std::string reply;
+    withFileSizeLimit(4096, [&] { reply = executeCommand(ctx, {"BGREWRITEAOF"}); });
+    ASSERT_EQ(reply, "-ERR AOF rewrite failed: cannot write " + aof_file + ".tmp: File too large\r\n");
+    ASSERT_TRUE(aof.readRaw() == before);
+    ASSERT_FALSE(std::ifstream(aof_file + ".tmp").good());    // the partial file is gone
+
+    s.set("after", "1");            // still logging to the same file
+    InMemoryStorage replayed(1000, &aof);
+    replayAOF(replayed, aof);
+    ASSERT_EQ(replayed.dumpState().size(), (size_t)201);
+    std::remove(aof_file.c_str());
+#endif
 }
 
 TEST(test_aof_no_log_on_failed_ops) {
@@ -742,7 +790,7 @@ TEST(test_aof_rewrite_preserves_ttl) {
 
         // Rewrite compacts the AOF
         auto commands = s.dumpState();
-        aof.rewrite(commands);
+        ASSERT_TRUE(aof.rewrite(commands));
 
         bool found_set = false, found_list_expiry = false;
         for(const auto& r : aofRecords(aof.readRaw())) {
@@ -854,7 +902,7 @@ TEST(test_aof_rewrite_keeps_ttl_under_a_second) {
         InMemoryStorage s(10, &aof);
         s.set("k", "v", 1);
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        aof.rewrite(s.dumpState());
+        ASSERT_TRUE(aof.rewrite(s.dumpState()));
     }
     {
         AOFLogger aof(aof_file);
@@ -1508,6 +1556,7 @@ int main() {
     RUN_TEST(test_aof_basic_replay);
     RUN_TEST(test_aof_all_types);
     RUN_TEST(test_aof_rewrite_compaction);
+    RUN_TEST(test_aof_rewrite_failure_keeps_old_file);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
     RUN_TEST(test_aof_logs_absolute_expiry_times);

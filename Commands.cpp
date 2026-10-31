@@ -292,7 +292,9 @@ std::string cmdHlen(CommandContext& ctx, const Args& args) {
 
 std::string cmdRewriteAof(CommandContext& ctx, const Args&) {
     if(!ctx.aof) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
-    ctx.aof->rewrite(ctx.storage.dumpState());
+    if(!ctx.aof->rewrite(ctx.storage.dumpState())) {
+        return RespParser::error("ERR AOF rewrite failed: " + ctx.aof->lastError());
+    }
     return ok();
 }
 

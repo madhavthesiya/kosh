@@ -44,14 +44,21 @@ public:
     // The caller uses RespParser to extract individual commands.
     std::string readRaw() const;
 
-    // Rewrite the AOF file with a compacted set of RESP-formatted commands.
-    // Each string in the vector is a complete RESP array (already formatted).
-    void rewrite(const std::vector<std::string>& commands);
+    // Replaces the AOF with a compacted set of RESP-formatted commands (each
+    // string a complete RESP array). Crash-safe: the new contents are written
+    // to "<file>.tmp", synced to disk, and renamed over the AOF, so a failure
+    // or crash at any point leaves either the old file or the new one, whole.
+    // Returns false, with the AOF untouched, if that fails (see lastError()).
+    [[nodiscard]] bool rewrite(const std::vector<std::string>& commands);
+
+    // Why the last rewrite failed
+    std::string lastError() const;
 
     std::string getFilename() const { return filename_; }
 
 private:
     std::string filename_;
     int fd_ = -1;           // opened for appending; -1 if it couldn't be opened
-    std::mutex mutex_;      // separate mutex from storage — no contention
+    std::string last_error_;
+    mutable std::mutex mutex_;      // separate mutex from storage — no contention
 };

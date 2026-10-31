@@ -183,8 +183,11 @@ int main() {
         }
         else if(cmd == "AOFREWRITE") {
             auto commands = storage.dumpState();
-            aof.rewrite(commands);
-            std::cout << "AOF rewritten with " << commands.size() << " commands\n";
+            if(aof.rewrite(commands)) {
+                std::cout << "AOF rewritten with " << commands.size() << " commands\n";
+            } else {
+                std::cout << "ERROR: AOF rewrite failed: " << aof.lastError() << "\n";
+            }
         }
         // ==================== Utility ====================
         else if(cmd == "HELP") {

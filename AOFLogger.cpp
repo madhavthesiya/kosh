@@ -2,8 +2,11 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
+#include <system_error>
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>
@@ -26,6 +29,9 @@ long long writeSome(int fd, const char* data, size_t size) {
     return _write(fd, data, static_cast<unsigned>(std::min<size_t>(size, INT_MAX)));
 }
 void closeFile(int fd) { _close(fd); }
+bool syncFile(int fd) { return _commit(fd) == 0; }
+// NTFS journals its metadata, and Windows offers no portable way to sync a directory
+bool syncDirectory(const std::string&) { return true; }
 #else
 int openFile(const std::string& path, int flags) {
     return open(path.c_str(), flags | O_CLOEXEC, 0644);
@@ -36,6 +42,17 @@ long long writeSome(int fd, const char* data, size_t size) {
     return write(fd, data, size);
 }
 void closeFile(int fd) { close(fd); }
+bool syncFile(int fd) { return fsync(fd) == 0; }
+// A rename is a change to the directory, not to the file: it is on disk only
+// once the directory itself is synced
+bool syncDirectory(const std::string& file) {
+    std::string dir = std::filesystem::path(file).parent_path().string();
+    int fd = open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if(fd < 0) return false;
+    bool synced = fsync(fd) == 0;
+    close(fd);
+    return synced;
+}
 #endif
 
 // Writes all of `data`. write() may write less than asked (a signal, a full
@@ -73,13 +90,57 @@ std::string AOFLogger::readRaw() const {
     return std::string(std::istreambuf_iterator<char>(in), {});
 }
 
-void AOFLogger::rewrite(const std::vector<std::string>& commands) {
+bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if(fd_ >= 0) closeFile(fd_);
-    int out = openFile(filename_, kTruncateFlags);
-    if(out >= 0) {
-        for(const auto& cmd : commands) writeAll(out, cmd.data(), cmd.size());
-        closeFile(out);
+    const std::string temp = filename_ + ".tmp";
+    std::error_code ignored;
+
+    // 1. Write the new contents to a temporary file; the AOF stays untouched.
+    // 2. Sync it: otherwise, after a power cut, the rename below could be on
+    //    disk while the data it names is not, leaving an empty or partial AOF.
+    int out = openFile(temp, kTruncateFlags);
+    if(out < 0) {
+        last_error_ = "cannot create " + temp + ": " + std::generic_category().message(errno);
+        return false;
     }
-    fd_ = openFile(filename_, kAppendFlags);
+    bool written = true;
+    for(const auto& cmd : commands) {
+        if(!(written = writeAll(out, cmd.data(), cmd.size()))) break;
+    }
+    if(written) written = syncFile(out);
+    int error = errno;
+    closeFile(out);
+    if(!written) {
+        last_error_ = "cannot write " + temp + ": " + std::generic_category().message(error);
+        std::filesystem::remove(temp, ignored);
+        return false;
+    }
+
+    // 3. Rename it over the AOF. The rename replaces the file atomically, so a
+    //    crash leaves either the old AOF or the new one. The append handle is
+    //    closed first: Windows can't replace an open file, and on POSIX it would
+    //    go on writing to the replaced one. (std::filesystem::rename replaces an
+    //    existing file on Windows too; std::rename fails there.)
+    if(fd_ >= 0) closeFile(fd_);
+    std::error_code renamed;
+    std::filesystem::rename(temp, filename_, renamed);
+    fd_ = openFile(filename_, kAppendFlags);    // the new file, or the old one
+    if(renamed) {
+        last_error_ = "cannot replace " + filename_ + ": " + renamed.message();
+        std::filesystem::remove(temp, ignored);
+        return false;
+    }
+
+    // 4. Sync the directory, so the rename itself survives a power cut. If that
+    //    fails, either file is still a complete copy of the data.
+    if(!syncDirectory(filename_)) {
+        std::cerr << "Warning: could not sync the directory of " << filename_
+                  << " after rewriting it\n";
+    }
+    return true;
+}
+
+std::string AOFLogger::lastError() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
 }
