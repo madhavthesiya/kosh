@@ -217,11 +217,8 @@ std::string cmdHlen(CommandContext& ctx, const Args& args) {
 }
 
 // ---- Persistence ----
-
-std::string cmdSave(CommandContext& ctx, const Args&) {
-    auto r = ctx.storage.saveToFile("dump.rdb");
-    return r.success ? ok() : RespParser::error("ERR save failed");
-}
+// There is no SAVE: the AOF is the server's only persistence. (SAVE used to
+// write string keys to dump.rdb, which nothing loaded.)
 
 std::string cmdRewriteAof(CommandContext& ctx, const Args&) {
     if(!ctx.aof) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
@@ -267,7 +264,6 @@ const Command kCommands[] = {
     {"hgetall",          2,  0,         cmdHgetall},
     {"hlen",             2,  0,         cmdHlen},
 
-    {"save",            -1,  0,         cmdSave},
     {"bgrewriteaof",    -1,  0,         cmdRewriteAof},
     {"aofrewrite",      -1,  0,         cmdRewriteAof},
 };

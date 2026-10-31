@@ -196,6 +196,16 @@ class BasicCommandTest(ServerTestCase):
             with self.assertRaises(RespError):
                 c.call("BGREWRITEAOF")
 
+    def test_save_is_not_supported(self):
+        # SAVE wrote only string keys to dump.rdb, and nothing loads that file:
+        # its "+OK" promised persistence that didn't exist. The AOF is the
+        # server's persistence.
+        with Client(self.server.port) as c:
+            with self.assertRaises(RespError) as caught:
+                c.call("SAVE")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE'")
+        self.assertFalse(os.path.exists(os.path.join(self.server.workdir, "dump.rdb")))
+
 
 class ClientDisconnectTest(ServerTestCase):
     def test_client_closing_before_reading_replies_does_not_kill_server(self):
