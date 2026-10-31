@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <climits>
 #include <unordered_map>
 
 namespace {
@@ -24,13 +25,53 @@ std::string wrongType() {
     return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
 }
 
-std::string notAnInteger() { return RespParser::error("ERR value is not an integer"); }
+// Redis's error replies, word for word
+std::string notAnInteger() { return RespParser::error("ERR value is not an integer or out of range"); }
+std::string syntaxError() { return RespParser::error("ERR syntax error"); }
+std::string invalidExpireTime(const char* command) {
+    return RespParser::error(std::string("ERR invalid expire time in '") + command + "' command");
+}
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
+               return std::toupper(x) == std::toupper(y);
+           });
+}
 
 // The whole of `text` as a 64-bit integer. std::from_chars, unlike std::stoll,
 // rejects trailing garbage such as "10abc" and reports overflow instead of throwing.
 bool parseInt64(const std::string& text, int64_t& out) {
     auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
     return ec == std::errc() && end == text.data() + text.size();
+}
+
+// An index past the range of int selects what INT_MIN or INT_MAX would
+int clampToInt(int64_t value) {
+    return static_cast<int>(std::clamp<int64_t>(value, INT_MIN, INT_MAX));
+}
+
+// A TTL argument of SET or SETEX, as an absolute Unix time in milliseconds.
+// `seconds`: the number is in seconds (EX, EXAT, SETEX), not milliseconds.
+// `relative`: it counts from now (EX, PX, SETEX), not from the Unix epoch.
+// As in Redis, it must be a positive integer, and the absolute time must fit
+// in 64 bits. Returns an error reply, or an empty string if it is valid.
+std::string parseExpiry(const std::string& text, bool seconds, bool relative,
+                        const char* command, int64_t& unix_time_ms) {
+    int64_t value;
+    if(!parseInt64(text, value)) return notAnInteger();
+    if(value <= 0) return invalidExpireTime(command);
+    if(seconds) {
+        if(value > INT64_MAX / 1000) return invalidExpireTime(command);
+        value *= 1000;
+    }
+    if(relative) {
+        int64_t now = InMemoryStorage::unixTimeMs();
+        if(value > INT64_MAX - now) return invalidExpireTime(command);
+        value += now;
+    }
+    unix_time_ms = value;
+    return "";
 }
 
 // ---- Connection and server ----
@@ -47,7 +88,7 @@ std::string cmdCommand(CommandContext&, const Args&) { return RespParser::emptyA
 std::string cmdClient(CommandContext&, const Args&) { return ok(); }
 
 std::string cmdConfig(CommandContext&, const Args& args) {
-    if(toUpper(args[1]) == "GET") return RespParser::emptyArray();
+    if(equalsIgnoreCase(args[1], "GET")) return RespParser::emptyArray();
     return RespParser::error("ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
 }
 
@@ -59,25 +100,32 @@ std::string cmdInfo(CommandContext& ctx, const Args&) {
 
 // ---- Strings ----
 
+// SET key value [EX seconds | PX milliseconds | EXAT unix-seconds | PXAT unix-milliseconds]
+// The AOF records every SET with a TTL as PXAT. Redis's other options (NX, XX,
+// GET, KEEPTTL) aren't supported and are a syntax error: ignoring NX would
+// let "SET lock me NX" take a lock that someone else holds.
 std::string cmdSet(CommandContext& ctx, const Args& args) {
-    // PXAT: expire at this Unix time in milliseconds. The AOF records every SET
-    // with a TTL this way.
-    if(args.size() == 5 && toUpper(args[3]) == "PXAT") {
-        int64_t at;
-        if(!parseInt64(args[4], at)) return notAnInteger();
-        auto r = ctx.storage.setExpiringAt(args[1], args[2], at);
+    // As Redis does: check the options' syntax first, then the number
+    const std::string* option = nullptr;
+    const std::string* number = nullptr;
+    for(size_t i = 3; i < args.size(); i += 2) {
+        bool known = equalsIgnoreCase(args[i], "EX") || equalsIgnoreCase(args[i], "PX") ||
+                     equalsIgnoreCase(args[i], "EXAT") || equalsIgnoreCase(args[i], "PXAT");
+        // Each option needs a value, and only one expiry may be given
+        if(!known || option || i + 1 == args.size()) return syntaxError();
+        option = &args[i];
+        number = &args[i + 1];
+    }
+    if(!option) {
+        auto r = ctx.storage.set(args[1], args[2]);
         return r.success ? ok() : RespParser::error("ERR set failed");
     }
-    if(args.size() >= 5 && toUpper(args[3]) == "EX") {
-        try {
-            int ttl = std::stoi(args[4]);
-            auto r = ctx.storage.set(args[1], args[2], ttl);
-            return r.success ? ok() : RespParser::error("ERR set failed");
-        } catch(...) {
-            return notAnInteger();
-        }
-    }
-    auto r = ctx.storage.set(args[1], args[2]);
+    bool seconds = equalsIgnoreCase(*option, "EX") || equalsIgnoreCase(*option, "EXAT");
+    bool relative = equalsIgnoreCase(*option, "EX") || equalsIgnoreCase(*option, "PX");
+    int64_t at;
+    std::string error = parseExpiry(*number, seconds, relative, "set", at);
+    if(!error.empty()) return error;
+    auto r = ctx.storage.setExpiringAt(args[1], args[2], at);
     return r.success ? ok() : RespParser::error("ERR set failed");
 }
 
@@ -88,13 +136,11 @@ std::string cmdGet(CommandContext& ctx, const Args& args) {
 }
 
 std::string cmdSetex(CommandContext& ctx, const Args& args) {
-    try {
-        int ttl = std::stoi(args[2]);
-        auto r = ctx.storage.set(args[1], args[3], ttl);
-        return r.success ? ok() : RespParser::error("ERR setex failed");
-    } catch(...) {
-        return notAnInteger();
-    }
+    int64_t at;
+    std::string error = parseExpiry(args[2], true, true, "setex", at);
+    if(!error.empty()) return error;
+    auto r = ctx.storage.setExpiringAt(args[1], args[3], at);
+    return r.success ? ok() : RespParser::error("ERR setex failed");
 }
 
 // ---- Keys ----
@@ -111,13 +157,16 @@ std::string cmdType(CommandContext& ctx, const Args& args) {
     return RespParser::simpleString(ctx.storage.type(args[1]).value);
 }
 
+// Unlike SET, a TTL of 0 or less is allowed: the key expires at once (Redis
+// deletes it). Only a time that doesn't fit in 64 bits is an error.
 std::string cmdExpire(CommandContext& ctx, const Args& args) {
-    try {
-        int ttl = std::stoi(args[2]);
-        return RespParser::integer(ctx.storage.expire(args[1], ttl).success ? 1 : 0);
-    } catch(...) {
-        return notAnInteger();
+    int64_t seconds;
+    if(!parseInt64(args[2], seconds)) return notAnInteger();
+    int64_t now = InMemoryStorage::unixTimeMs();
+    if(seconds > (INT64_MAX - now) / 1000 || seconds < INT64_MIN / 1000) {
+        return invalidExpireTime("expire");
     }
+    return RespParser::integer(ctx.storage.expireAt(args[1], now + seconds * 1000).success ? 1 : 0);
 }
 
 // The AOF records every expiry as PEXPIREAT: an absolute Unix time in milliseconds
@@ -155,15 +204,11 @@ std::string cmdLpop(CommandContext& ctx, const Args& args) { return cmdPop(ctx, 
 std::string cmdRpop(CommandContext& ctx, const Args& args) { return cmdPop(ctx, args, false); }
 
 std::string cmdLrange(CommandContext& ctx, const Args& args) {
-    try {
-        int start = std::stoi(args[2]);
-        int stop = std::stoi(args[3]);
-        auto r = ctx.storage.lrange(args[1], start, stop);
-        if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-        return RespParser::array(r.values);
-    } catch(...) {
-        return notAnInteger();
-    }
+    int64_t start, stop;
+    if(!parseInt64(args[2], start) || !parseInt64(args[3], stop)) return notAnInteger();
+    auto r = ctx.storage.lrange(args[1], clampToInt(start), clampToInt(stop));
+    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
+    return RespParser::array(r.values);
 }
 
 std::string cmdLlen(CommandContext& ctx, const Args& args) {

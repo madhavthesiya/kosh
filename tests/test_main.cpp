@@ -953,6 +953,71 @@ TEST(test_dispatch_quit_closes_connection) {
     ASSERT_TRUE(ctx.close_connection);
 }
 
+TEST(test_dispatch_set_options) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    int64_t now = InMemoryStorage::unixTimeMs();
+    ASSERT_EQ(executeCommand(ctx, {"SET", "ex", "v", "EX", "100"}), "+OK\r\n");
+    ASSERT_EQ(s.ttl("ex").value, "100");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "px", "v", "px", "100000"}), "+OK\r\n");  // was ignored
+    ASSERT_EQ(s.ttl("px").value, "100");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "exat", "v", "EXAT", std::to_string(now / 1000 + 100)}),
+              "+OK\r\n");
+    int exat = std::stoi(s.ttl("exat").value);      // whole seconds, so 99 or 100
+    ASSERT_TRUE(exat >= 99 && exat <= 100);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "pxat", "v", "PXAT", std::to_string(now + 100000)}),
+              "+OK\r\n");
+    ASSERT_EQ(s.ttl("pxat").value, "100");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "pxat", "v"}), "+OK\r\n");   // a plain SET clears the TTL
+    ASSERT_EQ(s.ttl("pxat").value, "-1");
+}
+
+TEST(test_dispatch_set_rejects_bad_options) {
+    // Each of these used to reply OK and store the key without a TTL (or,
+    // with NX, overwrite it). Errors and their order are Redis's.
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    const std::string syntax = "-ERR syntax error\r\n";
+    const std::string invalid = "-ERR invalid expire time in 'set' command\r\n";
+    const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX"}), syntax);             // no value
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "NX"}), syntax);             // not supported
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", "10", "PX", "100"}), syntax);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", "abc", "PX", "1"}), syntax);  // syntax first
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", "10abc"}), not_int);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", "0"}), invalid);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "PX", "-5"}), invalid);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "PXAT", "0"}), invalid);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", "9223372036854775"}), invalid);  // overflows
+    ASSERT_FALSE(s.exists("k").success);        // nothing was stored
+}
+
+TEST(test_dispatch_strict_integer_arguments) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    // SETEX: a TTL of 0 used to store the key without one; std::stoi read "10abc" as 10
+    ASSERT_EQ(executeCommand(ctx, {"SETEX", "k", "0", "v"}),
+              "-ERR invalid expire time in 'setex' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SETEX", "k", "10abc", "v"}), not_int);
+    ASSERT_FALSE(s.exists("k").success);
+    ASSERT_EQ(executeCommand(ctx, {"SETEX", "k", "100", "v"}), "+OK\r\n");
+    ASSERT_EQ(s.ttl("k").value, "100");
+
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", "10abc"}), not_int);
+    ASSERT_EQ(s.ttl("k").value, "100");
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", "9223372036854775807"}),
+              "-ERR invalid expire time in 'expire' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", "3000000000"}), ":1\r\n");    // over INT_MAX
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", "-1"}), ":1\r\n");   // in the past: gone at once
+    ASSERT_FALSE(s.exists("k").success);
+
+    executeCommand(ctx, {"RPUSH", "l", "a", "b"});
+    ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "1x"}), not_int);
+    ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "99999999999"}),     // past INT_MAX
+              "*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+}
+
 TEST(test_dispatch_extreme_expiry_times) {
     // Clients choose these numbers. Converting them to the monotonic clock
     // saturates instead of overflowing (undefined behaviour, which UBSan
@@ -963,15 +1028,17 @@ TEST(test_dispatch_extreme_expiry_times) {
     std::string ttl = executeCommand(ctx, {"TTL", "far"});
     ASSERT_EQ(ttl[0], ':');
     ASSERT_TRUE(std::stoll(ttl.substr(1)) > 9000000000000000LL);
-    ASSERT_EQ(executeCommand(ctx, {"SET", "past", "v", "PXAT", "-9223372036854775808"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "past", "v", "PXAT", "1"}), "+OK\r\n");
     ASSERT_FALSE(s.get("past").success);
     ASSERT_EQ(s.dumpState().size(), (size_t)1);     // converts "far" back to Unix time
 
+    const std::string not_int = "-ERR value is not an integer or out of range\r\n";
     executeCommand(ctx, {"SET", "k", "v"});
     ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "9223372036854775807"}), ":1\r\n");
-    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "10abc"}), "-ERR value is not an integer\r\n");
-    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "9223372036854775808"}),    // overflows
-              "-ERR value is not an integer\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "10abc"}), not_int);
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "9223372036854775808"}), not_int);  // overflows
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "-9223372036854775808"}), ":1\r\n");
+    ASSERT_FALSE(s.exists("k").success);    // expired, and no overflow on the way
 }
 
 TEST(test_dispatch_write_flags) {
@@ -1241,6 +1308,9 @@ int main() {
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
     RUN_TEST(test_dispatch_quit_closes_connection);
+    RUN_TEST(test_dispatch_set_options);
+    RUN_TEST(test_dispatch_set_rejects_bad_options);
+    RUN_TEST(test_dispatch_strict_integer_arguments);
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
 
