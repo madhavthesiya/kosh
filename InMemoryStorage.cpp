@@ -86,7 +86,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getValidEntry(const std::string& k
     auto it = data_.find(key);
     if(it == data_.end()) return nullptr;
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return nullptr;
     }
     if(getDataType(it->second) != expected) return nullptr;
@@ -101,7 +101,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
     auto it = data_.find(key);
     if(it != data_.end()) {
         if(isExpired(it->second)) {
-            removeKey(key);
+            expireKey(key);
         } else if(getDataType(it->second) != expected) {
             return nullptr;     // type mismatch
         } else {
@@ -110,9 +110,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         }
     }
     // Create new entry
-    if(data_.size() == capacity_) {
-        evictLRU();
-    }
+    makeRoomForNewKey();
     lru_list_.push_front(key);
     CacheEntry entry;
     switch(expected) {
@@ -134,7 +132,7 @@ Result InMemoryStorage::exists(const std::string& key){
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     return Result::ok();
@@ -144,9 +142,10 @@ Result InMemoryStorage::del(const std::string& key){
     std::unique_lock lock(mutex_);
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    // Expired keys are treated as non-existent — don't log DEL for them
+    // An expired key no longer exists: DEL returns 0, as in Redis. Its removal
+    // is still logged, as an expiration.
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     lru_list_.erase(it->second.lru_it);
@@ -174,7 +173,7 @@ Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     it->second.has_expiry = true;
@@ -203,7 +202,7 @@ Result InMemoryStorage::get(const std::string& key){
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     // Type check: GET only works on strings
@@ -242,7 +241,7 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
     auto it = data_.find(key);
     if(it != data_.end()) {
         if(isExpired(it->second)) {
-            removeKey(key);
+            expireKey(key);
         } else {
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
@@ -257,14 +256,12 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
         auto backKey = lru_list_.back();
         auto bit = data_.find(backKey);
         if(bit != data_.end() && isExpired(bit->second)) {
-            removeKey(backKey);
+            expireKey(backKey);
         } else {
             break;
         }
     }
-    if(data_.size() == capacity_) {
-        evictLRU();
-    }
+    makeRoomForNewKey();
     lru_list_.push_front(key);
     CacheEntry entry;
     entry.value = value;    // stores as std::string in the variant
@@ -645,10 +642,41 @@ void InMemoryStorage::touchLRU(const std::string& key){
     entry.lru_it = lru_list_.begin();
 }
 
+// Evictions and expirations are removals the server decides on its own, so
+// each is logged as a DEL, as Redis does. Replay can't repeat these decisions:
+// GETs aren't logged, so its LRU order differs, and it expires nothing until
+// loading is done (see setLoading). Without the DELs, a restart could bring
+// back keys the server had dropped and lose others it still had.
+
 void InMemoryStorage::evictLRU(){
     std::string key = lru_list_.back();
     lru_list_.pop_back();
     data_.erase(key);
+    logAOF({"DEL", key});
+}
+
+void InMemoryStorage::expireKey(const std::string& key){
+    removeKey(key);
+    logAOF({"DEL", key});
+}
+
+// Called before adding a key. Not while loading: replay repeats the live
+// server's evictions from their DEL records instead of choosing its own.
+void InMemoryStorage::makeRoomForNewKey(){
+    if(loading_) return;
+    while(data_.size() >= capacity_) evictLRU();
+}
+
+void InMemoryStorage::setLoading(bool loading){
+    std::unique_lock lock(mutex_);
+    loading_ = loading;
+    // The AOF may hold more keys than the capacity allows now (a smaller
+    // --maxkeys than when it was written). Evicting during replay could drop a
+    // key and then rebuild it from its later records alone, a wrong value
+    // rather than a missing one, so evict only once everything is loaded.
+    if(!loading_) {
+        while(data_.size() > capacity_) evictLRU();
+    }
 }
 
 bool InMemoryStorage::isExpired(const CacheEntry& entry) const{

@@ -83,11 +83,14 @@ class InMemoryStorage : public StorageInterface {
         // AOF operations
         std::vector<std::string> dumpState() const;   // serialize current state as commands
 
-        // True while the AOF is being replayed (see replayAOF() in Commands.h):
-        // the replayed commands are not logged again, and no key expires. A key
-        // whose TTL has passed may be given a later one by a later record, so
-        // expiry is only checked once loading is done (Redis does the same).
-        void setLoading(bool loading) { loading_ = loading; }
+        // True while the AOF is being replayed (see replayAOF() in Commands.h).
+        // Then the replayed commands are not logged again, and:
+        // - no key expires: a key whose TTL has passed may be given a later one
+        //   by a later record, so expiry is checked once loading is done (Redis
+        //   does the same);
+        // - nothing is evicted: the live server's evictions are in the AOF as
+        //   DELs. Once loading is done, keys beyond the capacity are evicted.
+        void setLoading(bool loading);
 
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
@@ -102,11 +105,13 @@ class InMemoryStorage : public StorageInterface {
 
         // LRU helpers
         void touchLRU(const std::string& key);
-        void evictLRU();
+        void evictLRU();                                // removes and logs the LRU key
+        void makeRoomForNewKey();                       // evicts until one more key fits
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
-        void removeKey(const std::string& key);
+        void expireKey(const std::string& key);         // removes an expired key, logs DEL
+        void removeKey(const std::string& key);         // removes without logging
 
         // Type helpers
         DataType getDataType(const CacheEntry& entry) const;

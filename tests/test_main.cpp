@@ -3,7 +3,11 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <map>
+#include <random>
+#include <algorithm>
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -846,6 +850,198 @@ TEST(test_aof_rewrite_keeps_ttl_under_a_second) {
     std::remove(aof_file.c_str());
 }
 
+TEST(test_aof_eviction_is_logged) {
+    // Capacity 2: the live server evicts B, because A was read after it. GETs
+    // aren't logged, so replay used to evict A instead: a restart brought back a
+    // key the server had dropped and lost one it still had.
+    const std::string aof_file = "test_aof_eviction.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(2, &aof);
+        s.set("A", "1");
+        s.set("B", "2");
+        s.get("A");
+        s.set("C", "3");
+        ASSERT_TRUE(s.exists("A").success);
+        ASSERT_FALSE(s.exists("B").success);
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(2, &aof);
+        replayAOF(s, aof);
+        ASSERT_TRUE(s.exists("A").success);
+        ASSERT_FALSE(s.exists("B").success);
+        ASSERT_TRUE(s.exists("C").success);
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_lazy_expiry_is_logged) {
+    // The live server removes the expired string and makes k a list. Replay
+    // doesn't expire anything until loading is done, so without a logged DEL
+    // the string was still there and LPUSH failed with WRONGTYPE: k was lost.
+    const std::string aof_file = "test_aof_lazy_expiry.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s};
+        executeCommand(ctx, {"SET", "k", "v", "PX", "50"});
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ASSERT_EQ(executeCommand(ctx, {"LPUSH", "k", "x"}), ":1\r\n");
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        replayAOF(s, aof);
+        ASSERT_EQ(s.type("k").value, "list");
+        ASSERT_EQ(s.llen("k").value, "1");
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_replay_into_smaller_capacity) {
+    // Written with room for 10 keys, replayed with room for 2. Evicting during
+    // replay would drop L at "SET C" and then rebuild it from "RPUSH L b" alone,
+    // a wrong value rather than a missing one. Replay loads everything and then
+    // evicts down to the capacity, logging those evictions too.
+    const std::string aof_file = "test_aof_smaller.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        s.rpush("L", {"a"});
+        s.set("B", "1");
+        s.set("C", "1");
+        s.rpush("L", {"b"});
+    }
+    for(int restart = 0; restart < 2; restart++) {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(2, &aof);
+        replayAOF(s, aof);
+        ASSERT_EQ(s.lrange("L", 0, -1).values, (std::vector<std::string>{"a", "b"}));
+        ASSERT_FALSE(s.exists("B").success);
+        ASSERT_TRUE(s.exists("C").success);
+    }
+    std::remove(aof_file.c_str());
+}
+
+// One key as a rewrite records it: the record that recreates it, with set
+// members and hash fields sorted (their order is unspecified), and its expiry
+// as Unix milliseconds, or -1 if it has none
+struct KeyState {
+    std::vector<std::string> record;
+    int64_t expiry = -1;
+};
+
+std::map<std::string, KeyState> snapshot(const InMemoryStorage& s) {
+    std::map<std::string, KeyState> keys;
+    for(const auto& raw : s.dumpState()) {
+        auto args = RespParser::parse(raw).args;
+        KeyState& state = keys[args[1]];
+        if(args[0] == "PEXPIREAT") {
+            state.expiry = std::stoll(args[2]);
+            continue;
+        }
+        if(args[0] == "SET" && args.size() == 5) {     // SET key value PXAT ms
+            state.expiry = std::stoll(args[4]);
+            args.resize(3);
+        }
+        std::vector<std::string> contents(args.begin() + 2, args.end());
+        if(args[0] == "SADD") std::sort(contents.begin(), contents.end());
+        if(args[0] == "HSET") {
+            std::vector<std::pair<std::string, std::string>> fields;
+            for(size_t i = 0; i + 1 < contents.size(); i += 2) fields.emplace_back(contents[i], contents[i + 1]);
+            std::sort(fields.begin(), fields.end());
+            contents.clear();
+            for(const auto& [f, v] : fields) { contents.push_back(f); contents.push_back(v); }
+        }
+        state.record = {args[0]};
+        state.record.insert(state.record.end(), contents.begin(), contents.end());
+    }
+    return keys;
+}
+
+std::string describe(const std::map<std::string, KeyState>& keys, const std::string& key) {
+    auto it = keys.find(key);
+    if(it == keys.end()) return "(missing)";
+    std::string text;
+    for(const auto& part : it->second.record) text += part + " ";
+    return text + "expiry " + std::to_string(it->second.expiry);
+}
+
+// Runs `ops` random commands, through the dispatcher the server uses, against 8
+// keys in room for 5, with short and long TTLs, reads that touch the LRU order
+// and the odd rewrite. Then replays the AOF into a new instance and checks it
+// holds exactly what the live one holds.
+void checkReplayMatchesLive(unsigned seed, int ops) {
+    const std::string aof_file = "test_aof_random.aof";
+    std::remove(aof_file.c_str());
+    std::mt19937 rng(seed);
+    auto pick = [&](unsigned n) { return static_cast<int>(rng() % n); };
+    std::map<std::string, KeyState> live, replayed;
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(5, &aof);
+        CommandContext ctx{s, &aof};
+        for(int i = 0; i < ops; i++) {
+            std::string key = "k" + std::to_string(pick(8));
+            std::string value(1, static_cast<char>('a' + pick(4)));
+            switch(pick(16)) {
+                case 0:  executeCommand(ctx, {"SET", key, value}); break;
+                case 1:  executeCommand(ctx, {"SET", key, value, "PX", std::to_string(1 + pick(20))}); break;
+                case 2:  executeCommand(ctx, {"SET", key, value, "EX", "1000"}); break;
+                case 3:
+                case 4:  executeCommand(ctx, {"GET", key}); break;
+                case 5:  executeCommand(ctx, {"DEL", key}); break;
+                case 6:  executeCommand(ctx, {"EXISTS", key}); break;
+                case 7:  executeCommand(ctx, {"EXPIRE", key, "1000"}); break;
+                case 8:  executeCommand(ctx, {"PEXPIREAT", key,     // up to 10 ms ago, or soon
+                             std::to_string(InMemoryStorage::unixTimeMs() + pick(30) - 10)}); break;
+                case 9:  executeCommand(ctx, {"LPUSH", key, value, value}); break;
+                case 10: executeCommand(ctx, {"RPOP", key}); break;
+                case 11: executeCommand(ctx, {"SADD", key, value}); break;
+                case 12: executeCommand(ctx, {"SREM", key, value}); break;
+                case 13: executeCommand(ctx, {"HSET", key, value, std::to_string(i)}); break;
+                case 14: executeCommand(ctx, {"HDEL", key, value}); break;
+                case 15: if(pick(25) == 0) executeCommand(ctx, {"BGREWRITEAOF"}); break;
+            }
+            if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+        // Let every short TTL pass, so none expires between the two snapshots
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        live = snapshot(s);
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(5, &aof);
+        replayAOF(s, aof);
+        replayed = snapshot(s);
+    }
+    std::remove(aof_file.c_str());
+
+    std::map<std::string, KeyState> all = live;
+    all.insert(replayed.begin(), replayed.end());
+    for(const auto& [key, unused] : all) {
+        auto l = live.find(key), r = replayed.find(key);
+        bool same = l != live.end() && r != replayed.end() && l->second.record == r->second.record &&
+                    (l->second.expiry == -1) == (r->second.expiry == -1) &&
+                    std::llabs(l->second.expiry - r->second.expiry) <= 50;   // clock reads differ by a ms or so
+        if(!same) {
+            throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
+                                     describe(live, key) + ", replayed " + describe(replayed, key));
+        }
+    }
+}
+
+TEST(test_aof_replay_matches_live_randomized) {
+    // RANDOM_TEST_SEEDS=<n> runs more seeds than the default 4 (each ~0.2 s)
+    unsigned seeds = 4;
+    if(const char* n = std::getenv("RANDOM_TEST_SEEDS")) seeds = static_cast<unsigned>(std::atoi(n));
+    for(unsigned seed = 1; seed <= seeds; seed++) checkReplayMatchesLive(seed, 2500);
+}
+
 TEST(test_aof_replay_uses_command_table) {
     // Replay runs records through the same table as client commands, so names
     // are case-insensitive for both. The old replay compared names
@@ -1299,6 +1495,10 @@ int main() {
     RUN_TEST(test_aof_expiry_is_absolute);
     RUN_TEST(test_aof_old_relative_records_still_load);
     RUN_TEST(test_aof_rewrite_keeps_ttl_under_a_second);
+    RUN_TEST(test_aof_eviction_is_logged);
+    RUN_TEST(test_aof_lazy_expiry_is_logged);
+    RUN_TEST(test_aof_replay_into_smaller_capacity);
+    RUN_TEST(test_aof_replay_matches_live_randomized);
     RUN_TEST(test_aof_replay_uses_command_table);
     RUN_TEST(test_aof_values_with_spaces);
 
