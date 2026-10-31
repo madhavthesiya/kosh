@@ -399,14 +399,17 @@ std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& 
 // Runs every complete command in the AOF through the command table. While
 // loading, the storage doesn't log the commands again.
 Result replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
-    std::string buffer = aof.readRaw();
+    const std::string buffer = aof.readRaw();
     CommandContext ctx{storage};
     LoadingGuard loading(storage);
 
-    while(!buffer.empty()) {
-        auto parsed = RespParser::parse(buffer);
+    // Parse from a moving position. Erasing each command from the front of the
+    // buffer moved the whole rest of the file every time: quadratic in its size.
+    size_t pos = 0;
+    while(pos < buffer.size()) {
+        auto parsed = RespParser::parse(std::string_view(buffer).substr(pos));
         if(parsed.status != RespParser::ParseStatus::Ok) break;    // incomplete or invalid tail
-        buffer.erase(0, parsed.consumed);
+        pos += parsed.consumed;
         const auto& args = parsed.args;
         if(args.empty()) continue;
 
