@@ -2,6 +2,7 @@
 #include "RespParser.h"
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <unordered_map>
 
 namespace {
@@ -24,6 +25,13 @@ std::string wrongType() {
 }
 
 std::string notAnInteger() { return RespParser::error("ERR value is not an integer"); }
+
+// The whole of `text` as a 64-bit integer. std::from_chars, unlike std::stoll,
+// rejects trailing garbage such as "10abc" and reports overflow instead of throwing.
+bool parseInt64(const std::string& text, int64_t& out) {
+    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+    return ec == std::errc() && end == text.data() + text.size();
+}
 
 // ---- Connection and server ----
 
@@ -52,6 +60,14 @@ std::string cmdInfo(CommandContext& ctx, const Args&) {
 // ---- Strings ----
 
 std::string cmdSet(CommandContext& ctx, const Args& args) {
+    // PXAT: expire at this Unix time in milliseconds. The AOF records every SET
+    // with a TTL this way.
+    if(args.size() == 5 && toUpper(args[3]) == "PXAT") {
+        int64_t at;
+        if(!parseInt64(args[4], at)) return notAnInteger();
+        auto r = ctx.storage.setExpiringAt(args[1], args[2], at);
+        return r.success ? ok() : RespParser::error("ERR set failed");
+    }
     if(args.size() >= 5 && toUpper(args[3]) == "EX") {
         try {
             int ttl = std::stoi(args[4]);
@@ -104,10 +120,19 @@ std::string cmdExpire(CommandContext& ctx, const Args& args) {
     }
 }
 
+// The AOF records every expiry as PEXPIREAT: an absolute Unix time in milliseconds
+std::string cmdPexpireat(CommandContext& ctx, const Args& args) {
+    int64_t at;
+    if(!parseInt64(args[2], at)) return notAnInteger();
+    return RespParser::integer(ctx.storage.expireAt(args[1], at).success ? 1 : 0);
+}
+
 std::string cmdTtl(CommandContext& ctx, const Args& args) {
     auto r = ctx.storage.ttl(args[1]);
     if(!r.success) return RespParser::integer(-2);
-    return RespParser::integer(std::stoi(r.value));
+    // 64-bit: an expiry set with PEXPIREAT can be further away than INT_MAX
+    // seconds, and std::stoi would throw out of the event loop
+    return RespParser::integer(std::stoll(r.value));
 }
 
 // ---- Lists ----
@@ -243,6 +268,7 @@ const Command kCommands[] = {
     {"exists",           2,  0,         cmdExists},
     {"type",             2,  0,         cmdType},
     {"expire",           3,  kCmdWrite, cmdExpire},
+    {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
     {"ttl",              2,  0,         cmdTtl},
 
     {"lpush",           -3,  kCmdWrite, cmdLpush},

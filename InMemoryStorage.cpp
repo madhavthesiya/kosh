@@ -7,6 +7,44 @@
 #include <sstream>
 #include <stdexcept>
 
+namespace {
+
+using std::chrono::milliseconds;
+
+ExpiryTime steadyNowMs() {
+    return std::chrono::time_point_cast<milliseconds>(std::chrono::steady_clock::now());
+}
+
+// a + b, clamped to the range of int64_t. Signed overflow is undefined
+// behaviour, and clients choose these numbers: PXAT takes any 64-bit value.
+int64_t addSaturating(int64_t a, int64_t b) {
+    if(b > 0 && a > INT64_MAX - b) return INT64_MAX;
+    if(b < 0 && a < INT64_MIN - b) return INT64_MIN;
+    return a + b;
+}
+
+// The monotonic time at which the wall clock will read `unixTimeMs`
+ExpiryTime toExpiryTime(int64_t unixTimeMs) {
+    int64_t remaining = addSaturating(unixTimeMs, -InMemoryStorage::unixTimeMs());
+    return ExpiryTime(milliseconds(addSaturating(steadyNowMs().time_since_epoch().count(), remaining)));
+}
+
+// The Unix time, in milliseconds, at which `expiry` comes
+int64_t toUnixTimeMs(ExpiryTime expiry) {
+    int64_t remaining = addSaturating(expiry.time_since_epoch().count(),
+                                      -steadyNowMs().time_since_epoch().count());
+    return addSaturating(InMemoryStorage::unixTimeMs(), remaining);
+}
+
+}  // namespace
+
+int64_t InMemoryStorage::unixTimeMs() {
+    // system_clock counts from the Unix epoch (required from C++20, and already
+    // true of every C++17 standard library)
+    return std::chrono::duration_cast<milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
     : capacity_(capacity), aof_(aof) {
     // Eviction makes room by removing a key, so at least one must fit. With
@@ -126,6 +164,12 @@ Result InMemoryStorage::type(const std::string& key){
 }
 
 Result InMemoryStorage::expire(const std::string& key, int ttlSeconds){
+    return expireAt(key, addSaturating(unixTimeMs(), ttlSeconds * int64_t(1000)));
+}
+
+// Logged as PEXPIREAT with the absolute time, so replay expires the key at the
+// same moment, however much later the restart is
+Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
     std::unique_lock lock(mutex_);
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
@@ -134,8 +178,8 @@ Result InMemoryStorage::expire(const std::string& key, int ttlSeconds){
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     it->second.has_expiry = true;
-    it->second.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-    logAOF({"EXPIRE", key, std::to_string(ttlSeconds)});
+    it->second.expiry_time = toExpiryTime(unixTimeMs);
+    logAOF({"PEXPIREAT", key, std::to_string(unixTimeMs)});
     return Result::ok();
 }
 
@@ -145,10 +189,11 @@ Result InMemoryStorage::ttl(const std::string& key){
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(!it->second.has_expiry) return Result::ok("-1");
-    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-        it->second.expiry_time - std::chrono::steady_clock::now()
-    ).count();
-    return Result::ok(std::to_string(remaining));
+    int64_t remaining_ms = addSaturating(it->second.expiry_time.time_since_epoch().count(),
+                                         -steadyNowMs().time_since_epoch().count());
+    // Rounded to the nearest second, as Redis does: right after "SET k v EX 10"
+    // this is 10, not 9
+    return Result::ok(std::to_string(addSaturating(remaining_ms, 500) / 1000));
 }
 
 // ==================== String Operations ====================
@@ -171,20 +216,29 @@ Result InMemoryStorage::get(const std::string& key){
 
 Result InMemoryStorage::set(const std::string& key, const std::string& value){
     std::unique_lock lock(mutex_);
-    auto r = setInternal(key, value, 0);
+    auto r = setInternal(key, value, std::nullopt);
     if(r.success) logAOF({"SET", key, value});
     return r;
 }
 
+// A TTL of 0 or less stores the key without one
 Result InMemoryStorage::set(const std::string& key, const std::string& value, int ttlSeconds){
+    if(ttlSeconds <= 0) return set(key, value);
+    return setExpiringAt(key, value, addSaturating(unixTimeMs(), ttlSeconds * int64_t(1000)));
+}
+
+// One record, SET with PXAT, so a crash can't leave the value logged without
+// its expiry (as SET followed by PEXPIREAT could)
+Result InMemoryStorage::setExpiringAt(const std::string& key, const std::string& value, int64_t unixTimeMs){
     std::unique_lock lock(mutex_);
-    auto r = setInternal(key, value, ttlSeconds);
-    if(r.success) logAOF({"SETEX", key, std::to_string(ttlSeconds), value});
+    auto r = setInternal(key, value, toExpiryTime(unixTimeMs));
+    if(r.success) logAOF({"SET", key, value, "PXAT", std::to_string(unixTimeMs)});
     return r;
 }
 
 // SET always overwrites regardless of existing type (same as real Redis)
-Result InMemoryStorage::setInternal(const std::string& key, const std::string& value, int ttlSeconds){
+Result InMemoryStorage::setInternal(const std::string& key, const std::string& value,
+                                    std::optional<ExpiryTime> expiry){
     auto it = data_.find(key);
     if(it != data_.end()) {
         if(isExpired(it->second)) {
@@ -192,12 +246,8 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
         } else {
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
-            if(ttlSeconds > 0) {
-                it->second.has_expiry = true;
-                it->second.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-            } else {
-                it->second.has_expiry = false;
-            }
+            it->second.has_expiry = expiry.has_value();
+            if(expiry) it->second.expiry_time = *expiry;
             touchLRU(key);
             return Result::ok();
         }
@@ -218,12 +268,8 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
     lru_list_.push_front(key);
     CacheEntry entry;
     entry.value = value;    // stores as std::string in the variant
-    if(ttlSeconds > 0) {
-        entry.has_expiry = true;
-        entry.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-    } else {
-        entry.has_expiry = false;
-    }
+    entry.has_expiry = expiry.has_value();
+    if(expiry) entry.expiry_time = *expiry;
     entry.lru_it = lru_list_.begin();
     data_[key] = std::move(entry);
     return Result::ok();
@@ -541,7 +587,12 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
         DataType dt = getDataType(entry);
         switch(dt) {
             case DataType::STRING: {
-                commands.push_back(RespParser::array({"SET", key, std::get<std::string>(entry.value)}));
+                std::vector<std::string> parts = {"SET", key, std::get<std::string>(entry.value)};
+                if(entry.has_expiry) {
+                    parts.push_back("PXAT");
+                    parts.push_back(std::to_string(toUnixTimeMs(entry.expiry_time)));
+                }
+                commands.push_back(RespParser::array(parts));
                 break;
             }
             case DataType::LIST: {
@@ -575,14 +626,11 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
                 break;
             }
         }
-        // Preserve TTL: emit EXPIRE for keys with remaining TTL
-        if(entry.has_expiry) {
-            auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-                entry.expiry_time - std::chrono::steady_clock::now()
-            ).count();
-            if(remaining > 0) {
-                commands.push_back(RespParser::array({"EXPIRE", key, std::to_string(remaining)}));
-            }
+        // Lists, sets and hashes can't carry their expiry in the record that
+        // creates them. (Strings carry it as SET ... PXAT, above.)
+        if(entry.has_expiry && dt != DataType::STRING) {
+            commands.push_back(RespParser::array(
+                {"PEXPIREAT", key, std::to_string(toUnixTimeMs(entry.expiry_time))}));
         }
     }
     return commands;
@@ -604,8 +652,8 @@ void InMemoryStorage::evictLRU(){
 }
 
 bool InMemoryStorage::isExpired(const CacheEntry& entry) const{
-    if(!entry.has_expiry) return false;   
-    return std::chrono::steady_clock::now() >= entry.expiry_time;
+    if(!entry.has_expiry || loading_) return false;   // see setLoading()
+    return steadyNowMs() >= entry.expiry_time;
 }
 
 void InMemoryStorage::removeKey(const std::string& key){

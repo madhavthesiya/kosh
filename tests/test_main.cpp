@@ -686,9 +686,28 @@ TEST(test_aof_no_log_on_failed_ops) {
     std::remove(aof_file.c_str());
 }
 
+// Every record in an AOF, parsed
+std::vector<std::vector<std::string>> aofRecords(const std::string& raw) {
+    std::vector<std::vector<std::string>> records;
+    size_t pos = 0;
+    while(pos < raw.size()) {
+        auto parsed = RespParser::parse(std::string_view(raw).substr(pos));
+        if(parsed.status != RespParser::ParseStatus::Ok) break;
+        pos += parsed.consumed;
+        if(!parsed.args.empty()) records.push_back(parsed.args);
+    }
+    return records;
+}
+
+// Writes `records` as an AOF file, as if the server had logged them
+void writeAof(const std::string& path, const std::vector<std::vector<std::string>>& records) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    for(const auto& record : records) out << RespParser::array(record);
+}
+
 TEST(test_aof_rewrite_preserves_ttl) {
-    // This test would have CAUGHT the TTL bug if it existed before the fix.
-    // dumpState() must emit EXPIRE commands for keys with remaining TTL.
+    // dumpState() must keep each key's expiry: a string's in its SET record,
+    // so one record holds both
     const std::string aof_file = "test_aof_ttl.aof";
     std::remove(aof_file.c_str());
     {
@@ -696,24 +715,20 @@ TEST(test_aof_rewrite_preserves_ttl) {
         InMemoryStorage s(10, &aof);
         s.set("persistent", "no_ttl");
         s.set("expiring", "has_ttl", 300);  // 5 minute TTL
+        s.rpush("list", {"a"});
+        s.expire("list", 300);
 
         // Rewrite compacts the AOF
         auto commands = s.dumpState();
         aof.rewrite(commands);
 
-        auto raw = aof.readRaw();
-        bool found_expire = false;
-        std::string buf = raw;
-        while(!buf.empty()) {
-            auto parsed = RespParser::parse(buf);
-            if(parsed.status != RespParser::ParseStatus::Ok) break;
-            buf.erase(0, parsed.consumed);
-            const auto& args = parsed.args;
-            if(!args.empty() && args[0] == "EXPIRE" && args.size() >= 2 && args[1] == "expiring") {
-                found_expire = true;
-            }
+        bool found_set = false, found_list_expiry = false;
+        for(const auto& r : aofRecords(aof.readRaw())) {
+            if(r.size() == 5 && r[0] == "SET" && r[1] == "expiring" && r[3] == "PXAT") found_set = true;
+            if(r.size() == 3 && r[0] == "PEXPIREAT" && r[1] == "list") found_list_expiry = true;
         }
-        ASSERT_TRUE(found_expire);  // TTL must survive rewrite
+        ASSERT_TRUE(found_set);
+        ASSERT_TRUE(found_list_expiry);
     }
     // Verify replaying compacted AOF restores TTL
     {
@@ -728,14 +743,107 @@ TEST(test_aof_rewrite_preserves_ttl) {
         ASSERT_TRUE(r.success);
         int remaining = std::stoi(r.value);
         ASSERT_TRUE(remaining > 0);  // TTL survived rewrite + replay
+        ASSERT_TRUE(std::stoi(s.ttl("list").value) > 0);
     }
     std::remove(aof_file.c_str());
 }
 
-// Writes `records` as an AOF file, as if the server had logged them
-void writeAof(const std::string& path, const std::vector<std::vector<std::string>>& records) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    for(const auto& record : records) out << RespParser::array(record);
+TEST(test_aof_logs_absolute_expiry_times) {
+    const std::string aof_file = "test_aof_pxat.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        int64_t before = InMemoryStorage::unixTimeMs();
+        s.set("k", "v", 10);
+        s.expire("k", 20);
+        int64_t after = InMemoryStorage::unixTimeMs();
+
+        auto records = aofRecords(aof.readRaw());
+        ASSERT_EQ(records.size(), (size_t)2);
+        ASSERT_EQ(records[0].size(), (size_t)5);
+        ASSERT_EQ(records[0][0], "SET");
+        ASSERT_EQ(records[0][3], "PXAT");
+        int64_t at = std::stoll(records[0][4]);
+        ASSERT_TRUE(at >= before + 10000 && at <= after + 10000);
+        ASSERT_EQ(records[1][0], "PEXPIREAT");
+        at = std::stoll(records[1][2]);
+        ASSERT_TRUE(at >= before + 20000 && at <= after + 20000);
+        ASSERT_EQ(s.ttl("k").value, "20");      // rounded to the nearest second, as Redis does
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_expiry_is_absolute) {
+    // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
+    // so every restart gave keys their full TTL again, even keys that had
+    // already expired. They must expire at the same moment after a restart.
+    const std::string aof_file = "test_aof_absolute.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        s.set("setex", "v", 1);
+        s.set("expire", "v");
+        s.expire("expire", 1);
+        s.set("extended", "v", 1);      // its first TTL passes before the restart,
+        s.expire("extended", 100);      // but a later record extends it
+        s.set("long", "v", 100);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        replayAOF(s, aof);
+        ASSERT_FALSE(s.get("setex").success);
+        ASSERT_FALSE(s.get("expire").success);
+        ASSERT_TRUE(s.get("extended").success);
+        int extended = std::stoi(s.ttl("extended").value);
+        ASSERT_TRUE(extended >= 97 && extended <= 99);
+        int remaining = std::stoi(s.ttl("long").value);
+        ASSERT_TRUE(remaining >= 97 && remaining <= 99);
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_old_relative_records_still_load) {
+    // AOFs written before expiry times became absolute hold SETEX and EXPIRE
+    // records. They still load, with the TTL counted from the replay.
+    const std::string aof_file = "test_aof_old_format.aof";
+    writeAof(aof_file, {{"SETEX", "a", "100", "v"}, {"SET", "b", "v"}, {"EXPIRE", "b", "100"}});
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        replayAOF(s, aof);
+        ASSERT_EQ(s.get("a").value, "v");
+        ASSERT_EQ(s.ttl("a").value, "100");
+        ASSERT_EQ(s.ttl("b").value, "100");
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_rewrite_keeps_ttl_under_a_second) {
+    // A rewrite used to write a key's TTL in whole seconds, and nothing at all
+    // when under a second was left: the key came back without a TTL, forever.
+    const std::string aof_file = "test_aof_short_ttl.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        s.set("k", "v", 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        aof.rewrite(s.dumpState());
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        replayAOF(s, aof);
+        ASSERT_TRUE(s.get("k").success);
+        ASSERT_TRUE(s.ttl("k").value != "-1");
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        ASSERT_FALSE(s.get("k").success);
+    }
+    std::remove(aof_file.c_str());
 }
 
 TEST(test_aof_replay_uses_command_table) {
@@ -845,11 +953,32 @@ TEST(test_dispatch_quit_closes_connection) {
     ASSERT_TRUE(ctx.close_connection);
 }
 
+TEST(test_dispatch_extreme_expiry_times) {
+    // Clients choose these numbers. Converting them to the monotonic clock
+    // saturates instead of overflowing (undefined behaviour, which UBSan
+    // reports), and TTL can be far more than INT_MAX seconds.
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"SET", "far", "v", "PXAT", "9223372036854775807"}), "+OK\r\n");
+    std::string ttl = executeCommand(ctx, {"TTL", "far"});
+    ASSERT_EQ(ttl[0], ':');
+    ASSERT_TRUE(std::stoll(ttl.substr(1)) > 9000000000000000LL);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "past", "v", "PXAT", "-9223372036854775808"}), "+OK\r\n");
+    ASSERT_FALSE(s.get("past").success);
+    ASSERT_EQ(s.dumpState().size(), (size_t)1);     // converts "far" back to Unix time
+
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "9223372036854775807"}), ":1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "10abc"}), "-ERR value is not an integer\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIREAT", "k", "9223372036854775808"}),    // overflows
+              "-ERR value is not an integer\r\n");
+}
+
 TEST(test_dispatch_write_flags) {
     // Replay runs only commands flagged as writes, so the flags decide what an AOF
     // can contain: every command that changes data needs one, no read may have one
-    for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "LPUSH", "RPUSH", "LPOP",
-                            "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
+    for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "PEXPIREAT", "LPUSH", "RPUSH",
+                            "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
         ASSERT_TRUE(lookupCommand(name) && (lookupCommand(name)->flags & kCmdWrite));
     }
     for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
@@ -1099,6 +1228,10 @@ int main() {
     RUN_TEST(test_aof_rewrite_compaction);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
+    RUN_TEST(test_aof_logs_absolute_expiry_times);
+    RUN_TEST(test_aof_expiry_is_absolute);
+    RUN_TEST(test_aof_old_relative_records_still_load);
+    RUN_TEST(test_aof_rewrite_keeps_ttl_under_a_second);
     RUN_TEST(test_aof_replay_uses_command_table);
     RUN_TEST(test_aof_values_with_spaces);
 
@@ -1108,6 +1241,7 @@ int main() {
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
     RUN_TEST(test_dispatch_quit_closes_connection);
+    RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
 
     std::cout << "\n[RESP Parser]\n";
