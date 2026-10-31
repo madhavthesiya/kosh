@@ -37,6 +37,7 @@ find_package(Threads REQUIRED)
 # Main executable (CLI mode)
 add_executable(mini_redis
     main.cpp
+    Commands.cpp
     InMemoryStorage.cpp
     RedisLite.cpp
 )
@@ -47,6 +48,7 @@ add_executable(mini_redis_server
     server_main.cpp
     Server.cpp
     Poller.cpp
+    Commands.cpp
     InMemoryStorage.cpp
     RedisLite.cpp
 )
@@ -58,6 +60,7 @@ endif()
 # Unit tests
 add_executable(tests
     tests/test_main.cpp
+    Commands.cpp
     InMemoryStorage.cpp
     RedisLite.cpp
 )

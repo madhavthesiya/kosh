@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
+#include "Commands.h"
 #include "Server.h"
 
 // Settings that would otherwise mean editing and rebuilding, e.g. a larger
@@ -101,7 +102,7 @@ int main(int argc, char* argv[]) {
     InMemoryStorage storage(config.maxKeys, aofLogger);
 
     // Restore state from previous session
-    if(aofLogger) storage.replayAOF();
+    if(aofLogger) replayAOF(storage, *aofLogger);
 
     std::cout << "Max keys: " << config.maxKeys << " | AOF: "
               << (aofLogger ? config.appendFilename : "disabled") << "\n";

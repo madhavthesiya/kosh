@@ -3,9 +3,11 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
+#include "../Commands.h"
 
 int passed = 0;
 int failed = 0;
@@ -587,7 +589,7 @@ TEST(test_aof_basic_replay) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.replayAOF();
+        replayAOF(s, aof);
 
         Result r = s.get("name");
         ASSERT_TRUE(r.success);
@@ -614,7 +616,7 @@ TEST(test_aof_all_types) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.replayAOF();
+        replayAOF(s, aof);
 
         ASSERT_EQ(s.get("str").value, "hello");
         ASSERT_EQ(s.llen("lst").value, "2");       // "b" and "c" remain
@@ -650,7 +652,7 @@ TEST(test_aof_rewrite_compaction) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.replayAOF();
+        replayAOF(s, aof);
         ASSERT_EQ(s.get("key").value, "final");
     }
     std::remove(aof_file.c_str());
@@ -705,7 +707,7 @@ TEST(test_aof_rewrite_preserves_ttl) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.replayAOF();
+        replayAOF(s, aof);
 
         Result r = s.ttl("persistent");
         ASSERT_EQ(r.value, "-1");  // no TTL
@@ -718,10 +720,29 @@ TEST(test_aof_rewrite_preserves_ttl) {
     std::remove(aof_file.c_str());
 }
 
-TEST(test_aof_replay_without_file) {
-    InMemoryStorage s(10);  // no AOF
-    Result r = s.replayAOF();
-    ASSERT_FALSE(r.success);  // no AOF configured
+// Writes `records` as an AOF file, as if the server had logged them
+void writeAof(const std::string& path, const std::vector<std::vector<std::string>>& records) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    for(const auto& record : records) out << RespParser::array(record);
+}
+
+TEST(test_aof_replay_uses_command_table) {
+    // Replay runs records through the same table as client commands, so names
+    // are case-insensitive for both. The old replay compared names
+    // case-sensitively and silently skipped "set". Only write commands run.
+    const std::string aof_file = "test_aof_table.aof";
+    writeAof(aof_file, {{"set", "a", "1"}, {"Rpush", "l", "x", "y"}, {"GET", "a"},
+                        {"NOSUCH", "b"}, {"SET", "b"}});
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        replayAOF(s, aof);
+        ASSERT_EQ(s.get("a").value, "1");
+        ASSERT_EQ(s.llen("l").value, "2");
+        ASSERT_FALSE(s.exists("b").success);    // unknown command, wrong arity: skipped
+        ASSERT_EQ(countRespCommands(aof.readRaw()), (size_t)5);   // nothing logged again
+    }
+    std::remove(aof_file.c_str());
 }
 
 TEST(test_aof_values_with_spaces) {
@@ -740,7 +761,7 @@ TEST(test_aof_values_with_spaces) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.replayAOF();
+        replayAOF(s, aof);
 
         ASSERT_EQ(s.get("greeting").value, "hello world");
         ASSERT_EQ(s.get("quote").value, "to be or not to be");
@@ -753,6 +774,77 @@ TEST(test_aof_values_with_spaces) {
         ASSERT_EQ(s.hget("user", "bio").value, "loves c++");
     }
     std::remove(aof_file.c_str());
+}
+
+// ==================== Command Table ====================
+// The dispatcher the server uses, called directly: no sockets involved.
+
+TEST(test_dispatch_is_case_insensitive) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"set", "k", "v"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GeT", "k"}), "$1\r\nv\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), "$-1\r\n");
+}
+
+TEST(test_dispatch_checks_arity) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"GET"}), "-ERR wrong number of arguments for 'get' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"get", "a", "b"}),
+              "-ERR wrong number of arguments for 'get' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"LPUSH", "k"}),
+              "-ERR wrong number of arguments for 'lpush' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HSET", "h", "f", "v", "g"}),   // field without a value
+              "-ERR wrong number of arguments for 'hset' command\r\n");
+    ASSERT_FALSE(s.exists("k").success);    // nothing ran
+    ASSERT_FALSE(s.exists("h").success);
+}
+
+TEST(test_dispatch_unknown_command) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", "x"}), "-ERR unknown command 'NOPE'\r\n");
+    // Longer than any command: rejected without upper-casing a copy; 128 bytes quoted
+    ASSERT_EQ(executeCommand(ctx, {std::string(1000, 'x')}),
+              "-ERR unknown command '" + std::string(128, 'x') + "'\r\n");
+    ASSERT_TRUE(lookupCommand("\xff\xfe") == nullptr);
+}
+
+TEST(test_dispatch_replies) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s, nullptr, 3};
+    ASSERT_EQ(executeCommand(ctx, {"RPUSH", "l", "a", "b"}), ":2\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "-1"}), "*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET", "l"}),
+              "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"TYPE", "l"}), "+list\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"TTL", "missing"}), ":-2\r\n");
+    ASSERT_TRUE(executeCommand(ctx, {"INFO"}).find("connected_clients:3\r\n") != std::string::npos);
+    ASSERT_EQ(executeCommand(ctx, {"BGREWRITEAOF"}).substr(0, 5), "-ERR ");   // AOF is off
+}
+
+TEST(test_dispatch_quit_closes_connection) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
+    ASSERT_FALSE(ctx.close_connection);
+    ASSERT_EQ(executeCommand(ctx, {"quit"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.close_connection);
+}
+
+TEST(test_dispatch_write_flags) {
+    // Replay runs only commands flagged as writes, so the flags decide what an AOF
+    // can contain: every command that changes data needs one, no read may have one
+    for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "LPUSH", "RPUSH", "LPOP",
+                            "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
+        ASSERT_TRUE(lookupCommand(name) && (lookupCommand(name)->flags & kCmdWrite));
+    }
+    for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
+                            "SISMEMBER", "SCARD", "HGET", "HGETALL", "HLEN", "PING", "INFO",
+                            "BGREWRITEAOF"}) {
+        ASSERT_TRUE(lookupCommand(name) && !(lookupCommand(name)->flags & kCmdWrite));
+    }
 }
 
 // ==================== RESP Parser ====================
@@ -994,8 +1086,16 @@ int main() {
     RUN_TEST(test_aof_rewrite_compaction);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
-    RUN_TEST(test_aof_replay_without_file);
+    RUN_TEST(test_aof_replay_uses_command_table);
     RUN_TEST(test_aof_values_with_spaces);
+
+    std::cout << "\n[Command Table]\n";
+    RUN_TEST(test_dispatch_is_case_insensitive);
+    RUN_TEST(test_dispatch_checks_arity);
+    RUN_TEST(test_dispatch_unknown_command);
+    RUN_TEST(test_dispatch_replies);
+    RUN_TEST(test_dispatch_quit_closes_connection);
+    RUN_TEST(test_dispatch_write_flags);
 
     std::cout << "\n[RESP Parser]\n";
     RUN_TEST(test_resp_parse_array);

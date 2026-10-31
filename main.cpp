@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "InMemoryStorage.h"
 #include "RedisLite.h"
+#include "Commands.h"
 
 std::vector<std::string> split(const std::string& input) {
     std::vector<std::string> tokens;
@@ -65,7 +66,7 @@ int main() {
     std::string line;
 
     // Replay AOF on startup to restore state from previous session
-    storage.replayAOF();
+    replayAOF(storage, aof);
 
     std::cout << "Mini-Redis v2.0 (AOF enabled) — Type HELP for commands\n";
     std::cout << "mini-redis> ";

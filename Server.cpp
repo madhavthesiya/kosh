@@ -1,4 +1,5 @@
 #include "Server.h"
+#include "Commands.h"
 #include <iostream>
 #include <algorithm>
 #include <atomic>
@@ -61,12 +62,6 @@ Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
 
 Server::~Server() {
     stop();
-}
-
-std::string Server::toUpper(const std::string& s) {
-    std::string result = s;
-    std::transform(result.begin(), result.end(), result.begin(), ::toupper);
-    return result;
 }
 
 // ==================== Lifecycle ====================
@@ -380,6 +375,7 @@ void Server::runCommands(Client& client) {
     // Erasing each command from the front would move all the bytes behind it,
     // once per command: quadratic in the number of commands in one read.
     size_t pos = 0;
+    CommandContext ctx{storage_, aof_, clients_.size()};
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
         auto parsed = RespParser::parse(std::string_view(client.in).substr(pos));
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
@@ -395,10 +391,10 @@ void Server::runCommands(Client& client) {
         const auto& args = parsed.args;
         if(args.empty()) continue;
 
-        client.out += executeCommand(args);
+        client.out += executeCommand(ctx, args);
 
         // QUIT: send its reply, then disconnect; commands after it don't run
-        if(toUpper(args[0]) == "QUIT") {
+        if(ctx.close_connection) {
             client.close_after_reply = true;
             client.in.clear();
             return;
@@ -439,258 +435,4 @@ void Server::updateInterest(socket_t fd, Client& client) {
         client.want_read = want_read;
         client.want_write = want_write;
     }
-}
-
-// ==================== Command Execution ====================
-//
-// Maps RESP commands to InMemoryStorage methods.
-// Each command has its own response format — not generic.
-
-std::string Server::executeCommand(const std::vector<std::string>& args) {
-    if(args.empty()) return RespParser::error("ERR empty command");
-
-    std::string cmd = toUpper(args[0]);
-
-    // ---- Redis-cli startup commands ----
-
-    if(cmd == "COMMAND") {
-        return RespParser::emptyArray();
-    }
-    if(cmd == "CLIENT") {
-        return RespParser::simpleString("OK");
-    }
-    if(cmd == "CONFIG" && args.size() >= 2 && toUpper(args[1]) == "GET") {
-        return RespParser::emptyArray();
-    }
-    if(cmd == "PING") {
-        return RespParser::simpleString("PONG");
-    }
-    if(cmd == "QUIT") {
-        return RespParser::simpleString("OK");
-    }
-    if(cmd == "INFO") {
-        std::string info = "# Server\r\nmini_redis_version:2.0\r\n"
-                           "# Clients\r\nconnected_clients:"
-                           + std::to_string(clients_.size()) + "\r\n";
-        return RespParser::bulkString(info);
-    }
-
-    // ---- String commands ----
-
-    if(cmd == "SET") {
-        if(args.size() < 3) return RespParser::error("ERR wrong number of arguments for 'set' command");
-        if(args.size() >= 5 && toUpper(args[3]) == "EX") {
-            try {
-                int ttl = std::stoi(args[4]);
-                auto r = storage_.set(args[1], args[2], ttl);
-                return r.success ? RespParser::simpleString("OK")
-                                 : RespParser::error("ERR set failed");
-            } catch(...) {
-                return RespParser::error("ERR value is not an integer");
-            }
-        }
-        auto r = storage_.set(args[1], args[2]);
-        return r.success ? RespParser::simpleString("OK")
-                         : RespParser::error("ERR set failed");
-    }
-
-    if(cmd == "GET") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'get' command");
-        auto r = storage_.get(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
-    }
-
-    if(cmd == "SETEX") {
-        if(args.size() != 4) return RespParser::error("ERR wrong number of arguments for 'setex' command");
-        try {
-            int ttl = std::stoi(args[2]);
-            auto r = storage_.set(args[1], args[3], ttl);
-            return r.success ? RespParser::simpleString("OK")
-                             : RespParser::error("ERR setex failed");
-        } catch(...) {
-            return RespParser::error("ERR value is not an integer");
-        }
-    }
-
-    // ---- Key commands ----
-
-    if(cmd == "DEL") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'del' command");
-        auto r = storage_.del(args[1]);
-        return RespParser::integer(r.success ? 1 : 0);
-    }
-
-    if(cmd == "EXISTS") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'exists' command");
-        auto r = storage_.exists(args[1]);
-        return RespParser::integer(r.success ? 1 : 0);
-    }
-
-    if(cmd == "TYPE") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'type' command");
-        auto r = storage_.type(args[1]);
-        return RespParser::simpleString(r.value);
-    }
-
-    if(cmd == "EXPIRE") {
-        if(args.size() != 3) return RespParser::error("ERR wrong number of arguments for 'expire' command");
-        try {
-            int ttl = std::stoi(args[2]);
-            auto r = storage_.expire(args[1], ttl);
-            return RespParser::integer(r.success ? 1 : 0);
-        } catch(...) {
-            return RespParser::error("ERR value is not an integer");
-        }
-    }
-
-    if(cmd == "TTL") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'ttl' command");
-        auto r = storage_.ttl(args[1]);
-        if(!r.success) return RespParser::integer(-2);
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    // ---- List commands ----
-
-    if(cmd == "LPUSH" || cmd == "RPUSH") {
-        if(args.size() < 3) return RespParser::error("ERR wrong number of arguments for '" + cmd + "' command");
-        std::vector<std::string> vals(args.begin() + 2, args.end());
-        auto r = (cmd == "LPUSH") ? storage_.lpush(args[1], vals) : storage_.rpush(args[1], vals);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    if(cmd == "LPOP" || cmd == "RPOP") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for '" + cmd + "' command");
-        auto r = (cmd == "LPOP") ? storage_.lpop(args[1]) : storage_.rpop(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
-    }
-
-    if(cmd == "LRANGE") {
-        if(args.size() != 4) return RespParser::error("ERR wrong number of arguments for 'lrange' command");
-        try {
-            int start = std::stoi(args[2]);
-            int stop = std::stoi(args[3]);
-            auto r = storage_.lrange(args[1], start, stop);
-            if(r.error == ErrorCode::WRONG_TYPE)
-                return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-            return RespParser::array(r.values);
-        } catch(...) {
-            return RespParser::error("ERR value is not an integer");
-        }
-    }
-
-    if(cmd == "LLEN") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'llen' command");
-        auto r = storage_.llen(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    // ---- Set commands ----
-
-    if(cmd == "SADD" || cmd == "SREM") {
-        if(args.size() < 3) return RespParser::error("ERR wrong number of arguments for '" + cmd + "' command");
-        std::vector<std::string> members(args.begin() + 2, args.end());
-        auto r = (cmd == "SADD") ? storage_.sadd(args[1], members) : storage_.srem(args[1], members);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    if(cmd == "SMEMBERS") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'smembers' command");
-        auto r = storage_.smembers(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::array(r.values);
-    }
-
-    if(cmd == "SISMEMBER") {
-        if(args.size() != 3) return RespParser::error("ERR wrong number of arguments for 'sismember' command");
-        auto r = storage_.sismember(args[1], args[2]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    if(cmd == "SCARD") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'scard' command");
-        auto r = storage_.scard(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    // ---- Hash commands ----
-
-    if(cmd == "HSET") {
-        if(args.size() < 4 || args.size() % 2 != 0)
-            return RespParser::error("ERR wrong number of arguments for 'hset' command");
-        std::vector<std::pair<std::string,std::string>> fields;
-        for(size_t i = 2; i < args.size(); i += 2) {
-            fields.emplace_back(args[i], args[i+1]);
-        }
-        auto r = storage_.hset(args[1], fields);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    if(cmd == "HGET") {
-        if(args.size() != 3) return RespParser::error("ERR wrong number of arguments for 'hget' command");
-        auto r = storage_.hget(args[1], args[2]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
-    }
-
-    if(cmd == "HDEL") {
-        if(args.size() < 3) return RespParser::error("ERR wrong number of arguments for 'hdel' command");
-        std::vector<std::string> fields(args.begin() + 2, args.end());
-        auto r = storage_.hdel(args[1], fields);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    if(cmd == "HGETALL") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'hgetall' command");
-        auto r = storage_.hgetall(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::array(r.values);
-    }
-
-    if(cmd == "HLEN") {
-        if(args.size() != 2) return RespParser::error("ERR wrong number of arguments for 'hlen' command");
-        auto r = storage_.hlen(args[1]);
-        if(r.error == ErrorCode::WRONG_TYPE)
-            return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        return RespParser::integer(std::stoi(r.value));
-    }
-
-    // ---- Persistence ----
-
-    if(cmd == "SAVE") {
-        auto r = storage_.saveToFile("dump.rdb");
-        return r.success ? RespParser::simpleString("OK") : RespParser::error("ERR save failed");
-    }
-
-    if(cmd == "BGREWRITEAOF" || cmd == "AOFREWRITE") {
-        if(!aof_) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
-        auto commands = storage_.dumpState();
-        aof_->rewrite(commands);
-        return RespParser::simpleString("OK");
-    }
-
-    // ---- Unknown command ----
-    // The name comes from the client and can be up to 512 MB: quote at most 128 bytes, as Redis does.
-    return RespParser::error("ERR unknown command '" + args[0].substr(0, 128) + "'");
 }

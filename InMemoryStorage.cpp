@@ -14,7 +14,7 @@ InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof){
 // Centralized AOF logging — serializes command parts as RESP and writes to AOF.
 // RESP format is binary-safe: values with spaces, newlines etc. are length-prefixed.
 void InMemoryStorage::logAOF(const std::vector<std::string>& parts) {
-    if(aof_ && logging_enabled_) {
+    if(aof_ && !loading_) {
         aof_->log(RespParser::array(parts));
     }
 }
@@ -583,66 +583,6 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
         }
     }
     return commands;
-}
-
-// Replay all commands from the AOF file to rebuild state.
-// Uses RespParser to parse the RESP-formatted AOF — binary-safe.
-// Logging is disabled during replay to prevent re-logging replayed commands.
-Result InMemoryStorage::replayAOF() {
-    if(!aof_) return Result::fail(ErrorCode::FILE_ERROR);
-    std::string buffer = aof_->readRaw();
-    logging_enabled_ = false;
-
-    while(!buffer.empty()) {
-        auto parsed = RespParser::parse(buffer);
-        if(parsed.status != RespParser::ParseStatus::Ok) break;    // incomplete or invalid tail
-        buffer.erase(0, parsed.consumed);
-        const auto& args = parsed.args;
-        if(args.empty()) continue;
-
-        const std::string& cmd = args[0];
-
-        if(cmd == "SET" && args.size() >= 3) {
-            set(args[1], args[2]);
-        }
-        else if(cmd == "SETEX" && args.size() >= 4) {
-            try { set(args[1], args[3], std::stoi(args[2])); } catch(...) {}
-        }
-        else if(cmd == "DEL" && args.size() >= 2) {
-            del(args[1]);
-        }
-        else if(cmd == "EXPIRE" && args.size() >= 3) {
-            try { expire(args[1], std::stoi(args[2])); } catch(...) {}
-        }
-        else if((cmd == "LPUSH" || cmd == "RPUSH") && args.size() >= 3) {
-            std::vector<std::string> vals(args.begin() + 2, args.end());
-            if(cmd == "LPUSH") lpush(args[1], vals);
-            else rpush(args[1], vals);
-        }
-        else if((cmd == "LPOP" || cmd == "RPOP") && args.size() >= 2) {
-            if(cmd == "LPOP") lpop(args[1]);
-            else rpop(args[1]);
-        }
-        else if((cmd == "SADD" || cmd == "SREM") && args.size() >= 3) {
-            std::vector<std::string> members(args.begin() + 2, args.end());
-            if(cmd == "SADD") sadd(args[1], members);
-            else srem(args[1], members);
-        }
-        else if(cmd == "HSET" && args.size() >= 4) {
-            std::vector<std::pair<std::string,std::string>> fields;
-            for(size_t i = 2; i + 1 < args.size(); i += 2) {
-                fields.emplace_back(args[i], args[i+1]);
-            }
-            hset(args[1], fields);
-        }
-        else if(cmd == "HDEL" && args.size() >= 3) {
-            std::vector<std::string> fields(args.begin() + 2, args.end());
-            hdel(args[1], fields);
-        }
-    }
-
-    logging_enabled_ = true;
-    return Result::ok();
 }
 
 // ==================== LRU Helpers ====================

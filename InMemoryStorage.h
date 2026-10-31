@@ -65,8 +65,11 @@ class InMemoryStorage : public StorageInterface {
 
         // AOF operations
         std::vector<std::string> dumpState() const;   // serialize current state as commands
-        Result replayAOF();                            // rebuild state from AOF log
-    
+
+        // True while the AOF is being replayed (see replayAOF() in Commands.h):
+        // the replayed commands are not logged again.
+        void setLoading(bool loading) { loading_ = loading; }
+
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;
@@ -109,5 +112,5 @@ class InMemoryStorage : public StorageInterface {
         size_t capacity_;
         mutable std::shared_mutex mutex_;
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
-        bool logging_enabled_ = true;       // disabled during replay to prevent re-logging
+        bool loading_ = false;              // replaying the AOF: don't log again
 };
