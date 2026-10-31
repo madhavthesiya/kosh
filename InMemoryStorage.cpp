@@ -121,8 +121,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
     }
     entry.has_expiry = false;
     entry.lru_it = lru_list_.begin();
-    data_[key] = std::move(entry);
-    return &data_[key];
+    return &data_.emplace(key, std::move(entry)).first->second;
 }
 
 // ==================== Key Operations ====================
@@ -148,8 +147,7 @@ Result InMemoryStorage::del(const std::string& key){
         expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    lru_list_.erase(it->second.lru_it);
-    data_.erase(it);
+    eraseEntry(it);
     logAOF({"DEL", key});
     return Result::ok();
 }
@@ -176,8 +174,7 @@ Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
         expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    it->second.has_expiry = true;
-    it->second.expiry_time = toExpiryTime(unixTimeMs);
+    setExpiry(it, toExpiryTime(unixTimeMs));
     logAOF({"PEXPIREAT", key, std::to_string(unixTimeMs)});
     return Result::ok();
 }
@@ -245,30 +242,18 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
         } else {
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
-            it->second.has_expiry = expiry.has_value();
-            if(expiry) it->second.expiry_time = *expiry;
+            setExpiry(it, expiry);
             touchLRU(key);
             return Result::ok();
-        }
-    }
-    // Sweep expired keys before checking capacity
-    while(!lru_list_.empty()) {
-        auto backKey = lru_list_.back();
-        auto bit = data_.find(backKey);
-        if(bit != data_.end() && isExpired(bit->second)) {
-            expireKey(backKey);
-        } else {
-            break;
         }
     }
     makeRoomForNewKey();
     lru_list_.push_front(key);
     CacheEntry entry;
     entry.value = value;    // stores as std::string in the variant
-    entry.has_expiry = expiry.has_value();
-    if(expiry) entry.expiry_time = *expiry;
+    entry.has_expiry = false;
     entry.lru_it = lru_list_.begin();
-    data_[key] = std::move(entry);
+    setExpiry(data_.emplace(key, std::move(entry)).first, expiry);
     return Result::ok();
 }
 
@@ -541,7 +526,8 @@ Result InMemoryStorage::loadFromFile(const std::string& filename){
     if(!in.is_open()) return Result::fail(ErrorCode::FILE_ERROR);
     data_.clear();
     lru_list_.clear();
-    
+    expiry_index_.clear();
+
     std::string line;
     while(std::getline(in, line)) {
         std::string key, value;
@@ -649,9 +635,8 @@ void InMemoryStorage::touchLRU(const std::string& key){
 // back keys the server had dropped and lose others it still had.
 
 void InMemoryStorage::evictLRU(){
-    std::string key = lru_list_.back();
-    lru_list_.pop_back();
-    data_.erase(key);
+    std::string key = lru_list_.back();     // a copy: erasing removes the original
+    eraseEntry(data_.find(key));
     logAOF({"DEL", key});
 }
 
@@ -663,7 +648,15 @@ void InMemoryStorage::expireKey(const std::string& key){
 // Called before adding a key. Not while loading: replay repeats the live
 // server's evictions from their DEL records instead of choosing its own.
 void InMemoryStorage::makeRoomForNewKey(){
-    if(loading_) return;
+    if(loading_ || data_.size() < capacity_) return;    // no clock read on the common path
+    // Expired keys go before any live key, wherever they are in the LRU order.
+    // Only as many as are needed: each insert does a bounded amount of work.
+    ExpiryTime now = steadyNowMs();
+    while(data_.size() >= capacity_ && !expiry_index_.empty() &&
+          expiry_index_.begin()->first <= now) {
+        std::string key = *expiry_index_.begin()->second;   // a copy, as above
+        expireKey(key);
+    }
     while(data_.size() >= capacity_) evictLRU();
 }
 
@@ -686,8 +679,22 @@ bool InMemoryStorage::isExpired(const CacheEntry& entry) const{
 
 void InMemoryStorage::removeKey(const std::string& key){
     auto it = data_.find(key);
-    if(it != data_.end()) {
-        lru_list_.erase(it->second.lru_it);
-        data_.erase(it);
+    if(it != data_.end()) eraseEntry(it);
+}
+
+void InMemoryStorage::setExpiry(DataMap::iterator it, std::optional<ExpiryTime> expiry){
+    CacheEntry& entry = it->second;
+    if(entry.has_expiry) expiry_index_.erase({entry.expiry_time, &it->first});
+    entry.has_expiry = expiry.has_value();
+    if(expiry) {
+        entry.expiry_time = *expiry;
+        expiry_index_.insert({*expiry, &it->first});
     }
+}
+
+void InMemoryStorage::eraseEntry(DataMap::iterator it){
+    // Out of the index first: it points at the key that erase() destroys
+    if(it->second.has_expiry) expiry_index_.erase({it->second.expiry_time, &it->first});
+    lru_list_.erase(it->second.lru_it);
+    data_.erase(it);
 }

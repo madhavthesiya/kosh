@@ -223,6 +223,24 @@ TEST(test_ttl_evicted_before_lru) {
     ASSERT_TRUE(r.success);
 }
 
+TEST(test_expired_keys_evicted_before_live_ones) {
+    // Capacity 2. A expires, but was used after B, so B is at the least
+    // recently used end. SET only looked for expired keys at that end, and
+    // LPUSH, SADD and HSET didn't look at all: both evicted live B and kept
+    // expired A.
+    for(bool use_lpush : {false, true}) {
+        InMemoryStorage s(2);
+        s.set("B", "2");
+        s.setExpiringAt("A", "1", InMemoryStorage::unixTimeMs() + 50);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if(use_lpush) s.lpush("C", {"x"});
+        else s.set("C", "3");
+        ASSERT_TRUE(s.exists("B").success);
+        ASSERT_TRUE(s.exists("C").success);
+        ASSERT_FALSE(s.exists("A").success);
+    }
+}
+
 // ==================== Persistence ====================
 
 TEST(test_save_and_load) {
@@ -1444,6 +1462,7 @@ int main() {
 
     std::cout << "\n[TTL > LRU Priority]\n";
     RUN_TEST(test_ttl_evicted_before_lru);
+    RUN_TEST(test_expired_keys_evicted_before_live_ones);
 
     std::cout << "\n[Persistence]\n";
     RUN_TEST(test_save_and_load);

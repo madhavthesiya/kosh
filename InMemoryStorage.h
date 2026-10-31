@@ -6,7 +6,9 @@
 #include <string>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <list>
+#include <set>
 #include <deque>
 #include <optional>
 #include <variant>
@@ -102,11 +104,17 @@ class InMemoryStorage : public StorageInterface {
             ExpiryTime expiry_time;
             std::list<std::string>::iterator lru_it;
         };
+        using DataMap = std::unordered_map<std::string, CacheEntry>;
+
+        // Every change to an entry's expiry and every removal goes through
+        // these, so the expiry index stays in step with data_
+        void setExpiry(DataMap::iterator it, std::optional<ExpiryTime> expiry);
+        void eraseEntry(DataMap::iterator it);
 
         // LRU helpers
         void touchLRU(const std::string& key);
         void evictLRU();                                // removes and logs the LRU key
-        void makeRoomForNewKey();                       // evicts until one more key fits
+        void makeRoomForNewKey();                       // expired keys first, then LRU
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
@@ -132,8 +140,24 @@ class InMemoryStorage : public StorageInterface {
         // AOF logging helper — serializes parts as RESP and logs to AOF file
         void logAOF(const std::vector<std::string>& parts);
 
-        std::unordered_map<std::string, CacheEntry> data_;
+        DataMap data_;
         std::list<std::string> lru_list_;
+
+        // Keys with a TTL, soonest expiry first, so expired keys are found
+        // without a scan when room is needed. The pointer is to the key inside
+        // data_: unordered_map keeps references to its elements valid until they
+        // are erased, even when it rehashes.
+        using ExpiryItem = std::pair<ExpiryTime, const std::string*>;
+        struct ExpiryOrder {
+            bool operator()(const ExpiryItem& a, const ExpiryItem& b) const {
+                if(a.first != b.first) return a.first < b.first;
+                // `<` on pointers into different objects is unspecified;
+                // std::less is guaranteed to be a total order
+                return std::less<const std::string*>()(a.second, b.second);
+            }
+        };
+        std::set<ExpiryItem, ExpiryOrder> expiry_index_;
+
         size_t capacity_;
         mutable std::shared_mutex mutex_;
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
