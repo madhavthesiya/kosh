@@ -51,7 +51,10 @@ public:
     // Returns false, with the AOF untouched, if that fails (see lastError()).
     [[nodiscard]] bool rewrite(const std::vector<std::string>& commands);
 
-    // Why the last rewrite failed
+    // Cuts the file to its first `size` bytes; false if that fails (see lastError())
+    [[nodiscard]] bool truncate(size_t size);
+
+    // Why the last rewrite or truncate failed
     std::string lastError() const;
 
     std::string getFilename() const { return filename_; }

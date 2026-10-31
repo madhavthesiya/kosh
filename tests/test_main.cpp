@@ -1082,7 +1082,10 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(5, &aof);
-        replayAOF(s, aof);
+        auto loaded = replayAOF(s, aof);
+        if(!loaded.ok || loaded.truncated_bytes > 0) {
+            throw std::runtime_error("seed " + std::to_string(seed) + ": the AOF didn't load cleanly: " + loaded.error);
+        }
         replayed = snapshot(s);
     }
     std::remove(aof_file.c_str());
@@ -1111,18 +1114,77 @@ TEST(test_aof_replay_matches_live_randomized) {
 TEST(test_aof_replay_uses_command_table) {
     // Replay runs records through the same table as client commands, so names
     // are case-insensitive for both. The old replay compared names
-    // case-sensitively and silently skipped "set". Only write commands run.
+    // case-sensitively and silently skipped "set".
     const std::string aof_file = "test_aof_table.aof";
-    writeAof(aof_file, {{"set", "a", "1"}, {"Rpush", "l", "x", "y"}, {"GET", "a"},
-                        {"NOSUCH", "b"}, {"SET", "b"}});
+    writeAof(aof_file, {{"set", "a", "1"}, {"Rpush", "l", "x", "y"}});
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        replayAOF(s, aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.commands, (size_t)2);
         ASSERT_EQ(s.get("a").value, "1");
         ASSERT_EQ(s.llen("l").value, "2");
-        ASSERT_FALSE(s.exists("b").success);    // unknown command, wrong arity: skipped
-        ASSERT_EQ(countRespCommands(aof.readRaw()), (size_t)5);   // nothing logged again
+        ASSERT_EQ(countRespCommands(aof.readRaw()), (size_t)2);   // nothing logged again
+    }
+    std::remove(aof_file.c_str());
+}
+
+void writeRaw(const std::string& path, const std::string& bytes) {
+    std::ofstream(path, std::ios::binary | std::ios::trunc) << bytes;
+}
+
+TEST(test_aof_replay_cuts_incomplete_last_record) {
+    // A crash while writing "SET b 2" left part of it at the end. Replay used to
+    // stop there and leave it, so the next records were appended after it and,
+    // at the next start, read as its missing part: lost.
+    const std::string aof_file = "test_aof_incomplete.aof";
+    const std::string partial = "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1";
+    writeRaw(aof_file, RespParser::array({"SET", "a", "1"}) + partial);
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.commands, (size_t)1);
+        ASSERT_EQ(loaded.truncated_bytes, partial.size());
+        ASSERT_EQ(aof.readRaw(), RespParser::array({"SET", "a", "1"}));
+        s.set("c", "3");
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.truncated_bytes, (size_t)0);
+        ASSERT_EQ(s.get("a").value, "1");
+        ASSERT_EQ(s.get("c").value, "3");
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_replay_refuses_damage_before_the_end) {
+    // Replay used to stop at the first bad record and start with what came
+    // before it, silently dropping everything after. And since only write
+    // commands are logged, any other command means the file is damaged too.
+    const std::string aof_file = "test_aof_damaged.aof";
+    const std::string good = RespParser::array({"SET", "a", "1"});
+    const std::string at = std::to_string(good.size());
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"*2\r\n$3\r\nGET\r\nxx\r\n", "expected '$', got 'x'"},
+        {RespParser::array({"GET", "a"}), "unexpected command 'GET'"},
+        {RespParser::array({"NOSUCH"}), "unexpected command 'NOSUCH'"},
+        {RespParser::array({"SET", "b"}), "unexpected command 'SET'"},      // too few arguments
+    };
+    for(const auto& [bad, reason] : cases) {
+        writeRaw(aof_file, good + bad + good);
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_FALSE(loaded.ok);
+        ASSERT_TRUE(loaded.error.find("damaged at byte " + at + " (" + reason + ")") != std::string::npos);
+        ASSERT_TRUE(loaded.error.find("truncate -s " + at + " " + aof_file) != std::string::npos);
+        ASSERT_EQ(aof.readRaw(), good + bad + good);     // left as it was
     }
     std::remove(aof_file.c_str());
 }
@@ -1568,6 +1630,8 @@ int main() {
     RUN_TEST(test_aof_replay_into_smaller_capacity);
     RUN_TEST(test_aof_replay_matches_live_randomized);
     RUN_TEST(test_aof_replay_uses_command_table);
+    RUN_TEST(test_aof_replay_cuts_incomplete_last_record);
+    RUN_TEST(test_aof_replay_refuses_damage_before_the_end);
     RUN_TEST(test_aof_values_with_spaces);
 
     std::cout << "\n[Command Table]\n";

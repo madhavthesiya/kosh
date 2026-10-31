@@ -66,7 +66,15 @@ int main() {
     std::string line;
 
     // Replay AOF on startup to restore state from previous session
-    replayAOF(storage, aof);
+    AofLoadResult loaded = replayAOF(storage, aof);
+    if(!loaded.ok) {
+        std::cerr << "Cannot start: " << loaded.error << "\n";
+        return 1;
+    }
+    if(loaded.truncated_bytes > 0) {
+        std::cerr << "Warning: the AOF ended with an incomplete record; cut off its "
+                  << loaded.truncated_bytes << " bytes\n";
+    }
 
     std::cout << "Mini-Redis v2.0 (AOF enabled) — Type HELP for commands\n";
     std::cout << "mini-redis> ";

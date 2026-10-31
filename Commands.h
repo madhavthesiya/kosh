@@ -39,5 +39,17 @@ bool arityMatches(const Command& cmd, size_t argc);
 // Runs one command (args[0] is its name) and returns its RESP reply
 std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args);
 
-// Rebuilds the data from the AOF by running its commands through the same table
-Result replayAOF(InMemoryStorage& storage, AOFLogger& aof);
+// What replayAOF() found in the file
+struct AofLoadResult {
+    bool ok = true;                 // false: the data couldn't all be loaded; don't start
+    size_t commands = 0;            // commands run
+    size_t truncated_bytes = 0;     // an incomplete last record, cut off the end
+    std::string error;              // why it isn't ok
+};
+
+// Rebuilds the data from the AOF by running its commands through the same
+// table. An incomplete last record (the server stopped while writing it) is
+// cut off the file, so new records start at a record boundary. Damage before
+// the end, or a command the server never logs, is an error: loading only the
+// part before it would silently drop everything after.
+AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof);

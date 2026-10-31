@@ -462,6 +462,50 @@ class ErrorReplyTest(ServerTestCase):
             self.assertEqual(str(caught.exception), "ERR unknown command '" + "x" * 128 + "'")
 
 
+class AofDamageTest(ServerTestCase):
+    """A crash while writing a record leaves an incomplete record at the end of
+    the AOF. Replay used to stop there silently, and the server then appended
+    new records after the partial bytes: at the next restart they were read as
+    the rest of the broken record, and lost."""
+
+    def test_incomplete_last_record_is_cut_off(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            aof = os.path.join(workdir, "appendonly.aof")
+            first = self.start_server(workdir=workdir)
+            with Client(first.port) as c:
+                c.call("SET", "a", "1")
+                c.call("SET", "b", "2")
+            first.stop()
+            with open(aof, "r+b") as f:     # as if the server died writing "SET b 2"
+                f.truncate(os.path.getsize(aof) - 7)
+
+            second = self.start_server(workdir=workdir)
+            with Client(second.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertIsNone(c.call("GET", "b"))
+                c.call("SET", "c", "3")
+            self.assertIn("incomplete record", second.output())
+            second.stop()
+
+            third = self.start_server(workdir=workdir)
+            with Client(third.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertEqual(c.call("GET", "c"), b"3")
+            third.stop()
+
+    def test_damage_before_the_end_refuses_to_start(self):
+        # Starting with whatever came before the damage would silently drop
+        # everything after it. Refuse, and say where the damage is.
+        with tempfile.TemporaryDirectory() as workdir:
+            good = Client.encode(("SET", "a", "1"))
+            with open(os.path.join(workdir, "appendonly.aof"), "wb") as f:
+                f.write(good + b"*2\r\n$3\r\nGET\r\nxx\r\n" + good)
+            result = subprocess.run([SERVER_BINARY, "--port", str(free_port())], cwd=workdir,
+                                    capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"damaged at byte %d" % len(good), result.stderr)
+
+
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
         with tempfile.TemporaryDirectory() as workdir:

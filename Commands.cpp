@@ -397,27 +397,55 @@ std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& 
 }
 
 // Runs every complete command in the AOF through the command table. While
-// loading, the storage doesn't log the commands again.
-Result replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
+// loading, the storage doesn't log the commands again (see setLoading).
+AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
+    AofLoadResult result;
     const std::string buffer = aof.readRaw();
     CommandContext ctx{storage};
     LoadingGuard loading(storage);
+
+    auto damaged = [&](size_t at, const std::string& reason) {
+        result.ok = false;
+        result.error = "the AOF is damaged at byte " + std::to_string(at) + " (" + reason +
+                       "), so what follows can't be read. The " + std::to_string(at) +
+                       " bytes before it are intact: to start with them, cut the file there"
+                       " (truncate -s " + std::to_string(at) + " " + aof.getFilename() + ")";
+        return result;
+    };
 
     // Parse from a moving position. Erasing each command from the front of the
     // buffer moved the whole rest of the file every time: quadratic in its size.
     size_t pos = 0;
     while(pos < buffer.size()) {
         auto parsed = RespParser::parse(std::string_view(buffer).substr(pos));
-        if(parsed.status != RespParser::ParseStatus::Ok) break;    // incomplete or invalid tail
-        pos += parsed.consumed;
-        const auto& args = parsed.args;
-        if(args.empty()) continue;
+        if(parsed.status == RespParser::ParseStatus::NeedMore) {
+            // The file ends partway through a record: the server stopped while
+            // writing it. Cut it off, or new records would be appended after it
+            // and read as its missing part at the next start (Redis also does
+            // this, with aof-load-truncated). A length damaged into a larger one
+            // looks the same and would cut more; nothing in the file tells them apart.
+            if(!aof.truncate(pos)) {
+                result.ok = false;
+                result.error = "cannot cut off the incomplete record at byte " +
+                               std::to_string(pos) + ": " + aof.lastError();
+                return result;
+            }
+            result.truncated_bytes = buffer.size() - pos;
+            break;
+        }
+        if(parsed.status == RespParser::ParseStatus::Error) return damaged(pos, parsed.error);
 
-        // Only write commands are logged, so anything else can't have come from
-        // the server: skip it
-        const Command* cmd = lookupCommand(args[0]);
-        if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) continue;
-        cmd->handler(ctx, args);
+        const auto& args = parsed.args;
+        if(!args.empty()) {
+            // Only write commands are logged, so anything else means the file is damaged
+            const Command* cmd = lookupCommand(args[0]);
+            if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
+                return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
+            }
+            cmd->handler(ctx, args);
+            result.commands++;
+        }
+        pos += parsed.consumed;
     }
-    return Result::ok();
+    return result;
 }

@@ -30,6 +30,7 @@ long long writeSome(int fd, const char* data, size_t size) {
 }
 void closeFile(int fd) { _close(fd); }
 bool syncFile(int fd) { return _commit(fd) == 0; }
+bool truncateFile(int fd, size_t size) { return _chsize_s(fd, static_cast<long long>(size)) == 0; }
 // NTFS journals its metadata, and Windows offers no portable way to sync a directory
 bool syncDirectory(const std::string&) { return true; }
 #else
@@ -43,6 +44,7 @@ long long writeSome(int fd, const char* data, size_t size) {
 }
 void closeFile(int fd) { close(fd); }
 bool syncFile(int fd) { return fsync(fd) == 0; }
+bool truncateFile(int fd, size_t size) { return ftruncate(fd, static_cast<off_t>(size)) == 0; }
 // A rename is a change to the directory, not to the file: it is on disk only
 // once the directory itself is synced
 bool syncDirectory(const std::string& file) {
@@ -138,6 +140,19 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
                   << " after rewriting it\n";
     }
     return true;
+}
+
+bool AOFLogger::truncate(size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(fd_ < 0) {
+        last_error_ = "the AOF is not open";
+        return false;
+    }
+    if(!truncateFile(fd_, size)) {
+        last_error_ = std::generic_category().message(errno);
+        return false;
+    }
+    return true;      // the descriptor appends, so the next write lands at the new end
 }
 
 std::string AOFLogger::lastError() const {
