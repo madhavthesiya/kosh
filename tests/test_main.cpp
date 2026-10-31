@@ -129,6 +129,18 @@ TEST(test_lru_capacity_one) {
     ASSERT_EQ(r.value, "2");
 }
 
+TEST(test_capacity_zero_is_rejected) {
+    // With room for no keys, the first SET used to evict from an empty LRU list:
+    // back() of an empty std::list, which is undefined behaviour
+    bool threw = false;
+    try {
+        InMemoryStorage s(0);
+    } catch(const std::invalid_argument&) {
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+}
+
 // ==================== TTL Expiration ====================
 
 TEST(test_ttl_expiration) {
@@ -1029,6 +1041,7 @@ int main() {
     RUN_TEST(test_lru_refresh_with_get);
     RUN_TEST(test_exists_does_not_refresh_lru);
     RUN_TEST(test_lru_capacity_one);
+    RUN_TEST(test_capacity_zero_is_rejected);
 
     std::cout << "\n[TTL Expiration]\n";
     RUN_TEST(test_ttl_expiration);

@@ -5,10 +5,13 @@
 #include <mutex>
 #include <algorithm>
 #include <sstream>
+#include <stdexcept>
 
-InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof){
-    capacity_=capacity;
-    aof_=aof;
+InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
+    : capacity_(capacity), aof_(aof) {
+    // Eviction makes room by removing a key, so at least one must fit. With
+    // capacity 0, the first SET would evict from an empty LRU list.
+    if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
 }
 
 // Centralized AOF logging — serializes command parts as RESP and writes to AOF.

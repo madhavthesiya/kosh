@@ -23,6 +23,7 @@ enum class DataType { STRING, LIST, SET, HASH };
 
 class InMemoryStorage : public StorageInterface {
     public:
+        // Throws std::invalid_argument if capacity is 0
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
 
         // String operations
