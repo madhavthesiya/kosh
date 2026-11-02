@@ -9,6 +9,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
+| [`insert_latency.cpp`](insert_latency.cpp) | How long one insert of a new key can take in the storage engine, and every rehash of the hash table (no network) | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 
 Results live in [`results/`](results/), one directory per measured version (for example `results/v0-baseline/`).
@@ -27,6 +28,7 @@ python3 bench/replay_bench.py --out bench/results/<name>
 python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
 ./build/memory_layout > bench/results/<name>/memory-layout.md
+cmake --build build --target insert_latency && taskset -c 2 ./build/insert_latency 100000 5
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
 sudo apt install linux-tools-generic

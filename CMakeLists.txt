@@ -86,6 +86,14 @@ add_executable(memory_layout
 )
 target_link_libraries(memory_layout Threads::Threads)
 
+# Times every insert of a new key, to find the storage engine's worst case (see bench/README.md)
+add_executable(insert_latency
+    bench/insert_latency.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(insert_latency Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
