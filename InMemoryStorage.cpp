@@ -119,7 +119,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         } else if(getDataType(it->second) != expected) {
             return nullptr;     // type mismatch
         } else {
-            touchLRU(key);
+            touchLRU(it->second);
             return &it->second; // existing entry of correct type
         }
     }
@@ -220,7 +220,7 @@ Result InMemoryStorage::get(const std::string& key){
     if(getDataType(it->second) != DataType::STRING) {
         return Result::fail(ErrorCode::WRONG_TYPE);
     }
-    touchLRU(key);
+    touchLRU(it->second);
     return Result::ok(std::get<std::string>(it->second.value));
 }
 
@@ -257,7 +257,7 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
             setExpiry(it, expiry);
-            touchLRU(key);
+            touchLRU(it->second);
             return Result::ok();
         }
     }
@@ -316,7 +316,7 @@ Result InMemoryStorage::lpop(const std::string& key){
     list.pop_front();
     // Auto-delete empty lists (same as real Redis)
     if(list.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     logAOF({"LPOP", key});
     return Result::ok(val);
 }
@@ -335,7 +335,7 @@ Result InMemoryStorage::rpop(const std::string& key){
     std::string val = list.back();
     list.pop_back();
     if(list.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     logAOF({"RPOP", key});
     return Result::ok(val);
 }
@@ -404,7 +404,7 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(set.erase(m));
     }
     if(set.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     std::vector<std::string> parts = {"SREM", key};
     parts.insert(parts.end(), members.begin(), members.end());
     logAOF(parts);
@@ -486,7 +486,7 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(hash.erase(f));
     }
     if(hash.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     std::vector<std::string> parts = {"HDEL", key};
     parts.insert(parts.end(), fields.begin(), fields.end());
     logAOF(parts);
@@ -635,11 +635,14 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
 
 // ==================== LRU Helpers ====================
 
-void InMemoryStorage::touchLRU(const std::string& key){
-    auto& entry = data_[key]; 
-    lru_list_.erase(entry.lru_it);
-    lru_list_.push_front(key);
-    entry.lru_it = lru_list_.begin();
+// splice() relinks the entry's existing list node at the front: O(1), no
+// allocation, no copy of the key, and entry.lru_it stays valid. It used to
+// look the key up again (data_[key]), erase the node and push a new one: a
+// second hash lookup, a free and two allocations (the node, and the key,
+// which at 16 bytes is one too long for the small-string buffer) on every
+// GET and every SET of an existing key.
+void InMemoryStorage::touchLRU(CacheEntry& entry){
+    lru_list_.splice(lru_list_.begin(), lru_list_, entry.lru_it);
 }
 
 // Evictions and expirations are removals the server decides on its own, so

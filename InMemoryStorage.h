@@ -116,7 +116,7 @@ class InMemoryStorage : public StorageInterface {
         void eraseEntry(DataMap::iterator it);
 
         // LRU helpers
-        void touchLRU(const std::string& key);
+        void touchLRU(CacheEntry& entry);               // marks it most recently used
         void evictLRU();                                // removes and logs the LRU key
         void makeRoomForNewKey();                       // expired keys first, then LRU
 
