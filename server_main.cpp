@@ -16,6 +16,8 @@ struct ServerConfig {
     size_t maxKeys = 10000;
     bool appendOnly = true;
     std::string appendFilename = "appendonly.aof";
+    // Redis's default: a power cut loses at most about a second of writes
+    AOFLogger::FsyncPolicy appendFsync = AOFLogger::FsyncPolicy::EverySecond;
 };
 
 static void printUsage(std::ostream& out) {
@@ -24,6 +26,9 @@ static void printUsage(std::ostream& out) {
            "  --maxkeys <n>            Keys to hold before LRU eviction (default 10000)\n"
            "  --appendonly <yes|no>    Log writes to the AOF and replay it at startup (default yes)\n"
            "  --appendfilename <path>  AOF file (default appendonly.aof)\n"
+           "  --appendfsync <always|everysec|no>\n"
+           "                           When the AOF is synced to disk: before every reply,\n"
+           "                           once a second, or when the OS decides (default everysec)\n"
            "  --help                   Show this message\n";
 }
 
@@ -47,8 +52,8 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         std::string option = argv[i];
         if(option == "--help" || option == "-h") return ParseResult::Help;
 
-        if(option != "--port" && option != "--maxkeys" &&
-           option != "--appendonly" && option != "--appendfilename") {
+        if(option != "--port" && option != "--maxkeys" && option != "--appendonly" &&
+           option != "--appendfilename" && option != "--appendfsync") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
             return ParseResult::Error;
         }
@@ -67,6 +72,11 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         } else if(option == "--appendonly") {
             ok = (value == "yes" || value == "no");
             if(ok) config.appendOnly = (value == "yes");
+        } else if(option == "--appendfsync") {
+            if(value == "always") config.appendFsync = AOFLogger::FsyncPolicy::Always;
+            else if(value == "everysec") config.appendFsync = AOFLogger::FsyncPolicy::EverySecond;
+            else if(value == "no") config.appendFsync = AOFLogger::FsyncPolicy::No;
+            else ok = false;
         } else {
             ok = !value.empty();
             if(ok) config.appendFilename = value;
@@ -87,8 +97,9 @@ int main(int argc, char* argv[]) {
         case ParseResult::Run:   break;
     }
 
-    // AOF persistence is optional. Every write is flushed to the OS, so it
-    // survives a process crash; without fsync a power cut can lose recent writes.
+    // AOF persistence is optional. Every write reaches the OS before its reply,
+    // so it survives a process crash; --appendfsync decides when it reaches
+    // the disk, which is what survives a power cut.
     std::optional<AOFLogger> aof;
     if(config.appendOnly) {
         aof.emplace(config.appendFilename);
@@ -114,10 +125,14 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Loaded " << loaded.commands
                   << (loaded.commands == 1 ? " command" : " commands") << " from the AOF\n";
+        // After the replay, which writes nothing worth syncing
+        aofLogger->setFsyncPolicy(config.appendFsync);
     }
 
+    const char* fsync_name = config.appendFsync == AOFLogger::FsyncPolicy::Always ? "always"
+                           : config.appendFsync == AOFLogger::FsyncPolicy::EverySecond ? "everysec" : "no";
     std::cout << "Max keys: " << config.maxKeys << " | AOF: "
-              << (aofLogger ? config.appendFilename : "disabled") << "\n";
+              << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
     Server server(config.port, storage, aofLogger);
     if(!server.start()) {
@@ -125,8 +140,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Block forever, handling client connections
+    // Serve until a stop signal (exit code 0), or until the AOF fails for good
+    // with --appendfsync always (exit code 1)
     server.run();
-
-    return 0;
+    return server.exitCode();
 }

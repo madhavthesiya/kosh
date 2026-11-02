@@ -1,8 +1,10 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 // Append-Only File logger: every write command is appended to a file in RESP
@@ -68,14 +70,35 @@ public:
     // Deferred mode on or off. Turning it off writes what is buffered.
     void setDeferred(bool deferred);
 
+    // When the AOF is synced to the disk with fdatasync() (Redis's appendfsync):
+    //   Always       after every write, so before any reply is sent: a reply
+    //                means the write survives a power cut. With group commit
+    //                that is one sync per pass of the event loop, not per
+    //                command. A write or sync that fails is fatal (failedForGood()).
+    //   EverySecond  by a background thread, once a second if anything was
+    //                written: a power cut loses at most about a second of
+    //                writes. A sync that fails refuses writes, as a failed write
+    //                does (flushPending()), until a sync succeeds.
+    //   No           left to the OS (Linux writes dirty pages back within ~30 s).
+    enum class FsyncPolicy { Always, EverySecond, No };
+    void setFsyncPolicy(FsyncPolicy policy);
+
+    // With Always, a write or sync failed: a reply can no longer mean that the
+    // write is on the disk, so the server must stop, as Redis does
+    bool failedForGood() const { return failed_for_good_; }
+
+    // Syncs done so far, by any policy (for tests)
+    size_t syncs() const { return syncs_; }
+
     // Writes everything buffered, with one write(). True if nothing is left.
     bool flush();
 
     // Tries again to write what failed writes left buffered. True if writes
-    // aren't failing: then a write command may run (its record can be saved).
+    // and syncs aren't failing: then a write command may run (its record can
+    // be saved).
     bool flushPending();
 
-    // Why writing failed, while it is failing
+    // Why writing or syncing failed, while it is failing
     std::string lastWriteError() const;
 
     // False if the file could not be opened; log() would then silently drop writes.
@@ -101,10 +124,14 @@ public:
     std::string getFilename() const { return filename_; }
 
 private:
-    // With mutex_ held. writeBuffer() writes what is buffered; setWriteError()
-    // records why it can't, and returns false.
+    // With mutex_ held. writeBuffer() writes what is buffered (and syncs it,
+    // with Always); setWriteError() records why it can't, and returns false.
     bool writeBuffer();
     bool setWriteError(const std::string& error);
+
+    // EverySecond's background thread, and stopping it
+    void syncEverySecond();
+    void stopSyncThread();
 
     std::string filename_;
     int fd_ = -1;           // opened for appending; -1 if it couldn't be opened
@@ -114,4 +141,14 @@ private:
     std::string write_error_;       // why, while writes are failing
     std::atomic<bool> failing_{false};  // a write failed; read without the lock
     mutable std::mutex mutex_;      // separate mutex from storage — no contention
+
+    FsyncPolicy policy_ = FsyncPolicy::No;
+    bool written_since_sync_ = false;           // data the disk may not have yet
+    std::string sync_error_;                    // why, while syncs are failing
+    std::atomic<bool> sync_failing_{false};     // EverySecond: the last sync failed
+    std::atomic<bool> failed_for_good_{false};  // Always: a write or sync failed
+    std::atomic<size_t> syncs_{0};
+    std::thread sync_thread_;                   // EverySecond only
+    std::condition_variable sync_wake_;         // wakes it early, to stop
+    bool stop_sync_thread_ = false;
 };

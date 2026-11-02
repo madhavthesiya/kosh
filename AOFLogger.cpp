@@ -1,6 +1,7 @@
 #include "AOFLogger.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,8 @@ long long writeSome(int fd, const char* data, size_t size) {
 }
 void closeFile(int fd) { _close(fd); }
 bool syncFile(int fd) { return _commit(fd) == 0; }
+bool syncData(int fd) { return _commit(fd) == 0; }
+int duplicateFile(int fd) { return _dup(fd); }
 bool truncateFile(int fd, size_t size) { return _chsize_s(fd, static_cast<long long>(size)) == 0; }
 // NTFS journals its metadata, and Windows offers no portable way to sync a directory
 bool syncDirectory(const std::string&) { return true; }
@@ -44,6 +47,16 @@ long long writeSome(int fd, const char* data, size_t size) {
 }
 void closeFile(int fd) { close(fd); }
 bool syncFile(int fd) { return fsync(fd) == 0; }
+// The data, and the metadata needed to read it back (the size of a file
+// that grew), but not, say, its modification time: what an AOF needs
+bool syncData(int fd) {
+#ifdef __APPLE__
+    return fsync(fd) == 0;      // macOS has no fdatasync()
+#else
+    return fdatasync(fd) == 0;
+#endif
+}
+int duplicateFile(int fd) { return fcntl(fd, F_DUPFD_CLOEXEC, 0); }
 bool truncateFile(int fd, size_t size) { return ftruncate(fd, static_cast<off_t>(size)) == 0; }
 // A rename is a change to the directory, not to the file: it is on disk only
 // once the directory itself is synced
@@ -84,12 +97,16 @@ AOFLogger::AOFLogger(const std::string& filename)
     : filename_(filename), fd_(openFile(filename, kAppendFlags)) {}
 
 AOFLogger::~AOFLogger() {
+    stopSyncThread();
     // Last chance for buffered records (no other thread can use the logger any
     // more, so no lock)
     if(!buffer_.empty() && !writeBuffer()) {
         std::cerr << "Warning: " << buffer_.size()
                   << " bytes could not be written to the AOF and are lost\n";
     }
+    // On a clean shutdown everything reaches the disk, whatever the policy
+    // promised while running (Redis syncs at shutdown too)
+    if(policy_ != FsyncPolicy::No && written_since_sync_ && fd_ >= 0) syncData(fd_);
     if(fd_ >= 0) closeFile(fd_);
 }
 
@@ -108,15 +125,73 @@ bool AOFLogger::flush() {
     return buffer_.empty() || writeBuffer();
 }
 
-bool AOFLogger::flushPending() {
-    if(!failing_) return true;      // checked without the lock: one load per write command
+void AOFLogger::setFsyncPolicy(FsyncPolicy policy) {
+    stopSyncThread();
     std::lock_guard<std::mutex> lock(mutex_);
-    return writeBuffer();
+    policy_ = policy;
+    if(policy_ == FsyncPolicy::EverySecond) {
+        stop_sync_thread_ = false;
+        sync_thread_ = std::thread([this] { syncEverySecond(); });
+    }
+}
+
+void AOFLogger::stopSyncThread() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_sync_thread_ = true;
+    }
+    sync_wake_.notify_all();
+    if(sync_thread_.joinable()) sync_thread_.join();
+}
+
+// Once a second, if anything was written since the last sync, sync the file.
+// The sync itself runs without the lock: it can take tens of milliseconds on a
+// busy disk, and the event loop must not wait for it. It syncs a duplicate of
+// the descriptor, taken under the lock: the same open file, which stays valid
+// even if a rewrite closes fd_ meanwhile (the rewrite syncs its new file
+// itself, so syncing the replaced one then is merely unnecessary).
+void AOFLogger::syncEverySecond() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while(!stop_sync_thread_) {
+        sync_wake_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_sync_thread_; });
+        if(stop_sync_thread_ || !written_since_sync_ || fd_ < 0) continue;
+        int fd = duplicateFile(fd_);
+        written_since_sync_ = false;
+        lock.unlock();
+        bool synced = fd >= 0 && syncData(fd);
+        int error = errno;
+        if(fd >= 0) closeFile(fd);
+        lock.lock();
+        if(synced) {
+            syncs_++;
+            if(sync_failing_) {
+                sync_failing_ = false;
+                sync_error_.clear();
+                std::cerr << "AOF fsync works again\n";
+            }
+        } else {
+            written_since_sync_ = true;     // still not on the disk: next second
+            if(!sync_failing_) {
+                std::cerr << "Error syncing the AOF (" << std::generic_category().message(error)
+                          << "): write commands are refused until it can be synced\n";
+            }
+            sync_failing_ = true;
+            sync_error_ = "fsync: " + std::generic_category().message(error);
+        }
+    }
+}
+
+bool AOFLogger::flushPending() {
+    // Checked without the lock: two loads per write command
+    if(!failing_ && !sync_failing_) return true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(failing_ && !writeBuffer()) return false;
+    return !sync_failing_;      // cleared by the background thread's next good sync
 }
 
 std::string AOFLogger::lastWriteError() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return write_error_;
+    return failing_ ? write_error_ : sync_error_;
 }
 
 bool AOFLogger::writeBuffer() {
@@ -126,13 +201,30 @@ bool AOFLogger::writeBuffer() {
     if(written < buffer_.size()) {
         // Keep what wasn't written, in order, for the next attempt
         buffer_.erase(0, written);
+        if(policy_ == FsyncPolicy::Always) failed_for_good_ = true;
         return setWriteError(std::generic_category().message(error));
     }
+    // Everything is in the file now, so empty the buffer before anything else:
+    // whatever happens next, these bytes must never be written twice.
     // clear() keeps the capacity, so the next records need no allocation. A
     // burst (a large pipeline) can grow the buffer to megabytes, though, so
     // give that memory back, as Redis does with its AOF buffer.
     if(buffer_.capacity() > kKeepBufferBytes) std::string().swap(buffer_);
     else buffer_.clear();
+
+    if(policy_ == FsyncPolicy::Always) {
+        // Before any reply goes out (the server flushes first). After a failed
+        // sync the kernel may already have dropped the dirty pages, so a retry
+        // that succeeds wouldn't prove the data is on the disk: give up, as
+        // Redis does.
+        if(!syncData(fd_)) {
+            failed_for_good_ = true;
+            return setWriteError("fsync: " + std::generic_category().message(errno));
+        }
+        syncs_++;
+    } else {
+        written_since_sync_ = true;
+    }
     if(failing_) {
         failing_ = false;
         write_error_.clear();
@@ -202,6 +294,7 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
     // belong at the end of the old file; appending them to the new one would
     // apply them twice.
     buffer_.clear();
+    written_since_sync_ = false;        // the new file was synced above
     if(failing_ && fd_ >= 0) {
         failing_ = false;
         write_error_.clear();

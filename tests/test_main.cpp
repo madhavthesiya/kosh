@@ -921,6 +921,75 @@ TEST(test_aof_rewrite_drops_buffered_records) {
     std::remove(aof_file.c_str());
 }
 
+TEST(test_aof_fsync_always_syncs_each_write_or_group) {
+    // appendfsync always: a sync after every write, so before any reply. With
+    // group commit the server writes once per pass, so one sync covers every
+    // command of the pass: that is what makes "always" affordable.
+    const std::string aof_file = "test_aof_fsync_always.aof";
+    std::remove(aof_file.c_str());
+    const std::string record = RespParser::array({"SET", "k", "v"});
+    {
+        AOFLogger aof(aof_file);
+        aof.setFsyncPolicy(AOFLogger::FsyncPolicy::Always);
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)2);          // one per write
+        aof.setDeferred(true);
+        for(int i = 0; i < 3; i++) ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)2);          // buffered: nothing to sync yet
+        ASSERT_TRUE(aof.flush());
+        ASSERT_EQ(aof.syncs(), (size_t)3);          // one write, one sync, for all three
+        ASSERT_TRUE(aof.flush());
+        ASSERT_EQ(aof.syncs(), (size_t)3);          // nothing new: no sync
+        ASSERT_FALSE(aof.failedForGood());
+    }
+    {
+        AOFLogger aof(aof_file);                    // no: the OS decides
+        aof.setFsyncPolicy(AOFLogger::FsyncPolicy::No);
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)0);
+        ASSERT_EQ(aof.readRaw().size(), 6 * record.size());
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_fsync_everysec_syncs_in_the_background) {
+    // appendfsync everysec: a background thread syncs about once a second,
+    // and only if something was written since the last sync
+    const std::string aof_file = "test_aof_fsync_everysec.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setFsyncPolicy(AOFLogger::FsyncPolicy::EverySecond);
+    ASSERT_TRUE(aof.log(RespParser::array({"SET", "k", "v"})));
+    ASSERT_EQ(aof.syncs(), (size_t)0);              // not by the write itself
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while(aof.syncs() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(aof.syncs(), (size_t)1);              // within about a second
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    ASSERT_EQ(aof.syncs(), (size_t)1);              // nothing new: no sync
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_fsync_always_write_error_is_fatal) {
+#ifndef _WIN32
+    // With "always", a reply must mean the write is on the disk. A write that
+    // fails breaks that promise for good, so the server must stop (Redis exits)
+    const std::string aof_file = "test_aof_fsync_always_error.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setFsyncPolicy(AOFLogger::FsyncPolicy::Always);
+    {
+        FileSizeLimit limit(100);
+        ASSERT_FALSE(aof.log(RespParser::array({"SET", "k", std::string(200, 'v')})));
+    }
+    ASSERT_TRUE(aof.failedForGood());
+    ASSERT_EQ(aof.lastWriteError(), "File too large");
+    std::remove(aof_file.c_str());
+#endif
+}
+
 TEST(test_aof_no_log_on_failed_ops) {
     const std::string aof_file = "test_aof_nolog.aof";
     std::remove(aof_file.c_str());
@@ -1904,6 +1973,9 @@ int main() {
     RUN_TEST(test_aof_deferred_writes_wait_for_flush);
     RUN_TEST(test_aof_deferred_write_errors);
     RUN_TEST(test_aof_rewrite_drops_buffered_records);
+    RUN_TEST(test_aof_fsync_always_syncs_each_write_or_group);
+    RUN_TEST(test_aof_fsync_everysec_syncs_in_the_background);
+    RUN_TEST(test_aof_fsync_always_write_error_is_fatal);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
     RUN_TEST(test_aof_logs_absolute_expiry_times);

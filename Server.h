@@ -18,6 +18,9 @@ public:
     void run();         // Event loop — handles multiple clients concurrently
     void stop();
 
+    // 0, or 1 if the server stopped because the AOF failed for good (see flushAof())
+    int exitCode() const { return exit_code_; }
+
 private:
     // One connected client. Received bytes wait in `in` until they form whole
     // commands; replies wait in `out` until the socket takes them. The server
@@ -39,6 +42,7 @@ private:
     void acceptNewClients();                         // New connections on listen socket
     void handleReadable(socket_t fd);                // Data or end of stream on a client socket
     void queueToServe(socket_t fd, Client& client);  // Serve it once this pass has written the AOF
+    bool flushAof();                                 // Before replies go out; false: stop
     void serveClient(socket_t fd);                   // Send replies, run commands, until blocked
     void runCommands(Client& client);                // Execute whole commands from in into out
     void releaseLargeArgs(size_t argc);              // Bound the memory args_ keeps
@@ -76,6 +80,7 @@ private:
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
     bool running_ = false;
+    int exit_code_ = 0;
 
     AOFLogger* aof_ = nullptr;  // optional: flushed before replies are sent, and for BGREWRITEAOF
 

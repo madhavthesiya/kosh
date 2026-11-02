@@ -607,6 +607,34 @@ class AofWriteErrorTest(ServerTestCase):
                 self.assertEqual(c.call("GET", "after"), b"1")
             restarted.stop()
 
+    def test_appendfsync_always_stops_the_server_when_the_aof_fails(self):
+        # With "always", a reply means the write is on the disk. Once a write
+        # fails, that can't be promised any more: the server must not reply,
+        # and stops with exit code 1 (Redis exits too), instead of refusing
+        # writes with MISCONF as it does with "everysec" or "no".
+        value = b"v" * 100
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server("--appendfsync", "always", workdir=workdir, fsize=4096)
+            acknowledged = 0
+            with Client(server.port) as c:
+                with self.assertRaises((ConnectionError, OSError)):
+                    for i in range(100):    # about 30 fit in 4 KB
+                        self.assertEqual(c.call("SET", f"k{i}", value), b"OK")
+                        acknowledged += 1
+            self.assertGreater(acknowledged, 0)
+            self.assertLess(acknowledged, 100)
+            self.assertEqual(server.proc.wait(timeout=5), 1)
+            self.assertIn("with --appendfsync always a reply must mean the write is on disk",
+                          server.output())
+            server.stop()
+
+            # Every write that was acknowledged is on the disk
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in range(acknowledged):
+                    self.assertEqual(c.call("GET", f"k{i}"), value, f"k{i} was acknowledged")
+            restarted.stop()
+
 
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
@@ -623,6 +651,7 @@ class CommandLineTest(ServerTestCase):
             ("--port", "0"), ("--port", "65536"), ("--port", "80abc"), ("--port", "-1"),
             ("--port",), ("--maxkeys", "0"), ("--maxkeys", "ten"),
             ("--appendonly", "maybe"), ("--appendfilename", ""), ("--bogus",),
+            ("--appendfsync", "sometimes"), ("--appendfsync",),
         ]
         for args in cases:
             with self.subTest(args=args):

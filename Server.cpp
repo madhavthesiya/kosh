@@ -230,9 +230,10 @@ void Server::run() {
         }
 
         // 2. Group commit: one write() hands the OS the AOF records of every
-        //    command this pass ran, where each command used to make its own.
+        //    command this pass ran, where each command used to make its own
+        //    (with --appendfsync always, one sync puts them on the disk).
         //    Redis does the same in beforeSleep().
-        if(aof_) aof_->flush();
+        if(!flushAof()) break;
 
         // 3. Only now send the replies, so none leaves before its record is
         //    with the OS. (serveClient() flushes again before sending replies to
@@ -370,6 +371,23 @@ void Server::handleReadable(socket_t fd) {
     if(!client.out.empty()) queueToServe(fd, client);
 }
 
+// Hands the AOF records of the commands run so far to the OS, and with
+// --appendfsync always to the disk. False if that has failed for good: with
+// always, a reply must mean the write is on the disk, which can no longer be
+// promised. Then no reply is sent and the server stops, as Redis exits.
+bool Server::flushAof() {
+    if(!aof_) return true;
+    aof_->flush();
+    if(!aof_->failedForGood()) return true;
+    if(running_) {
+        std::cerr << "Stopping: the AOF can't be written or synced (" << aof_->lastWriteError()
+                  << "), and with --appendfsync always a reply must mean the write is on disk\n";
+    }
+    running_ = false;
+    exit_code_ = 1;
+    return false;
+}
+
 void Server::queueToServe(socket_t fd, Client& client) {
     if(client.queued) return;
     client.queued = true;
@@ -387,7 +405,7 @@ void Server::serveClient(socket_t fd) {
         if(client.out_sent < client.out.size()) {
             // No reply leaves before the AOF records of its commands are with the
             // OS. Usually run() has written them already and this does nothing.
-            if(aof_) aof_->flush();
+            if(!flushAof()) return;
             SendStatus status = sendReplies(fd, client);
             if(status == SendStatus::Failed) {     // the client has gone
                 removeClient(fd);

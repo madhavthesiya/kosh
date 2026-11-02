@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--clients", type=int, default=50, help="connections (-c)")
     p.add_argument("--pipelines", default="1,16", help="pipeline depths (-P)")
     p.add_argument("--aof", default="on,off", help="AOF settings to measure")
+    p.add_argument("--appendfsync", default="no", choices=["always", "everysec", "no"],
+                   help="when both servers sync the AOF to disk (default no)")
     p.add_argument("--server-cpu", default="2", help="CPU list for the server (taskset)")
     # redis-benchmark does about as much work per request as the server (one read and
     # one write system call), so one client thread can run out of CPU first. Two give
@@ -115,9 +117,10 @@ def measure(args, binaries, run, server, aof, pipeline):
         port = bl.free_port()
         if server == "mini":
             # Twice the keyspace, so SET never evicts.
-            argv = bl.mini_redis_argv(binaries["mini"], port, workdir, aof, 2 * args.keyspace)
+            argv = bl.mini_redis_argv(binaries["mini"], port, workdir, aof, 2 * args.keyspace,
+                                      args.appendfsync)
         else:
-            argv = bl.redis_argv(binaries["redis"], port, workdir, aof)
+            argv = bl.redis_argv(binaries["redis"], port, workdir, aof, args.appendfsync)
         with bl.Server(argv, workdir, port, cpus=args.server_cpu) as srv:
             srv.wait_ready()
             for test in ("set", "get"):
@@ -249,10 +252,11 @@ def main():
     example = Path("<tmp>")
     if "mini" in args.servers:
         commands.append(show(bl.pinned(args.server_cpu, bl.mini_redis_argv(
-            "build-bench/mini_redis_server", "<port>", example, True, 2 * args.keyspace))))
+            "build-bench/mini_redis_server", "<port>", example, True, 2 * args.keyspace,
+            args.appendfsync))))
     if "redis" in args.servers:
         commands.append(show(bl.pinned(args.server_cpu, bl.redis_argv(
-            "redis-server", "<port>", example, True))))
+            "redis-server", "<port>", example, True, args.appendfsync))))
     commands.append(show(bl.pinned(args.client_cpus, [
         "redis-benchmark", "-h", "127.0.0.1", "-p", "<port>", "-t", "<set|get>",
         "-n", "<requests>", "-r", str(args.keyspace), "-c", str(args.clients),
