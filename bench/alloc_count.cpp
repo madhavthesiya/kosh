@@ -54,6 +54,13 @@ void row(const char* what, double allocations) {
     std::printf("| %s | %.2f |\n", what, allocations);
 }
 
+// Runs a command the way the server does, its reply ending up in `out`. `out`
+// is emptied, keeping its memory, before it grows past half a megabyte.
+void runInto(std::string& out, CommandContext& ctx, const std::vector<std::string>& args) {
+    out += executeCommand(ctx, args);
+    if(out.size() > (1 << 19)) out.clear();
+}
+
 }  // namespace
 
 int main() {
@@ -108,24 +115,30 @@ int main() {
     std::string out;
     out.reserve(1 << 20);
     row("Command: GET (dispatch, engine, reply)", perCall([&](size_t i) {
-        out += executeCommand(plain, get_args[i % kKeys]);
-        if(out.size() > (1 << 19)) out.clear();
+        runInto(out, plain, get_args[i % kKeys]);
     }));
     row("Command: SET, AOF on (dispatch, engine, log, reply)", perCall([&](size_t i) {
-        out += executeCommand(with_aof, set_args[i % kKeys]);
-        if(out.size() > (1 << 19)) out.clear();
+        runInto(out, with_aof, set_args[i % kKeys]);
     }));
 
     // A whole request as the server handles it: parse, run, append the reply
     row("Request: GET, parsed and run", perCall([&](size_t i) {
-        auto parsed = RespParser::parse(get_requests[i % kKeys]);
-        out += executeCommand(plain, parsed.args);
-        if(out.size() > (1 << 19)) out.clear();
+        runInto(out, plain, RespParser::parse(get_requests[i % kKeys]).args);
     }));
     row("Request: SET, AOF on, parsed and run", perCall([&](size_t i) {
-        auto parsed = RespParser::parse(set_requests[i % kKeys]);
-        out += executeCommand(with_aof, parsed.args);
-        if(out.size() > (1 << 19)) out.clear();
+        runInto(out, with_aof, RespParser::parse(set_requests[i % kKeys]).args);
+    }));
+
+    // 100-byte values, too long for the small-string buffer (redis-benchmark
+    // sends 3 bytes unless told otherwise): each copy of one is an allocation
+    InMemoryStorage big(2 * kKeys, nullptr);
+    for(const auto& k : keys) big.set(k, std::string(100, 'v'));
+    CommandContext big_ctx{big};
+    row("Command: GET of a 100-byte value", perCall([&](size_t i) {
+        runInto(out, big_ctx, get_args[i % kKeys]);
+    }));
+    row("Request: GET of a 100-byte value, parsed and run", perCall([&](size_t i) {
+        runInto(out, big_ctx, RespParser::parse(get_requests[i % kKeys]).args);
     }));
     return 0;
 }
