@@ -417,7 +417,8 @@ void Server::runCommands(Client& client) {
     size_t pos = 0;
     CommandContext ctx{storage_, aof_, clients_.size()};
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
-        auto parsed = RespParser::parse(std::string_view(client.in).substr(pos));
+        // Into args_, whose strings are reused from command to command
+        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_);
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
@@ -428,10 +429,11 @@ void Server::runCommands(Client& client) {
             return;
         }
         pos += parsed.consumed;
-        const auto& args = parsed.args;
-        if(args.empty()) continue;
+        if(parsed.argc == 0) continue;
 
-        executeCommand(ctx, args, client.out);      // the reply goes straight into the buffer
+        // The reply goes straight into the client's buffer
+        executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
+        releaseLargeArgs(parsed.argc);
 
         // QUIT: send its reply, then disconnect; commands after it don't run
         if(ctx.close_connection) {
@@ -441,6 +443,19 @@ void Server::runCommands(Client& client) {
         }
     }
     client.in.erase(0, pos);
+}
+
+// args_ keeps its memory so that parsing allocates nothing, but one command
+// with a huge argument (up to 512 MB) or very many would leave it that large
+// for good. Give such memory back, as Redis shrinks a client's query buffer.
+void Server::releaseLargeArgs(size_t argc) {
+    for(size_t i = 0; i < argc; i++) {
+        if(args_[i].capacity() > kKeepArgBytes) std::string().swap(args_[i]);
+    }
+    if(args_.size() > kKeepArgs) {
+        args_.resize(kKeepArgs);
+        args_.shrink_to_fit();
+    }
 }
 
 // Sends as much of the waiting replies as the socket takes. A partial send is

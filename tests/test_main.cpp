@@ -1671,6 +1671,35 @@ TEST(test_resp_parse_incomplete) {
     ASSERT_TRUE(parsed.args.empty());
 }
 
+TEST(test_resp_parse_into_reuses_argument_strings) {
+    // The server parses every command into the same strings, so parsing
+    // allocates nothing once they are large enough. A 16-byte key is too long
+    // for the small-string buffer: the same heap buffer must be reused.
+    std::vector<std::string> args;
+    auto first = RespParser::parseInto(RespParser::array({"SET", "key:000000000001", "v"}), args);
+    ASSERT_TRUE(first.status == RespParser::ParseStatus::Ok);
+    ASSERT_EQ(first.argc, (size_t)3);
+    const char* key_buffer = args[1].data();
+    auto second = RespParser::parseInto(RespParser::array({"SET", "key:000000000002", "w"}), args);
+    ASSERT_EQ(second.argc, (size_t)3);
+    ASSERT_EQ(args[1], "key:000000000002");
+    ASSERT_EQ(args[2], "w");
+    ASSERT_TRUE(args[1].data() == key_buffer);          // no new allocation
+
+    // A shorter command: argc says how many are its own; the rest are kept
+    auto get = RespParser::parseInto(RespParser::array({"GET", "k"}), args);
+    ASSERT_EQ(get.argc, (size_t)2);
+    ASSERT_EQ(args[0], "GET");
+    ASSERT_EQ(args[1], "k");
+    ASSERT_EQ(args.size(), (size_t)3);
+
+    // Inline commands go into the same strings
+    auto inline_cmd = RespParser::parseInto("RPUSH list a b c\r\n", args);
+    ASSERT_EQ(inline_cmd.argc, (size_t)5);
+    ASSERT_EQ(args[4], "c");
+    ASSERT_EQ(inline_cmd.consumed, (size_t)18);
+}
+
 TEST(test_resp_parse_multiple_commands) {
     // Two commands in one buffer (common with TCP pipelining)
     std::string input = "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$4\r\nname\r\n";
@@ -1907,6 +1936,7 @@ int main() {
     RUN_TEST(test_resp_parse_array);
     RUN_TEST(test_resp_parse_inline);
     RUN_TEST(test_resp_parse_incomplete);
+    RUN_TEST(test_resp_parse_into_reuses_argument_strings);
     RUN_TEST(test_resp_parse_multiple_commands);
     RUN_TEST(test_resp_empty_array_is_skipped);
     RUN_TEST(test_resp_rejects_malformed_input);

@@ -8,8 +8,6 @@
 
 namespace {
 
-using Args = std::vector<std::string>;
-
 std::string toUpper(std::string_view s) {
     std::string upper(s);
     // std::toupper needs an unsigned char value: passing a plain char that is
@@ -391,7 +389,7 @@ bool arityMatches(const Command& cmd, size_t argc) {
     return argc >= static_cast<size_t>(-cmd.arity);
 }
 
-void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out) {
+void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.empty()) return RespParser::appendError(out, "ERR empty command");
     const Command* cmd = lookupCommand(args[0]);
     if(!cmd) {
@@ -412,9 +410,13 @@ void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, s
     cmd->handler(ctx, args, out);
 }
 
+void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out) {
+    executeCommand(ctx, Args(args), out);
+}
+
 std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args) {
     std::string reply;
-    executeCommand(ctx, args, reply);
+    executeCommand(ctx, Args(args), reply);
     return reply;
 }
 
@@ -426,6 +428,7 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
     CommandContext ctx{storage};
     LoadingGuard loading(storage);
     std::string discarded;      // replies: nobody reads them
+    std::vector<std::string> scratch;   // every record is parsed into these strings
 
     auto damaged = [&](size_t at, const std::string& reason) {
         result.ok = false;
@@ -440,7 +443,7 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
     // buffer moved the whole rest of the file every time: quadratic in its size.
     size_t pos = 0;
     while(pos < buffer.size()) {
-        auto parsed = RespParser::parse(std::string_view(buffer).substr(pos));
+        auto parsed = RespParser::parseInto(std::string_view(buffer).substr(pos), scratch);
         if(parsed.status == RespParser::ParseStatus::NeedMore) {
             // The file ends partway through a record: the server stopped while
             // writing it. Cut it off, or new records would be appended after it
@@ -458,7 +461,7 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
         }
         if(parsed.status == RespParser::ParseStatus::Error) return damaged(pos, parsed.error);
 
-        const auto& args = parsed.args;
+        Args args(scratch.data(), parsed.argc);
         if(!args.empty()) {
             // Only write commands are logged, so anything else means the file is damaged
             const Command* cmd = lookupCommand(args[0]);

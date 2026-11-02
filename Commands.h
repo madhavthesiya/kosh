@@ -20,9 +20,27 @@ struct CommandContext {
     bool close_connection = false;  // set by QUIT: close once its reply is sent
 };
 
+// A command's arguments (args[0] is its name): a view of strings the caller
+// owns. The server parses every command into the same strings, which keep their
+// memory from one command to the next, so it needs no vector per command.
+class Args {
+public:
+    Args(const std::string* data, size_t size) : data_(data), size_(size) {}
+    Args(const std::vector<std::string>& args) : data_(args.data()), size_(args.size()) {}
+
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    const std::string& operator[](size_t i) const { return data_[i]; }
+    const std::string* begin() const { return data_; }
+    const std::string* end() const { return data_ + size_; }
+
+private:
+    const std::string* data_;
+    size_t size_;
+};
+
 // Appends the command's RESP reply to `out`
-using CommandHandler = void (*)(CommandContext& ctx, const std::vector<std::string>& args,
-                                std::string& out);
+using CommandHandler = void (*)(CommandContext& ctx, const Args& args, std::string& out);
 
 struct Command {
     const char* name;       // lower case, as Redis's error messages quote it
@@ -40,9 +58,11 @@ bool arityMatches(const Command& cmd, size_t argc);
 
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.
-void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out);
+void executeCommand(CommandContext& ctx, const Args& args, std::string& out);
 
-// The same, returning the reply (for tests and tools)
+// The same, for arguments in a vector of their own, appending, or returning
+// the reply (for tests and tools)
+void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out);
 std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args);
 
 // What replayAOF() found in the file

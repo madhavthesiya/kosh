@@ -41,6 +41,7 @@ private:
     void queueToServe(socket_t fd, Client& client);  // Serve it once this pass has written the AOF
     void serveClient(socket_t fd);                   // Send replies, run commands, until blocked
     void runCommands(Client& client);                // Execute whole commands from in into out
+    void releaseLargeArgs(size_t argc);              // Bound the memory args_ keeps
     SendStatus sendReplies(socket_t fd, Client& client);
     void updateInterest(socket_t fd, Client& client);
     void removeClient(socket_t fd);                  // Cleanup on disconnect
@@ -66,6 +67,11 @@ private:
     // slowed down by TCP flow control instead of being cut off.
     static constexpr size_t kOutputHighWater = size_t(1) << 20;
 
+    // The parsed arguments keep their memory between commands, up to this much
+    // per argument and this many arguments; more is given back after use
+    static constexpr size_t kKeepArgBytes = 64 * 1024;
+    static constexpr size_t kKeepArgs = 1024;
+
     int port_;
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
@@ -86,4 +92,9 @@ private:
     // Clients with replies to send in this pass of the loop, in order. They are
     // served after the pass's AOF records are written (group commit).
     std::vector<socket_t> to_serve_;
+
+    // Every command is parsed into these strings, which keep their memory, so
+    // parsing allocates nothing once they are large enough. One set serves all
+    // clients: commands run one at a time, and none keeps its arguments.
+    std::vector<std::string> args_;
 };

@@ -61,6 +61,15 @@ void runInto(std::string& out, CommandContext& ctx, const std::vector<std::strin
     if(out.size() > (1 << 19)) out.clear();
 }
 
+// A whole request as the server handles it: parsed into argument strings that
+// are reused from request to request, then run, its reply appended to `out`
+void requestInto(std::string& out, CommandContext& ctx, const std::string& request,
+                 std::vector<std::string>& args) {
+    auto parsed = RespParser::parseInto(request, args);
+    executeCommand(ctx, Args(args.data(), parsed.argc), out);
+    if(out.size() > (1 << 19)) out.clear();
+}
+
 }  // namespace
 
 int main() {
@@ -85,13 +94,13 @@ int main() {
     std::printf("%zu keys of 16 bytes, 3-byte values, averages over %zu operations.\n\n", kKeys, kOps);
     std::printf("| Operation | Allocations |\n|---|---:|\n");
 
+    // Parsed as the server does, into argument strings reused between requests
+    std::vector<std::string> args;
     row("Parse a GET request", perCall([&](size_t i) {
-        auto parsed = RespParser::parse(get_requests[i % kKeys]);
-        (void)parsed;
+        RespParser::parseInto(get_requests[i % kKeys], args);
     }));
     row("Parse a SET request", perCall([&](size_t i) {
-        auto parsed = RespParser::parse(set_requests[i % kKeys]);
-        (void)parsed;
+        RespParser::parseInto(set_requests[i % kKeys], args);
     }));
     row("Engine: GET of an existing key", perCall([&](size_t i) {
         auto r = storage.get(keys[i % kKeys]);
@@ -123,10 +132,10 @@ int main() {
 
     // A whole request as the server handles it: parse, run, append the reply
     row("Request: GET, parsed and run", perCall([&](size_t i) {
-        runInto(out, plain, RespParser::parse(get_requests[i % kKeys]).args);
+        requestInto(out, plain, get_requests[i % kKeys], args);
     }));
     row("Request: SET, AOF on, parsed and run", perCall([&](size_t i) {
-        runInto(out, with_aof, RespParser::parse(set_requests[i % kKeys]).args);
+        requestInto(out, with_aof, set_requests[i % kKeys], args);
     }));
 
     // 100-byte values, too long for the small-string buffer (redis-benchmark
@@ -138,7 +147,7 @@ int main() {
         runInto(out, big_ctx, get_args[i % kKeys]);
     }));
     row("Request: GET of a 100-byte value, parsed and run", perCall([&](size_t i) {
-        runInto(out, big_ctx, RespParser::parse(get_requests[i % kKeys]).args);
+        requestInto(out, big_ctx, get_requests[i % kKeys], args);
     }));
     return 0;
 }
