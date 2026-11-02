@@ -20,7 +20,9 @@ struct CommandContext {
     bool close_connection = false;  // set by QUIT: close once its reply is sent
 };
 
-using CommandHandler = std::string (*)(CommandContext& ctx, const std::vector<std::string>& args);
+// Appends the command's RESP reply to `out`
+using CommandHandler = void (*)(CommandContext& ctx, const std::vector<std::string>& args,
+                                std::string& out);
 
 struct Command {
     const char* name;       // lower case, as Redis's error messages quote it
@@ -36,7 +38,11 @@ constexpr unsigned kCmdWrite = 1u << 0;
 const Command* lookupCommand(std::string_view name);
 bool arityMatches(const Command& cmd, size_t argc);
 
-// Runs one command (args[0] is its name) and returns its RESP reply
+// Runs one command (args[0] is its name) and appends its RESP reply to `out`.
+// The server passes the client's output buffer, so a reply is built in place.
+void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out);
+
+// The same, returning the reply (for tests and tools)
 std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args);
 
 // What replayAOF() found in the file

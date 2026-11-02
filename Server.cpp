@@ -431,7 +431,7 @@ void Server::runCommands(Client& client) {
         const auto& args = parsed.args;
         if(args.empty()) continue;
 
-        client.out += executeCommand(ctx, args);
+        executeCommand(ctx, args, client.out);      // the reply goes straight into the buffer
 
         // QUIT: send its reply, then disconnect; commands after it don't run
         if(ctx.close_connection) {

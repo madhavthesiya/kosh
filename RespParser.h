@@ -3,6 +3,7 @@
 #include <cctype>
 #include <charconv>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <initializer_list>
 #include <string>
@@ -126,6 +127,39 @@ public:
     static void appendArray(std::string& out, std::initializer_list<std::string_view> items) {
         appendLength(out, '*', items.size());
         for(std::string_view item : items) appendBulk(out, item);
+    }
+
+    static void appendArray(std::string& out, const std::vector<std::string>& items) {
+        appendLength(out, '*', items.size());
+        for(const auto& item : items) appendBulk(out, item);
+    }
+
+    static void appendSimpleString(std::string& out, std::string_view s) {
+        out += '+';
+        out.append(s);
+        out += "\r\n";
+    }
+
+    // As error(): line breaks in the message become spaces
+    static void appendError(std::string& out, std::string_view message) {
+        out += '-';
+        size_t start = out.size();
+        out.append(message);
+        std::replace_if(out.begin() + static_cast<std::ptrdiff_t>(start), out.end(),
+                        [](char c) { return c == '\r' || c == '\n'; }, ' ');
+        out += "\r\n";
+    }
+
+    static void appendInteger(std::string& out, long long n) {
+        char digits[24];    // enough for any 64-bit value and its sign
+        auto result = std::to_chars(digits, digits + sizeof(digits), n);
+        out += ':';
+        out.append(digits, result.ptr);
+        out += "\r\n";
+    }
+
+    static void appendNull(std::string& out) {
+        out += "$-1\r\n";
     }
 
 private:

@@ -57,7 +57,7 @@ void row(const char* what, double allocations) {
 // Runs a command the way the server does, its reply ending up in `out`. `out`
 // is emptied, keeping its memory, before it grows past half a megabyte.
 void runInto(std::string& out, CommandContext& ctx, const std::vector<std::string>& args) {
-    out += executeCommand(ctx, args);
+    executeCommand(ctx, args, out);
     if(out.size() > (1 << 19)) out.clear();
 }
 

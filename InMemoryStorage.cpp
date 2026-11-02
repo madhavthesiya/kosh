@@ -233,20 +233,12 @@ Result InMemoryStorage::ttl(const std::string& key){
 
 // ==================== String Operations ====================
 
+// A copy of the value, through readString() (which the server uses directly)
 Result InMemoryStorage::get(const std::string& key){
-    std::unique_lock lock(mutex_);
-    auto it = data_.find(key);
-    if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(it->second)) {
-        expireKey(key);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    }
-    // Type check: GET only works on strings
-    if(getDataType(it->second) != DataType::STRING) {
-        return Result::fail(ErrorCode::WRONG_TYPE);
-    }
-    touchLRU(it->second);
-    return Result::ok(std::get<std::string>(it->second.value));
+    std::string value;
+    Result r = readString(key, [&value](const std::string& stored) { value = stored; });
+    if(r.success) r.value = std::move(value);
+    return r;
 }
 
 Result InMemoryStorage::set(const std::string& key, const std::string& value){

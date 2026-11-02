@@ -1501,6 +1501,22 @@ TEST(test_dispatch_replies) {
     ASSERT_EQ(executeCommand(ctx, {"BGREWRITEAOF"}).substr(0, 5), "-ERR ");   // AOF is off
 }
 
+TEST(test_dispatch_appends_replies) {
+    // The server passes a client's output buffer, which can still hold replies
+    // the socket hasn't taken: a reply must be appended, never replace them
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    std::string out = "+earlier reply\r\n";
+    executeCommand(ctx, {"SET", "k", std::string(100, 'v')}, out);
+    executeCommand(ctx, {"GET", "k"}, out);
+    executeCommand(ctx, {"GET", "missing"}, out);
+    executeCommand(ctx, {"LPUSH", "k", "x"}, out);       // wrong type
+    executeCommand(ctx, {"NOSUCH"}, out);
+    ASSERT_EQ(out, "+earlier reply\r\n+OK\r\n$100\r\n" + std::string(100, 'v') + "\r\n$-1\r\n"
+                   "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                   "-ERR unknown command 'NOSUCH'\r\n");
+}
+
 TEST(test_dispatch_quit_closes_connection) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
@@ -1879,6 +1895,7 @@ int main() {
     RUN_TEST(test_dispatch_checks_arity);
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
+    RUN_TEST(test_dispatch_appends_replies);
     RUN_TEST(test_dispatch_quit_closes_connection);
     RUN_TEST(test_dispatch_set_options);
     RUN_TEST(test_dispatch_set_rejects_bad_options);

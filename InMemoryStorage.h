@@ -43,6 +43,13 @@ class InMemoryStorage : public StorageInterface {
         Result set(const std::string& key, const std::string& value, int ttlSeconds) override;
         Result get(const std::string& key) override;
 
+        // GET without copying the value: calls use(value) with the stored string
+        // while holding the lock (so `use` must not call back into this object),
+        // and marks the key used, as get() does. The server writes the reply
+        // straight from the stored value into the client's output buffer.
+        template<typename Use>
+        Result readString(const std::string& key, Use&& use);
+
         // Key operations
         Result del(const std::string& key) override;
         Result exists(const std::string& key) override;
@@ -175,3 +182,18 @@ class InMemoryStorage : public StorageInterface {
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
         bool loading_ = false;              // replaying the AOF (see setLoading)
 };
+
+template<typename Use>
+Result InMemoryStorage::readString(const std::string& key, Use&& use) {
+    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the LRU order changes
+    auto it = data_.find(key);
+    if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    if(isExpired(it->second)) {
+        expireKey(key);
+        return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    }
+    if(getDataType(it->second) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
+    touchLRU(it->second);
+    use(std::get<std::string>(it->second.value));
+    return Result::ok();
+}
