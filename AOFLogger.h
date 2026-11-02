@@ -23,6 +23,14 @@
 //   Durability needs fsync(), truncation needs ftruncate(), and handling a
 //   failed write needs to know how many bytes reached the file. A stream gives
 //   access to none of these.
+//
+// Group commit (deferred mode, used by the server):
+//   Records are only buffered as commands run, and flush() writes everything
+//   buffered with one write(). The server flushes once per pass of its event
+//   loop, and always before sending a reply, so no client ever sees a reply
+//   whose record isn't with the OS yet: the same guarantee as one write() per
+//   command, for far fewer system calls. Redis does the same (it writes its AOF
+//   buffer in beforeSleep(), before sending replies).
 
 class AOFLogger {
 public:
@@ -33,9 +41,11 @@ public:
     AOFLogger& operator=(const AOFLogger&) = delete;
 
     // Appends a complete RESP record to the AOF (thread-safe). No trailing \n is
-    // added: RESP has its own terminators (\r\n). It is written at once, with
-    // one write(): it then survives a process crash, but without fsync a power
-    // cut can still lose it.
+    // added: RESP has its own terminators (\r\n).
+    //
+    // Immediate mode (the default): written at once, with one write(). It then
+    // survives a process crash, but without fsync a power cut can still lose it.
+    // Deferred mode: buffered until flush().
     //
     // If a write fails (a full disk), the bytes it didn't write stay buffered,
     // and later records go after them, so nothing is lost or reordered; they are
@@ -51,8 +61,15 @@ public:
     bool logWith(Append&& append) {
         std::lock_guard<std::mutex> lock(mutex_);
         append(buffer_);
+        if(deferred_) return !failing_;
         return writeBuffer();
     }
+
+    // Deferred mode on or off. Turning it off writes what is buffered.
+    void setDeferred(bool deferred);
+
+    // Writes everything buffered, with one write(). True if nothing is left.
+    bool flush();
 
     // Tries again to write what failed writes left buffered. True if writes
     // aren't failing: then a write command may run (its record can be saved).
@@ -93,6 +110,7 @@ private:
     int fd_ = -1;           // opened for appending; -1 if it couldn't be opened
     std::string last_error_;        // why the last rewrite or truncate failed
     std::string buffer_;            // records not written yet, in order
+    bool deferred_ = false;         // buffer until flush(), instead of writing at once
     std::string write_error_;       // why, while writes are failing
     std::atomic<bool> failing_{false};  // a write failed; read without the lock
     mutable std::mutex mutex_;      // separate mutex from storage — no contention

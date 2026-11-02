@@ -57,11 +57,16 @@ void raiseOpenFileLimit(rlim_t wanted) {
 
 }  // namespace
 
+// The server batches AOF writes (group commit, see run()): the logger only
+// buffers records, and the server writes them before sending any reply.
 Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
-    : port_(port), storage_(storage), aof_(aof) {}
+    : port_(port), storage_(storage), aof_(aof) {
+    if(aof_) aof_->setDeferred(true);
+}
 
 Server::~Server() {
     stop();
+    if(aof_) aof_->setDeferred(false);      // writes whatever is still buffered
 }
 
 // ==================== Lifecycle ====================
@@ -210,8 +215,10 @@ void Server::run() {
             continue;
         }
 
-        // `ready` is a separate list, so removing a client below while going
-        // through it is safe.
+        // 1. Read from every ready client and run its commands. Their replies
+        //    wait in each client's output buffer, their AOF records in the AOF's.
+        //    (`ready` is a separate list, so removing a client while going
+        //    through it is safe.)
         for(const auto& event : ready) {
             if(event.fd == listen_socket_) {
                 acceptNewClients();
@@ -219,8 +226,24 @@ void Server::run() {
             }
             // Each check also skips a client removed earlier in this pass
             if(event.readable && clients_.count(event.fd)) handleReadable(event.fd);
-            if(event.writable && clients_.count(event.fd)) serveClient(event.fd);
+            if(event.writable && clients_.count(event.fd)) queueToServe(event.fd, clients_.at(event.fd));
         }
+
+        // 2. Group commit: one write() hands the OS the AOF records of every
+        //    command this pass ran, where each command used to make its own.
+        //    Redis does the same in beforeSleep().
+        if(aof_) aof_->flush();
+
+        // 3. Only now send the replies, so none leaves before its record is
+        //    with the OS. (serveClient() flushes again before sending replies to
+        //    commands it runs itself.)
+        for(socket_t fd : to_serve_) {
+            auto it = clients_.find(fd);
+            if(it == clients_.end()) continue;      // removed earlier in this pass
+            it->second.queued = false;
+            serveClient(fd);
+        }
+        to_serve_.clear();
     }
     // Connections and the AOF are closed by stop() and the destructors, which
     // run normally now instead of the process being killed by the signal.
@@ -341,7 +364,16 @@ void Server::handleReadable(socket_t fd) {
         removeClient(fd);
         return;
     }
-    serveClient(fd);
+    // Run its commands now; the replies are sent once the pass has written
+    // the AOF (see run())
+    runCommands(client);
+    if(!client.out.empty()) queueToServe(fd, client);
+}
+
+void Server::queueToServe(socket_t fd, Client& client) {
+    if(client.queued) return;
+    client.queued = true;
+    to_serve_.push_back(fd);
 }
 
 // Sends what the client has waiting, then runs its next commands, until it has
@@ -353,6 +385,9 @@ void Server::serveClient(socket_t fd) {
     Client& client = clients_.at(fd);
     while(true) {
         if(client.out_sent < client.out.size()) {
+            // No reply leaves before the AOF records of its commands are with the
+            // OS. Usually run() has written them already and this does nothing.
+            if(aof_) aof_->flush();
             SendStatus status = sendReplies(fd, client);
             if(status == SendStatus::Failed) {     // the client has gone
                 removeClient(fd);

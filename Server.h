@@ -30,6 +30,7 @@ private:
         bool close_after_reply = false;  // QUIT or a protocol error: close once `out` is sent
         bool want_read = true;           // what the poller is currently asked to report
         bool want_write = false;
+        bool queued = false;             // in to_serve_ for this pass of the loop
     };
 
     enum class SendStatus { Done, Blocked, Failed };
@@ -37,6 +38,7 @@ private:
     // I/O multiplexing handlers
     void acceptNewClients();                         // New connections on listen socket
     void handleReadable(socket_t fd);                // Data or end of stream on a client socket
+    void queueToServe(socket_t fd, Client& client);  // Serve it once this pass has written the AOF
     void serveClient(socket_t fd);                   // Send replies, run commands, until blocked
     void runCommands(Client& client);                // Execute whole commands from in into out
     SendStatus sendReplies(socket_t fd, Client& client);
@@ -69,7 +71,7 @@ private:
     InMemoryStorage& storage_;
     bool running_ = false;
 
-    AOFLogger* aof_ = nullptr;  // optional — for BGREWRITEAOF
+    AOFLogger* aof_ = nullptr;  // optional: flushed before replies are sent, and for BGREWRITEAOF
 
     // Tells the event loop which sockets are ready
     std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();
@@ -80,4 +82,8 @@ private:
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
+
+    // Clients with replies to send in this pass of the loop, in order. They are
+    // served after the pass's AOF records are written (group commit).
+    std::vector<socket_t> to_serve_;
 };

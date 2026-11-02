@@ -511,6 +511,64 @@ class AofDamageTest(ServerTestCase):
             self.assertIn(b"damaged at byte %d" % len(good), result.stderr)
 
 
+def pipeline(client, commands):
+    """Sends all `commands` at once, then reads one reply for each."""
+    client.sock.sendall(b"".join(Client.encode(cmd) for cmd in commands))
+    return [client.read_reply() for _ in commands]
+
+
+class AofGroupCommitTest(ServerTestCase):
+    """The server writes the AOF records of every command in one pass of its
+    event loop with one write(), before sending any of their replies. These
+    tests put many commands, from many clients, into the same passes."""
+
+    def test_pipelined_writes_from_many_clients_survive_a_restart(self):
+        # RPUSH is not idempotent: a record written twice, or lost, changes a
+        # list's length, so this catches duplicates as well as gaps
+        clients, per_client = 5, 400
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            connections = [Client(server.port) for _ in range(clients)]
+            try:
+                for i, c in enumerate(connections):     # send everything first...
+                    c.sock.sendall(b"".join(
+                        Client.encode(("SET", f"k{i}:{n}", f"v{n}")) + Client.encode(("RPUSH", f"list{i}", n))
+                        for n in range(per_client)))
+                for i, c in enumerate(connections):     # ...then read every reply
+                    for n in range(per_client):
+                        self.assertEqual(c.read_reply(), b"OK")
+                        self.assertEqual(c.read_reply(), n + 1)
+            finally:
+                for c in connections:
+                    c.close()
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in range(clients):
+                    self.assertEqual(c.call("LLEN", f"list{i}"), per_client)
+                    for n in (0, per_client // 2, per_client - 1):
+                        self.assertEqual(c.call("GET", f"k{i}:{n}"), f"v{n}".encode())
+            restarted.stop()
+
+    def test_bgrewriteaof_in_the_middle_of_a_pipeline(self):
+        # The rewrite's snapshot includes the first RPUSH, whose record is still
+        # buffered: it must not also be written after the new file, or replay
+        # would apply it twice. The second RPUSH comes after the snapshot and
+        # must be kept.
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                replies = pipeline(c, [("RPUSH", "l", "a"), ("BGREWRITEAOF",), ("RPUSH", "l", "b")])
+                self.assertEqual(replies, [1, b"OK", 2])
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                self.assertEqual(c.call("LRANGE", "l", 0, -1), [b"a", b"b"])
+            restarted.stop()
+
+
 @unittest.skipIf(resource is None or not hasattr(resource, "prlimit"), "needs Linux prlimit")
 class AofWriteErrorTest(ServerTestCase):
     """A full disk, played by a 4 KB limit on the size of the files the server

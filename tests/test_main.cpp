@@ -838,6 +838,89 @@ TEST(test_aof_rewrite_replaces_failed_writes) {
 #endif
 }
 
+TEST(test_aof_deferred_writes_wait_for_flush) {
+    // Group commit: in deferred mode (the server's), records are only buffered,
+    // and flush() writes them all, in order, with one write()
+    const std::string aof_file = "test_aof_deferred.aof";
+    std::remove(aof_file.c_str());
+    const std::string a = RespParser::array({"SET", "a", "1"});
+    const std::string b = RespParser::array({"SET", "b", "2"});
+    {
+        AOFLogger aof(aof_file);
+        aof.setDeferred(true);
+        ASSERT_TRUE(aof.log(a));
+        ASSERT_TRUE(aof.log(b));
+        ASSERT_TRUE(aof.readRaw().empty());         // nothing written yet
+        ASSERT_TRUE(aof.flush());
+        ASSERT_TRUE(aof.readRaw() == a + b);
+        ASSERT_TRUE(aof.flush());                   // nothing left to write
+        ASSERT_TRUE(aof.log(a));
+        aof.setDeferred(false);                     // writes what is buffered
+        ASSERT_TRUE(aof.readRaw() == a + b + a);
+        ASSERT_TRUE(aof.log(b));                    // written at once again
+        ASSERT_TRUE(aof.readRaw() == a + b + a + b);
+        aof.setDeferred(true);
+        ASSERT_TRUE(aof.log(a));
+    }                                               // the destructor writes it
+    AOFLogger aof(aof_file);
+    ASSERT_TRUE(aof.readRaw() == a + b + a + b + a);
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_deferred_write_errors) {
+#ifndef _WIN32
+    // A flush that fails (a full disk) keeps what it didn't write, in order,
+    // as an immediate write does, and writes it all once there is room
+    const std::string aof_file = "test_aof_deferred_error.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setDeferred(true);
+    const std::string record = RespParser::array({"SET", "k", std::string(100, 'v')});
+    std::string expected;
+    for(int i = 0; i < 20; i++) {                   // 128 bytes each
+        ASSERT_TRUE(aof.log(record));
+        expected += record;
+    }
+    {
+        FileSizeLimit limit(1000);
+        ASSERT_FALSE(aof.flush());
+        ASSERT_EQ(aof.readRaw().size(), (size_t)1000);
+        ASSERT_FALSE(aof.flushPending());
+        ASSERT_EQ(aof.lastWriteError(), "File too large");
+        ASSERT_FALSE(aof.log(record));              // buffered behind the rest
+        expected += record;
+    }
+    ASSERT_TRUE(aof.flushPending());                // room again: everything is written
+    ASSERT_TRUE(aof.readRaw() == expected);
+    ASSERT_EQ(aof.lastWriteError(), "");
+    std::remove(aof_file.c_str());
+#endif
+}
+
+TEST(test_aof_rewrite_drops_buffered_records) {
+    // A rewrite writes a snapshot that already includes the effect of every
+    // record still buffered. Those records must not be written after it:
+    // replay would apply them twice, and an RPUSH twice is a wrong value.
+    const std::string aof_file = "test_aof_rewrite_buffered.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        aof.setDeferred(true);
+        InMemoryStorage s(100, &aof);
+        s.rpush("list", {"x"});                     // buffered, and in the snapshot below
+        ASSERT_TRUE(aof.rewrite(s.dumpState()));
+        s.rpush("list", {"y"});                     // after the rewrite: must be kept
+        ASSERT_TRUE(aof.flush());
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(100, &aof);
+        ASSERT_TRUE(replayAOF(s, aof).ok);
+        ASSERT_EQ(s.llen("list").value, "2");       // x, y; not x, x, y
+    }
+    std::remove(aof_file.c_str());
+}
+
 TEST(test_aof_no_log_on_failed_ops) {
     const std::string aof_file = "test_aof_nolog.aof";
     std::remove(aof_file.c_str());
@@ -1728,6 +1811,9 @@ int main() {
     RUN_TEST(test_aof_rewrite_failure_keeps_old_file);
     RUN_TEST(test_aof_failed_writes_wait_and_are_retried);
     RUN_TEST(test_aof_rewrite_replaces_failed_writes);
+    RUN_TEST(test_aof_deferred_writes_wait_for_flush);
+    RUN_TEST(test_aof_deferred_write_errors);
+    RUN_TEST(test_aof_rewrite_drops_buffered_records);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
     RUN_TEST(test_aof_logs_absolute_expiry_times);

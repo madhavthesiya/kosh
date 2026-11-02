@@ -97,6 +97,17 @@ bool AOFLogger::log(std::string_view data) {
     return logWith([data](std::string& buffer) { buffer.append(data); });
 }
 
+void AOFLogger::setDeferred(bool deferred) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    deferred_ = deferred;
+    if(!deferred_ && !buffer_.empty()) writeBuffer();
+}
+
+bool AOFLogger::flush() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return buffer_.empty() || writeBuffer();
+}
+
 bool AOFLogger::flushPending() {
     if(!failing_) return true;      // checked without the lock: one load per write command
     std::lock_guard<std::mutex> lock(mutex_);
@@ -187,8 +198,9 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
         return false;
     }
     // The new file holds all the data, including the effect of every record
-    // still buffered (left by failed writes). Those records belong at the end
-    // of the old file; appending them to the new one would apply them twice.
+    // still buffered (not flushed yet, or left by failed writes). Those records
+    // belong at the end of the old file; appending them to the new one would
+    // apply them twice.
     buffer_.clear();
     if(failing_ && fd_ >= 0) {
         failing_ = false;
