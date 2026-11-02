@@ -33,7 +33,10 @@ enum class DataType { STRING, LIST, SET, HASH };
 // which still means the same after a restart; the monotonic clock doesn't.
 using ExpiryTime = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
 
-class InMemoryStorage : public StorageInterface {
+// final: nothing derives from it, so a call through an InMemoryStorage& (as
+// every command makes) is a direct call instead of one through the vtable.
+// It still can't be inlined, as the methods are in InMemoryStorage.cpp.
+class InMemoryStorage final : public StorageInterface {
     public:
         // Throws std::invalid_argument if capacity is 0
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
