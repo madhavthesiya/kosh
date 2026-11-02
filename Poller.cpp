@@ -1,4 +1,9 @@
 #include "Poller.h"
+#include <algorithm>
+#ifdef __linux__
+#include <cerrno>
+#include <unistd.h>
+#endif
 
 bool SelectPoller::canWatch(socket_t fd) const {
 #ifdef _WIN32
@@ -51,4 +56,73 @@ int SelectPoller::wait(int timeout_ms, std::vector<Event>& ready) {
         if(readable || writable) ready.push_back({fd, readable, writable});
     }
     return static_cast<int>(ready.size());
+}
+
+#ifdef __linux__
+EpollPoller::EpollPoller() : epfd_(epoll_create1(EPOLL_CLOEXEC)) {}
+
+EpollPoller::~EpollPoller() {
+    if(epfd_ >= 0) close(epfd_);
+}
+
+bool EpollPoller::canWatch(socket_t) const {
+    return true;        // any socket number; the open-file limit is the only bound
+}
+
+void EpollPoller::add(socket_t fd) {
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+    if(epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &event) == 0) watched_++;
+}
+
+void EpollPoller::remove(socket_t fd) {
+    if(epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0) watched_--;
+}
+
+void EpollPoller::setInterest(socket_t fd, bool read, bool write) {
+    epoll_event event{};
+    if(read) event.events |= EPOLLIN;
+    if(write) event.events |= EPOLLOUT;
+    event.data.fd = fd;
+    epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &event);
+}
+
+int EpollPoller::wait(int timeout_ms, std::vector<Event>& ready) {
+    ready.clear();
+    // Room for every watched socket to be ready at once
+    size_t room = std::max<size_t>(watched_, 64);
+    if(events_.size() < room) events_.resize(room);
+    int n = epoll_wait(epfd_, events_.data(), static_cast<int>(events_.size()), timeout_ms);
+    if(n < 0) return errno == EINTR ? 0 : -1;
+    for(int i = 0; i < n; i++) {
+        const epoll_event& event = events_[static_cast<size_t>(i)];
+        // An error or a hang-up is reported as both readable and writable, as
+        // Redis does: the next recv() or send() finds out what happened. (epoll
+        // reports these even for sockets watched for neither.)
+        bool failed = (event.events & (EPOLLERR | EPOLLHUP)) != 0;
+        ready.push_back({event.data.fd, (event.events & EPOLLIN) != 0 || failed,
+                         (event.events & EPOLLOUT) != 0 || failed});
+    }
+    return n;
+}
+#endif
+
+std::unique_ptr<Poller> makePoller(const std::string& name) {
+    if(name == "select") return std::make_unique<SelectPoller>();
+#ifdef __linux__
+    if(name == "epoll") {
+        auto poller = std::make_unique<EpollPoller>();
+        if(poller->isOpen()) return poller;
+    }
+#endif
+    return nullptr;
+}
+
+const char* defaultPollerName() {
+#ifdef __linux__
+    return "epoll";
+#else
+    return "select";
+#endif
 }

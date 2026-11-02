@@ -49,8 +49,9 @@ void raiseOpenFileLimit(rlim_t wanted) {
     limit.rlim_cur = std::min(wanted, limit.rlim_max);
     setrlimit(RLIMIT_NOFILE, &limit);
     if(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < wanted) {
-        std::cerr << "Warning: open file limit is " << limit.rlim_cur
-                  << ", so fewer clients than select() allows can connect\n";
+        std::cerr << "Warning: the open file limit is " << limit.rlim_cur << ", so about "
+                  << (limit.rlim_cur > 32 ? limit.rlim_cur - 32 : 0)
+                  << " clients can connect at once\n";
     }
 }
 #endif
@@ -59,8 +60,12 @@ void raiseOpenFileLimit(rlim_t wanted) {
 
 // The server batches AOF writes (group commit, see run()): the logger only
 // buffers records, and the server writes them before sending any reply.
-Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
-    : port_(port), storage_(storage), aof_(aof) {
+Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
+               std::unique_ptr<Poller> poller, size_t max_clients)
+    : port_(port), storage_(storage), aof_(aof), poller_(std::move(poller)),
+      max_clients_(max_clients) {
+    if(!poller_) poller_ = makePoller(defaultPollerName());
+    if(!poller_) poller_ = makePoller("select");    // epoll_create1() failed: select() always works
     if(aof_) aof_->setDeferred(true);
 }
 
@@ -101,12 +106,12 @@ bool Server::start() {
     // EFBIG instead, and the AOF reports it like any other write error.
     std::signal(SIGXFSZ, SIG_IGN);
 
-    // select() watches sockets numbered below FD_SETSIZE. A client beyond that
-    // gets socket FD_SETSIZE or higher and is refused with an error reply; the
-    // server must be allowed to open that socket to reply at all. With a lower
-    // limit, accept() would fail with EMFILE instead. (Redis also raises its
-    // limit at startup.)
-    raiseOpenFileLimit(FD_SETSIZE + 32);
+    // Room for every client the server will serve, plus a few files of its own
+    // and the socket of one client too many, which must be opened to be refused
+    // with an error reply (with a lower limit, accept() would fail with EMFILE
+    // instead). That is max_clients_, or with select() its FD_SETSIZE. Redis
+    // raises its limit to maxclients + 32 at startup the same way.
+    raiseOpenFileLimit(static_cast<rlim_t>(std::min(max_clients_, poller_->capacity())) + 32);
     reserve_fd_ = open("/dev/null", O_RDONLY);
 #endif
 
@@ -154,7 +159,9 @@ bool Server::start() {
     running_ = true;
     std::cout << "Mini-Redis server listening on port " << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
-    std::cout << "I/O multiplexing: select() — single-threaded, concurrent clients\n";
+    std::cout << "I/O multiplexing: " << poller_->name();
+    if(poller_->capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << poller_->capacity() << ")";
+    std::cout << ", single-threaded | maxclients " << max_clients_ << "\n";
     return true;
 }
 
@@ -185,7 +192,7 @@ void Server::stop() {
 //
 // How the loop works:
 //   1. The listening socket and every client socket are registered with the
-//      poller (select() today; see Poller.h)
+//      poller (epoll on Linux, select() elsewhere; see Poller.h)
 //   2. wait() blocks until at least one of them is ready
 //   3. Handle only the ready ones:
 //      - listen socket ready → new client connecting → accept()
@@ -199,8 +206,8 @@ void Server::stop() {
 //
 // Why single-threaded?
 //   Commands run one at a time, so no two commands can race each other.
-//   Redis's main thread uses the same model, but waits with epoll/kqueue,
-//   which return only the ready sockets; select() scans every socket each call.
+//   Redis's main thread uses the same model, also with epoll on Linux, which
+//   returns only the ready sockets; select() scans every socket each call.
 
 void Server::run() {
     std::vector<Poller::Event> ready;
@@ -211,7 +218,7 @@ void Server::run() {
         // On Windows the console handler runs on another thread, so the timeout
         // is what lets the loop notice.
         if(poller_->wait(1000, ready) < 0) {
-            if(running_) std::cerr << "select() error\n";
+            if(running_) std::cerr << poller_->name() << " error " << lastSocketError() << "\n";
             continue;
         }
 
@@ -267,7 +274,7 @@ void Server::acceptNewClients() {
         if(client == INVALID_SOCKET) {
             int error = lastSocketError();
 #ifndef _WIN32
-            // Out of file descriptors: the connection stays queued, so select()
+            // Out of file descriptors: the connection stays queued, so the poller
             // would report it again at once and the loop would spin at 100% CPU.
             // Free the spare descriptor, accept the connection with it, refuse
             // it properly, then take the spare back (as nginx and libev do).
@@ -297,11 +304,17 @@ void Server::acceptNewClients() {
             continue;
         }
 
+        // As Redis does at maxclients
+        if(clients_.size() >= max_clients_) {
+            refuseClient(client);
+            std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
+            continue;
+        }
         // Watching a socket select() can't hold would write past the end of
         // fd_set (Linux) or silently never serve it (Windows)
         if(!poller_->canWatch(client)) {
             refuseClient(client);
-            std::cout << "Client refused: the server is at its select() limit ("
+            std::cout << "Client refused: the server is at its " << poller_->name() << " limit ("
                       << clients_.size() << " clients)\n";
             continue;
         }

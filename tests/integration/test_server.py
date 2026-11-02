@@ -63,6 +63,12 @@ class ServerProcess:
             if fsize:
                 resource.setrlimit(resource.RLIMIT_FSIZE,
                                    (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
+        # ctest runs the suite once more with MINI_REDIS_POLLER=select, so the
+        # select() path stays tested now that Linux uses epoll by default. A
+        # test that names a poller itself keeps it.
+        poller = os.environ.get("MINI_REDIS_POLLER")
+        if poller and "--poller" not in args:
+            args = (*args, "--poller", poller)
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
@@ -365,10 +371,29 @@ class ClientLimitTest(ServerTestCase):
         self.allow_open_files(1100 + 64)
         # A common default limit: below it, socket 1024 can't even be created, so
         # the server must raise its own limit to be able to refuse anyone.
-        server = self.start_server("--appendonly", "no", nofile=1024)
+        server = self.start_server("--appendonly", "no", "--poller", "select", nofile=1024)
         accepted, refused = self.connect_and_sort(server, 1100)
         self.assertGreater(len(accepted), 1000)
         self.assertGreater(refused, 0)
+        self.assertStillServing(server, accepted)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "epoll is Linux only")
+    def test_epoll_serves_clients_beyond_select_limit(self):
+        # epoll watches any socket number: the clients select() had to refuse
+        # are served, and the server raises its open-file limit to make room
+        self.allow_open_files(1100 + 64)
+        server = self.start_server("--appendonly", "no", "--poller", "epoll", nofile=1024)
+        accepted, refused = self.connect_and_sort(server, 1100)
+        self.assertEqual(refused, 0)
+        self.assertEqual(len(accepted), 1100)
+        self.assertStillServing(server, accepted)
+
+    def test_maxclients_refuses_the_next_client(self):
+        # As Redis does at maxclients (10,000 by default)
+        server = self.start_server("--appendonly", "no", "--maxclients", "10")
+        accepted, refused = self.connect_and_sort(server, 12)
+        self.assertEqual(len(accepted), 10)
+        self.assertEqual(refused, 2)
         self.assertStillServing(server, accepted)
 
     @unittest.skipUnless(os.path.exists("/proc/self/stat"), "measures CPU time via /proc")
@@ -377,16 +402,23 @@ class ClientLimitTest(ServerTestCase):
         # before select()'s limit. accept() then fails with EMFILE and the
         # connection stays queued, so select() reported it again at once: the
         # server spun at 100% CPU and logged "accept() failed" thousands of
-        # times a second, and the waiting clients never got an answer.
-        server = self.start_server("--appendonly", "no", nofile=(64, 64))
-        accepted, refused = self.connect_and_sort(server, 100)
+        # times a second, and the waiting clients never got an answer. Both
+        # pollers report a queued connection until it is accepted.
+        pollers = ["select", "epoll"] if sys.platform.startswith("linux") else ["select"]
+        for poller in pollers:
+            with self.subTest(poller=poller):
+                server = self.start_server("--appendonly", "no", "--poller", poller, nofile=(64, 64))
+                accepted, refused = self.connect_and_sort(server, 100)
 
-        cpu = server.cpu_seconds()
-        time.sleep(1)
-        self.assertLess(server.cpu_seconds() - cpu, 0.2, "server busy while idle")
-        self.assertGreater(len(accepted), 40)
-        self.assertGreater(refused, 0)
-        self.assertStillServing(server, accepted)
+                cpu = server.cpu_seconds()
+                time.sleep(1)
+                self.assertLess(server.cpu_seconds() - cpu, 0.2, "server busy while idle")
+                self.assertGreater(len(accepted), 40)
+                self.assertGreater(refused, 0)
+                self.assertStillServing(server, accepted)
+                for s in accepted:
+                    s.close()
+                server.stop()
 
 
 @unittest.skipIf(os.name == "nt", "POSIX signals")
@@ -652,6 +684,7 @@ class CommandLineTest(ServerTestCase):
             ("--port",), ("--maxkeys", "0"), ("--maxkeys", "ten"),
             ("--appendonly", "maybe"), ("--appendfilename", ""), ("--bogus",),
             ("--appendfsync", "sometimes"), ("--appendfsync",),
+            ("--poller", "kqueue"), ("--maxclients", "0"), ("--maxclients", "many"),
         ]
         for args in cases:
             with self.subTest(args=args):

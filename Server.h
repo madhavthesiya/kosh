@@ -11,7 +11,15 @@
 
 class Server {
 public:
-    Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr);
+    // Clients served at once, as Redis's maxclients default
+    static constexpr size_t kDefaultMaxClients = 10000;
+
+    // `poller`: how to wait for sockets; the system's best (epoll on Linux,
+    // select() elsewhere) if none is given. Beyond `max_clients` clients, or
+    // what the poller can watch, a new client gets "-ERR max number of clients
+    // reached" and is disconnected.
+    Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr,
+           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
     ~Server();
 
     bool start();       // Create socket, bind, listen
@@ -85,7 +93,8 @@ private:
     AOFLogger* aof_ = nullptr;  // optional: flushed before replies are sent, and for BGREWRITEAOF
 
     // Tells the event loop which sockets are ready
-    std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();
+    std::unique_ptr<Poller> poller_;
+    size_t max_clients_;
 
     // A spare file descriptor (POSIX), given up for a moment when the process
     // runs out, so a waiting connection can still be accepted and refused

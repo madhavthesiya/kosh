@@ -18,6 +18,8 @@ struct ServerConfig {
     std::string appendFilename = "appendonly.aof";
     // Redis's default: a power cut loses at most about a second of writes
     AOFLogger::FsyncPolicy appendFsync = AOFLogger::FsyncPolicy::EverySecond;
+    std::string poller = defaultPollerName();
+    size_t maxClients = Server::kDefaultMaxClients;
 };
 
 static void printUsage(std::ostream& out) {
@@ -29,6 +31,9 @@ static void printUsage(std::ostream& out) {
            "  --appendfsync <always|everysec|no>\n"
            "                           When the AOF is synced to disk: before every reply,\n"
            "                           once a second, or when the OS decides (default everysec)\n"
+           "  --maxclients <n>         Clients served at once; more are refused (default 10000)\n"
+           "  --poller <epoll|select>  How to wait for sockets (default: epoll on Linux,\n"
+           "                           select elsewhere; select serves about 1,000 clients)\n"
            "  --help                   Show this message\n";
 }
 
@@ -53,7 +58,8 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         if(option == "--help" || option == "-h") return ParseResult::Help;
 
         if(option != "--port" && option != "--maxkeys" && option != "--appendonly" &&
-           option != "--appendfilename" && option != "--appendfsync") {
+           option != "--appendfilename" && option != "--appendfsync" &&
+           option != "--maxclients" && option != "--poller") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
             return ParseResult::Error;
         }
@@ -77,6 +83,12 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
             else if(value == "everysec") config.appendFsync = AOFLogger::FsyncPolicy::EverySecond;
             else if(value == "no") config.appendFsync = AOFLogger::FsyncPolicy::No;
             else ok = false;
+        } else if(option == "--maxclients") {
+            ok = parseNumber<size_t>(value, 1, 1000000, config.maxClients);
+        } else if(option == "--poller") {
+            // Rejected here if this system has no such poller (no epoll outside Linux)
+            ok = makePoller(value) != nullptr;
+            if(ok) config.poller = value;
         } else {
             ok = !value.empty();
             if(ok) config.appendFilename = value;
@@ -134,7 +146,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Max keys: " << config.maxKeys << " | AOF: "
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
-    Server server(config.port, storage, aofLogger);
+    Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);
     if(!server.start()) {
         std::cerr << "Failed to start server on port " << config.port << "\n";
         return 1;

@@ -11,7 +11,10 @@
 #ifndef _WIN32
 #include <csignal>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
+#include "../Poller.h"
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -1697,6 +1700,63 @@ TEST(test_dispatch_write_flags) {
     }
 }
 
+// ==================== Pollers ====================
+
+#ifndef _WIN32
+// The same checks for every poller: the event loop relies on each behaving
+// alike, level-triggered (a ready socket is reported until it is drained)
+void checkPoller(Poller& poller) {
+    int fds[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    std::vector<Poller::Event> ready;
+    poller.add(fds[0]);
+    ASSERT_EQ(poller.wait(0, ready), 0);            // nothing to read; writing wasn't asked about
+
+    ASSERT_TRUE(write(fds[1], "x", 1) == 1);
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].fd == fds[0] && ready[0].readable && !ready[0].writable);
+    ASSERT_EQ(poller.wait(0, ready), 1);            // level-triggered: still there until read
+    char c;
+    ASSERT_TRUE(read(fds[0], &c, 1) == 1);
+    ASSERT_EQ(poller.wait(0, ready), 0);
+
+    poller.setInterest(fds[0], false, true);        // only "can it take more data?"
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].writable && !ready[0].readable);
+    poller.setInterest(fds[0], true, false);
+
+    close(fds[1]);                                  // the peer hangs up: end of stream
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].readable);                 // the next recv() returns 0
+
+    poller.remove(fds[0]);
+    ASSERT_EQ(poller.wait(0, ready), 0);
+    close(fds[0]);
+}
+#endif
+
+TEST(test_poller_select) {
+#ifndef _WIN32
+    SelectPoller poller;
+    ASSERT_TRUE(poller.canWatch(FD_SETSIZE - 1) && !poller.canWatch(FD_SETSIZE));
+    checkPoller(poller);
+#endif
+}
+
+TEST(test_poller_epoll) {
+#ifdef __linux__
+    EpollPoller poller;
+    ASSERT_TRUE(poller.isOpen());
+    ASSERT_TRUE(poller.canWatch(FD_SETSIZE));       // any socket number
+    checkPoller(poller);
+    ASSERT_TRUE(makePoller("epoll") != nullptr);
+#else
+    ASSERT_TRUE(makePoller("epoll") == nullptr);    // only on Linux
+#endif
+    ASSERT_TRUE(makePoller("select") != nullptr);
+    ASSERT_TRUE(makePoller("kqueue") == nullptr);
+}
+
 // ==================== RESP Parser ====================
 
 using ParseStatus = RespParser::ParseStatus;
@@ -2003,6 +2063,10 @@ int main() {
     RUN_TEST(test_dispatch_strict_integer_arguments);
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
+
+    std::cout << "\n[Pollers]\n";
+    RUN_TEST(test_poller_select);
+    RUN_TEST(test_poller_epoll);
 
     std::cout << "\n[RESP Parser]\n";
     RUN_TEST(test_resp_parse_array);
