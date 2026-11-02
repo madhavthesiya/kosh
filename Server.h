@@ -43,12 +43,6 @@ private:
     void updateInterest(socket_t fd, Client& client);
     void removeClient(socket_t fd);                  // Cleanup on disconnect
 
-    // Execute a parsed command and return the RESP-formatted response
-    std::string executeCommand(const std::vector<std::string>& args);
-
-    // Convert string to uppercase (for case-insensitive command matching)
-    static std::string toUpper(const std::string& s);
-
     // Most a client's incomplete command may occupy (Redis's client-query-buffer-limit)
     static constexpr size_t kMaxQueryBuffer = size_t(1) << 30;
 
@@ -75,7 +69,7 @@ private:
     InMemoryStorage& storage_;
     bool running_ = false;
 
-    AOFLogger* aof_ = nullptr;  // optional — for AOFREWRITE command
+    AOFLogger* aof_ = nullptr;  // optional — for BGREWRITEAOF
 
     // Tells the event loop which sockets are ready
     std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();

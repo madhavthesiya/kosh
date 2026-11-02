@@ -5,8 +5,12 @@
 #include <unordered_set>
 #include <string>
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <list>
+#include <set>
 #include <deque>
+#include <optional>
 #include <variant>
 #include <shared_mutex>
 
@@ -21,8 +25,15 @@ using ValueType = std::variant<
 
 enum class DataType { STRING, LIST, SET, HASH };
 
+// When a key expires. In memory it is a time on the monotonic clock, in
+// milliseconds, so a change to the wall clock while the server runs can't make
+// keys expire early or late. The AOF records it as Unix time in milliseconds,
+// which still means the same after a restart; the monotonic clock doesn't.
+using ExpiryTime = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
+
 class InMemoryStorage : public StorageInterface {
     public:
+        // Throws std::invalid_argument if capacity is 0
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
 
         // String operations
@@ -63,10 +74,26 @@ class InMemoryStorage : public StorageInterface {
         Result saveToFile(const std::string& filename) override;
         Result loadFromFile(const std::string& filename) override;
 
+        // Expiry at an absolute time, given as Unix time in milliseconds (what
+        // the AOF records: SET ... PXAT and PEXPIREAT)
+        Result setExpiringAt(const std::string& key, const std::string& value, int64_t unixTimeMs);
+        Result expireAt(const std::string& key, int64_t unixTimeMs);
+
+        // The wall clock now, as Unix time in milliseconds
+        static int64_t unixTimeMs();
+
         // AOF operations
         std::vector<std::string> dumpState() const;   // serialize current state as commands
-        Result replayAOF();                            // rebuild state from AOF log
-    
+
+        // True while the AOF is being replayed (see replayAOF() in Commands.h).
+        // Then the replayed commands are not logged again, and:
+        // - no key expires: a key whose TTL has passed may be given a later one
+        //   by a later record, so expiry is checked once loading is done (Redis
+        //   does the same);
+        // - nothing is evicted: the live server's evictions are in the AOF as
+        //   DELs. Once loading is done, keys beyond the capacity are evicted.
+        void setLoading(bool loading);
+
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;
@@ -74,24 +101,33 @@ class InMemoryStorage : public StorageInterface {
         struct CacheEntry {
             ValueType value;        // std::variant — holds String, List, Set, or Hash
             bool has_expiry;
-            std::chrono::steady_clock::time_point expiry_time;
+            ExpiryTime expiry_time;
             std::list<std::string>::iterator lru_it;
         };
+        using DataMap = std::unordered_map<std::string, CacheEntry>;
+
+        // Every change to an entry's expiry and every removal goes through
+        // these, so the expiry index stays in step with data_
+        void setExpiry(DataMap::iterator it, std::optional<ExpiryTime> expiry);
+        void eraseEntry(DataMap::iterator it);
 
         // LRU helpers
         void touchLRU(const std::string& key);
-        void evictLRU();
+        void evictLRU();                                // removes and logs the LRU key
+        void makeRoomForNewKey();                       // expired keys first, then LRU
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
-        void removeKey(const std::string& key);
+        void expireKey(const std::string& key);         // removes an expired key, logs DEL
+        void removeKey(const std::string& key);         // removes without logging
 
         // Type helpers
         DataType getDataType(const CacheEntry& entry) const;
         std::string dataTypeToString(DataType dt) const;
 
-        // Internal set (called by both set overloads)
-        Result setInternal(const std::string& key, const std::string& value, int ttlSeconds);
+        // Internal set (called by every set variant); no expiry if `expiry` is empty
+        Result setInternal(const std::string& key, const std::string& value,
+                           std::optional<ExpiryTime> expiry);
 
         // Ensures key exists, is not expired, and holds the expected type
         // Returns nullptr if valid, or a Result with the appropriate error
@@ -104,10 +140,26 @@ class InMemoryStorage : public StorageInterface {
         // AOF logging helper — serializes parts as RESP and logs to AOF file
         void logAOF(const std::vector<std::string>& parts);
 
-        std::unordered_map<std::string, CacheEntry> data_;
+        DataMap data_;
         std::list<std::string> lru_list_;
+
+        // Keys with a TTL, soonest expiry first, so expired keys are found
+        // without a scan when room is needed. The pointer is to the key inside
+        // data_: unordered_map keeps references to its elements valid until they
+        // are erased, even when it rehashes.
+        using ExpiryItem = std::pair<ExpiryTime, const std::string*>;
+        struct ExpiryOrder {
+            bool operator()(const ExpiryItem& a, const ExpiryItem& b) const {
+                if(a.first != b.first) return a.first < b.first;
+                // `<` on pointers into different objects is unspecified;
+                // std::less is guaranteed to be a total order
+                return std::less<const std::string*>()(a.second, b.second);
+            }
+        };
+        std::set<ExpiryItem, ExpiryOrder> expiry_index_;
+
         size_t capacity_;
         mutable std::shared_mutex mutex_;
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
-        bool logging_enabled_ = true;       // disabled during replay to prevent re-logging
+        bool loading_ = false;              // replaying the AOF (see setLoading)
 };

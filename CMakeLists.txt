@@ -37,7 +37,9 @@ find_package(Threads REQUIRED)
 # Main executable (CLI mode)
 add_executable(mini_redis
     main.cpp
+    Commands.cpp
     InMemoryStorage.cpp
+    AOFLogger.cpp
     RedisLite.cpp
 )
 target_link_libraries(mini_redis Threads::Threads)
@@ -47,7 +49,9 @@ add_executable(mini_redis_server
     server_main.cpp
     Server.cpp
     Poller.cpp
+    Commands.cpp
     InMemoryStorage.cpp
+    AOFLogger.cpp
     RedisLite.cpp
 )
 target_link_libraries(mini_redis_server Threads::Threads)
@@ -58,7 +62,9 @@ endif()
 # Unit tests
 add_executable(tests
     tests/test_main.cpp
+    Commands.cpp
     InMemoryStorage.cpp
+    AOFLogger.cpp
     RedisLite.cpp
 )
 target_link_libraries(tests Threads::Threads)
@@ -67,6 +73,7 @@ target_link_libraries(tests Threads::Threads)
 add_executable(test_threads
     tests/test_thread_safety.cpp
     InMemoryStorage.cpp
+    AOFLogger.cpp
     RedisLite.cpp
 )
 target_link_libraries(test_threads Threads::Threads)
@@ -75,6 +82,7 @@ target_link_libraries(test_threads Threads::Threads)
 add_executable(memory_layout
     bench/memory_layout.cpp
     InMemoryStorage.cpp
+    AOFLogger.cpp
 )
 target_link_libraries(memory_layout Threads::Threads)
 

@@ -43,9 +43,10 @@ def describe_exit(returncode):
 
 class ServerProcess:
     """A running mini_redis_server on a free port, working in `workdir`.
-    `nofile` limits its open files (POSIX): a soft limit, or (soft, hard)."""
+    `nofile` limits its open files (POSIX): a soft limit, or (soft, hard).
+    `fsize` limits the size of the files it writes, in bytes (soft limit)."""
 
-    def __init__(self, *args, workdir=None, nofile=None):
+    def __init__(self, *args, workdir=None, nofile=None, fsize=None):
         self._tmp = None
         if workdir is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -54,14 +55,18 @@ class ServerProcess:
         self.port = free_port()
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
-        def limit_open_files():
-            soft, hard = nofile if isinstance(nofile, tuple) else \
-                (nofile, resource.getrlimit(resource.RLIMIT_NOFILE)[1])
-            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        def set_limits():
+            if nofile:
+                soft, hard = nofile if isinstance(nofile, tuple) else \
+                    (nofile, resource.getrlimit(resource.RLIMIT_NOFILE)[1])
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            if fsize:
+                resource.setrlimit(resource.RLIMIT_FSIZE,
+                                   (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
-            preexec_fn=limit_open_files if nofile else None)
+            preexec_fn=set_limits if nofile or fsize else None)
         self._wait_until_listening()
 
     def _wait_until_listening(self, timeout=5.0):
@@ -170,8 +175,8 @@ class Client:
 
 
 class ServerTestCase(unittest.TestCase):
-    def start_server(self, *args, workdir=None, nofile=None):
-        server = ServerProcess(*args, workdir=workdir, nofile=nofile)
+    def start_server(self, *args, workdir=None, nofile=None, fsize=None):
+        server = ServerProcess(*args, workdir=workdir, nofile=nofile, fsize=fsize)
         self.addCleanup(server.stop)
         return server
 
@@ -195,6 +200,16 @@ class BasicCommandTest(ServerTestCase):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError):
                 c.call("BGREWRITEAOF")
+
+    def test_save_is_not_supported(self):
+        # SAVE wrote only string keys to dump.rdb, and nothing loads that file:
+        # its "+OK" promised persistence that didn't exist. The AOF is the
+        # server's persistence.
+        with Client(self.server.port) as c:
+            with self.assertRaises(RespError) as caught:
+                c.call("SAVE")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE'")
+        self.assertFalse(os.path.exists(os.path.join(self.server.workdir, "dump.rdb")))
 
 
 class ClientDisconnectTest(ServerTestCase):
@@ -450,6 +465,89 @@ class ErrorReplyTest(ServerTestCase):
             with self.assertRaises(RespError) as caught:
                 c.call(b"x" * 10_000)
             self.assertEqual(str(caught.exception), "ERR unknown command '" + "x" * 128 + "'")
+
+
+class AofDamageTest(ServerTestCase):
+    """A crash while writing a record leaves an incomplete record at the end of
+    the AOF. Replay used to stop there silently, and the server then appended
+    new records after the partial bytes: at the next restart they were read as
+    the rest of the broken record, and lost."""
+
+    def test_incomplete_last_record_is_cut_off(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            aof = os.path.join(workdir, "appendonly.aof")
+            first = self.start_server(workdir=workdir)
+            with Client(first.port) as c:
+                c.call("SET", "a", "1")
+                c.call("SET", "b", "2")
+            first.stop()
+            with open(aof, "r+b") as f:     # as if the server died writing "SET b 2"
+                f.truncate(os.path.getsize(aof) - 7)
+
+            second = self.start_server(workdir=workdir)
+            with Client(second.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertIsNone(c.call("GET", "b"))
+                c.call("SET", "c", "3")
+            self.assertIn("incomplete record", second.output())
+            second.stop()
+
+            third = self.start_server(workdir=workdir)
+            with Client(third.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertEqual(c.call("GET", "c"), b"3")
+            third.stop()
+
+    def test_damage_before_the_end_refuses_to_start(self):
+        # Starting with whatever came before the damage would silently drop
+        # everything after it. Refuse, and say where the damage is.
+        with tempfile.TemporaryDirectory() as workdir:
+            good = Client.encode(("SET", "a", "1"))
+            with open(os.path.join(workdir, "appendonly.aof"), "wb") as f:
+                f.write(good + b"*2\r\n$3\r\nGET\r\nxx\r\n" + good)
+            result = subprocess.run([SERVER_BINARY, "--port", str(free_port())], cwd=workdir,
+                                    capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"damaged at byte %d" % len(good), result.stderr)
+
+
+@unittest.skipIf(resource is None or not hasattr(resource, "prlimit"), "needs Linux prlimit")
+class AofWriteErrorTest(ServerTestCase):
+    """A full disk, played by a 4 KB limit on the size of the files the server
+    writes: writes past it fail with EFBIG, as they would with ENOSPC."""
+
+    def test_writes_are_refused_until_the_aof_can_be_written(self):
+        # The server used to ignore the failed write and reply OK, so the AOF
+        # silently lost every write from then on. (Without SIGXFSZ ignored, the
+        # first write past the limit killed the server instead.)
+        value = b"v" * 100
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir, fsize=4096)
+            with Client(server.port) as c:
+                acknowledged, refusal = [], None
+                for i in range(100):     # about 130 bytes each: 4 KB holds about 30
+                    try:
+                        c.call("SET", f"k{i}", value)
+                        acknowledged.append(i)
+                    except RespError as e:
+                        refusal = str(e)
+                        break
+                self.assertIsNotNone(refusal, "every SET was acknowledged")
+                self.assertEqual(refusal, "MISCONF Errors writing to the AOF file: File too large")
+                self.assertEqual(c.call("GET", "k0"), value)     # reads still work
+
+                # Room on the disk again: what was waiting is written, writes resume
+                hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+                resource.prlimit(server.proc.pid, resource.RLIMIT_FSIZE, (hard, hard))
+                self.assertEqual(c.call("SET", "after", "1"), b"OK")
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in acknowledged:
+                    self.assertEqual(c.call("GET", f"k{i}"), value, f"k{i} was acknowledged")
+                self.assertEqual(c.call("GET", "after"), b"1")
+            restarted.stop()
 
 
 class CommandLineTest(ServerTestCase):

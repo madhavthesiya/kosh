@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "InMemoryStorage.h"
 #include "RedisLite.h"
+#include "Commands.h"
 
 std::vector<std::string> split(const std::string& input) {
     std::vector<std::string> tokens;
@@ -65,7 +66,15 @@ int main() {
     std::string line;
 
     // Replay AOF on startup to restore state from previous session
-    storage.replayAOF();
+    AofLoadResult loaded = replayAOF(storage, aof);
+    if(!loaded.ok) {
+        std::cerr << "Cannot start: " << loaded.error << "\n";
+        return 1;
+    }
+    if(loaded.truncated_bytes > 0) {
+        std::cerr << "Warning: the AOF ended with an incomplete record; cut off its "
+                  << loaded.truncated_bytes << " bytes\n";
+    }
 
     std::cout << "Mini-Redis v2.0 (AOF enabled) — Type HELP for commands\n";
     std::cout << "mini-redis> ";
@@ -182,8 +191,11 @@ int main() {
         }
         else if(cmd == "AOFREWRITE") {
             auto commands = storage.dumpState();
-            aof.rewrite(commands);
-            std::cout << "AOF rewritten with " << commands.size() << " commands\n";
+            if(aof.rewrite(commands)) {
+                std::cout << "AOF rewritten with " << commands.size() << " commands\n";
+            } else {
+                std::cout << "ERROR: AOF rewrite failed: " << aof.lastError() << "\n";
+            }
         }
         // ==================== Utility ====================
         else if(cmd == "HELP") {

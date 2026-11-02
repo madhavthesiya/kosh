@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
+#include "Commands.h"
 #include "Server.h"
 
 // Settings that would otherwise mean editing and rebuilding, e.g. a larger
@@ -101,7 +102,19 @@ int main(int argc, char* argv[]) {
     InMemoryStorage storage(config.maxKeys, aofLogger);
 
     // Restore state from previous session
-    if(aofLogger) storage.replayAOF();
+    if(aofLogger) {
+        AofLoadResult loaded = replayAOF(storage, *aofLogger);
+        if(!loaded.ok) {
+            std::cerr << "Cannot start: " << loaded.error << "\n";
+            return 1;
+        }
+        if(loaded.truncated_bytes > 0) {
+            std::cerr << "Warning: the AOF ended with an incomplete record (the server stopped "
+                         "while writing it); cut off its " << loaded.truncated_bytes << " bytes\n";
+        }
+        std::cout << "Loaded " << loaded.commands
+                  << (loaded.commands == 1 ? " command" : " commands") << " from the AOF\n";
+    }
 
     std::cout << "Max keys: " << config.maxKeys << " | AOF: "
               << (aofLogger ? config.appendFilename : "disabled") << "\n";

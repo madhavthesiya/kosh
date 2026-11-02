@@ -81,7 +81,7 @@ public:
         return "-" + line + "\r\n";
     }
 
-    static std::string integer(int n) {
+    static std::string integer(long long n) {
         return ":" + std::to_string(n) + "\r\n";
     }
 

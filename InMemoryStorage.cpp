@@ -5,16 +5,57 @@
 #include <mutex>
 #include <algorithm>
 #include <sstream>
+#include <stdexcept>
 
-InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof){
-    capacity_=capacity;
-    aof_=aof;
+namespace {
+
+using std::chrono::milliseconds;
+
+ExpiryTime steadyNowMs() {
+    return std::chrono::time_point_cast<milliseconds>(std::chrono::steady_clock::now());
+}
+
+// a + b, clamped to the range of int64_t. Signed overflow is undefined
+// behaviour, and clients choose these numbers: PXAT takes any 64-bit value.
+int64_t addSaturating(int64_t a, int64_t b) {
+    if(b > 0 && a > INT64_MAX - b) return INT64_MAX;
+    if(b < 0 && a < INT64_MIN - b) return INT64_MIN;
+    return a + b;
+}
+
+// The monotonic time at which the wall clock will read `unixTimeMs`
+ExpiryTime toExpiryTime(int64_t unixTimeMs) {
+    int64_t remaining = addSaturating(unixTimeMs, -InMemoryStorage::unixTimeMs());
+    return ExpiryTime(milliseconds(addSaturating(steadyNowMs().time_since_epoch().count(), remaining)));
+}
+
+// The Unix time, in milliseconds, at which `expiry` comes
+int64_t toUnixTimeMs(ExpiryTime expiry) {
+    int64_t remaining = addSaturating(expiry.time_since_epoch().count(),
+                                      -steadyNowMs().time_since_epoch().count());
+    return addSaturating(InMemoryStorage::unixTimeMs(), remaining);
+}
+
+}  // namespace
+
+int64_t InMemoryStorage::unixTimeMs() {
+    // system_clock counts from the Unix epoch (required from C++20, and already
+    // true of every C++17 standard library)
+    return std::chrono::duration_cast<milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
+    : capacity_(capacity), aof_(aof) {
+    // Eviction makes room by removing a key, so at least one must fit. With
+    // capacity 0, the first SET would evict from an empty LRU list.
+    if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
 }
 
 // Centralized AOF logging — serializes command parts as RESP and writes to AOF.
 // RESP format is binary-safe: values with spaces, newlines etc. are length-prefixed.
 void InMemoryStorage::logAOF(const std::vector<std::string>& parts) {
-    if(aof_ && logging_enabled_) {
+    if(aof_ && !loading_) {
         aof_->log(RespParser::array(parts));
     }
 }
@@ -45,7 +86,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getValidEntry(const std::string& k
     auto it = data_.find(key);
     if(it == data_.end()) return nullptr;
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return nullptr;
     }
     if(getDataType(it->second) != expected) return nullptr;
@@ -60,7 +101,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
     auto it = data_.find(key);
     if(it != data_.end()) {
         if(isExpired(it->second)) {
-            removeKey(key);
+            expireKey(key);
         } else if(getDataType(it->second) != expected) {
             return nullptr;     // type mismatch
         } else {
@@ -69,9 +110,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         }
     }
     // Create new entry
-    if(data_.size() == capacity_) {
-        evictLRU();
-    }
+    makeRoomForNewKey();
     lru_list_.push_front(key);
     CacheEntry entry;
     switch(expected) {
@@ -82,8 +121,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
     }
     entry.has_expiry = false;
     entry.lru_it = lru_list_.begin();
-    data_[key] = std::move(entry);
-    return &data_[key];
+    return &data_.emplace(key, std::move(entry)).first->second;
 }
 
 // ==================== Key Operations ====================
@@ -93,7 +131,7 @@ Result InMemoryStorage::exists(const std::string& key){
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     return Result::ok();
@@ -103,13 +141,13 @@ Result InMemoryStorage::del(const std::string& key){
     std::unique_lock lock(mutex_);
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    // Expired keys are treated as non-existent — don't log DEL for them
+    // An expired key no longer exists: DEL returns 0, as in Redis. Its removal
+    // is still logged, as an expiration.
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    lru_list_.erase(it->second.lru_it);
-    data_.erase(it);
+    eraseEntry(it);
     logAOF({"DEL", key});
     return Result::ok();
 }
@@ -123,16 +161,21 @@ Result InMemoryStorage::type(const std::string& key){
 }
 
 Result InMemoryStorage::expire(const std::string& key, int ttlSeconds){
+    return expireAt(key, addSaturating(unixTimeMs(), ttlSeconds * int64_t(1000)));
+}
+
+// Logged as PEXPIREAT with the absolute time, so replay expires the key at the
+// same moment, however much later the restart is
+Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
     std::unique_lock lock(mutex_);
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    it->second.has_expiry = true;
-    it->second.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-    logAOF({"EXPIRE", key, std::to_string(ttlSeconds)});
+    setExpiry(it, toExpiryTime(unixTimeMs));
+    logAOF({"PEXPIREAT", key, std::to_string(unixTimeMs)});
     return Result::ok();
 }
 
@@ -142,10 +185,11 @@ Result InMemoryStorage::ttl(const std::string& key){
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(!it->second.has_expiry) return Result::ok("-1");
-    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-        it->second.expiry_time - std::chrono::steady_clock::now()
-    ).count();
-    return Result::ok(std::to_string(remaining));
+    int64_t remaining_ms = addSaturating(it->second.expiry_time.time_since_epoch().count(),
+                                         -steadyNowMs().time_since_epoch().count());
+    // Rounded to the nearest second, as Redis does: right after "SET k v EX 10"
+    // this is 10, not 9
+    return Result::ok(std::to_string(addSaturating(remaining_ms, 500) / 1000));
 }
 
 // ==================== String Operations ====================
@@ -155,7 +199,7 @@ Result InMemoryStorage::get(const std::string& key){
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {
-        removeKey(key);
+        expireKey(key);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     // Type check: GET only works on strings
@@ -168,61 +212,48 @@ Result InMemoryStorage::get(const std::string& key){
 
 Result InMemoryStorage::set(const std::string& key, const std::string& value){
     std::unique_lock lock(mutex_);
-    auto r = setInternal(key, value, 0);
+    auto r = setInternal(key, value, std::nullopt);
     if(r.success) logAOF({"SET", key, value});
     return r;
 }
 
+// A TTL of 0 or less stores the key without one
 Result InMemoryStorage::set(const std::string& key, const std::string& value, int ttlSeconds){
+    if(ttlSeconds <= 0) return set(key, value);
+    return setExpiringAt(key, value, addSaturating(unixTimeMs(), ttlSeconds * int64_t(1000)));
+}
+
+// One record, SET with PXAT, so a crash can't leave the value logged without
+// its expiry (as SET followed by PEXPIREAT could)
+Result InMemoryStorage::setExpiringAt(const std::string& key, const std::string& value, int64_t unixTimeMs){
     std::unique_lock lock(mutex_);
-    auto r = setInternal(key, value, ttlSeconds);
-    if(r.success) logAOF({"SETEX", key, std::to_string(ttlSeconds), value});
+    auto r = setInternal(key, value, toExpiryTime(unixTimeMs));
+    if(r.success) logAOF({"SET", key, value, "PXAT", std::to_string(unixTimeMs)});
     return r;
 }
 
 // SET always overwrites regardless of existing type (same as real Redis)
-Result InMemoryStorage::setInternal(const std::string& key, const std::string& value, int ttlSeconds){
+Result InMemoryStorage::setInternal(const std::string& key, const std::string& value,
+                                    std::optional<ExpiryTime> expiry){
     auto it = data_.find(key);
     if(it != data_.end()) {
         if(isExpired(it->second)) {
-            removeKey(key);
+            expireKey(key);
         } else {
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
-            if(ttlSeconds > 0) {
-                it->second.has_expiry = true;
-                it->second.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-            } else {
-                it->second.has_expiry = false;
-            }
+            setExpiry(it, expiry);
             touchLRU(key);
             return Result::ok();
         }
     }
-    // Sweep expired keys before checking capacity
-    while(!lru_list_.empty()) {
-        auto backKey = lru_list_.back();
-        auto bit = data_.find(backKey);
-        if(bit != data_.end() && isExpired(bit->second)) {
-            removeKey(backKey);
-        } else {
-            break;
-        }
-    }
-    if(data_.size() == capacity_) {
-        evictLRU();
-    }
+    makeRoomForNewKey();
     lru_list_.push_front(key);
     CacheEntry entry;
     entry.value = value;    // stores as std::string in the variant
-    if(ttlSeconds > 0) {
-        entry.has_expiry = true;
-        entry.expiry_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttlSeconds);
-    } else {
-        entry.has_expiry = false;
-    }
+    entry.has_expiry = false;
     entry.lru_it = lru_list_.begin();
-    data_[key] = std::move(entry);
+    setExpiry(data_.emplace(key, std::move(entry)).first, expiry);
     return Result::ok();
 }
 
@@ -495,7 +526,8 @@ Result InMemoryStorage::loadFromFile(const std::string& filename){
     if(!in.is_open()) return Result::fail(ErrorCode::FILE_ERROR);
     data_.clear();
     lru_list_.clear();
-    
+    expiry_index_.clear();
+
     std::string line;
     while(std::getline(in, line)) {
         std::string key, value;
@@ -538,7 +570,12 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
         DataType dt = getDataType(entry);
         switch(dt) {
             case DataType::STRING: {
-                commands.push_back(RespParser::array({"SET", key, std::get<std::string>(entry.value)}));
+                std::vector<std::string> parts = {"SET", key, std::get<std::string>(entry.value)};
+                if(entry.has_expiry) {
+                    parts.push_back("PXAT");
+                    parts.push_back(std::to_string(toUnixTimeMs(entry.expiry_time)));
+                }
+                commands.push_back(RespParser::array(parts));
                 break;
             }
             case DataType::LIST: {
@@ -572,77 +609,14 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
                 break;
             }
         }
-        // Preserve TTL: emit EXPIRE for keys with remaining TTL
-        if(entry.has_expiry) {
-            auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-                entry.expiry_time - std::chrono::steady_clock::now()
-            ).count();
-            if(remaining > 0) {
-                commands.push_back(RespParser::array({"EXPIRE", key, std::to_string(remaining)}));
-            }
+        // Lists, sets and hashes can't carry their expiry in the record that
+        // creates them. (Strings carry it as SET ... PXAT, above.)
+        if(entry.has_expiry && dt != DataType::STRING) {
+            commands.push_back(RespParser::array(
+                {"PEXPIREAT", key, std::to_string(toUnixTimeMs(entry.expiry_time))}));
         }
     }
     return commands;
-}
-
-// Replay all commands from the AOF file to rebuild state.
-// Uses RespParser to parse the RESP-formatted AOF — binary-safe.
-// Logging is disabled during replay to prevent re-logging replayed commands.
-Result InMemoryStorage::replayAOF() {
-    if(!aof_) return Result::fail(ErrorCode::FILE_ERROR);
-    std::string buffer = aof_->readRaw();
-    logging_enabled_ = false;
-
-    while(!buffer.empty()) {
-        auto parsed = RespParser::parse(buffer);
-        if(parsed.status != RespParser::ParseStatus::Ok) break;    // incomplete or invalid tail
-        buffer.erase(0, parsed.consumed);
-        const auto& args = parsed.args;
-        if(args.empty()) continue;
-
-        const std::string& cmd = args[0];
-
-        if(cmd == "SET" && args.size() >= 3) {
-            set(args[1], args[2]);
-        }
-        else if(cmd == "SETEX" && args.size() >= 4) {
-            try { set(args[1], args[3], std::stoi(args[2])); } catch(...) {}
-        }
-        else if(cmd == "DEL" && args.size() >= 2) {
-            del(args[1]);
-        }
-        else if(cmd == "EXPIRE" && args.size() >= 3) {
-            try { expire(args[1], std::stoi(args[2])); } catch(...) {}
-        }
-        else if((cmd == "LPUSH" || cmd == "RPUSH") && args.size() >= 3) {
-            std::vector<std::string> vals(args.begin() + 2, args.end());
-            if(cmd == "LPUSH") lpush(args[1], vals);
-            else rpush(args[1], vals);
-        }
-        else if((cmd == "LPOP" || cmd == "RPOP") && args.size() >= 2) {
-            if(cmd == "LPOP") lpop(args[1]);
-            else rpop(args[1]);
-        }
-        else if((cmd == "SADD" || cmd == "SREM") && args.size() >= 3) {
-            std::vector<std::string> members(args.begin() + 2, args.end());
-            if(cmd == "SADD") sadd(args[1], members);
-            else srem(args[1], members);
-        }
-        else if(cmd == "HSET" && args.size() >= 4) {
-            std::vector<std::pair<std::string,std::string>> fields;
-            for(size_t i = 2; i + 1 < args.size(); i += 2) {
-                fields.emplace_back(args[i], args[i+1]);
-            }
-            hset(args[1], fields);
-        }
-        else if(cmd == "HDEL" && args.size() >= 3) {
-            std::vector<std::string> fields(args.begin() + 2, args.end());
-            hdel(args[1], fields);
-        }
-    }
-
-    logging_enabled_ = true;
-    return Result::ok();
 }
 
 // ==================== LRU Helpers ====================
@@ -654,21 +628,73 @@ void InMemoryStorage::touchLRU(const std::string& key){
     entry.lru_it = lru_list_.begin();
 }
 
+// Evictions and expirations are removals the server decides on its own, so
+// each is logged as a DEL, as Redis does. Replay can't repeat these decisions:
+// GETs aren't logged, so its LRU order differs, and it expires nothing until
+// loading is done (see setLoading). Without the DELs, a restart could bring
+// back keys the server had dropped and lose others it still had.
+
 void InMemoryStorage::evictLRU(){
-    std::string key = lru_list_.back();
-    lru_list_.pop_back();
-    data_.erase(key);
+    std::string key = lru_list_.back();     // a copy: erasing removes the original
+    eraseEntry(data_.find(key));
+    logAOF({"DEL", key});
+}
+
+void InMemoryStorage::expireKey(const std::string& key){
+    removeKey(key);
+    logAOF({"DEL", key});
+}
+
+// Called before adding a key. Not while loading: replay repeats the live
+// server's evictions from their DEL records instead of choosing its own.
+void InMemoryStorage::makeRoomForNewKey(){
+    if(loading_ || data_.size() < capacity_) return;    // no clock read on the common path
+    // Expired keys go before any live key, wherever they are in the LRU order.
+    // Only as many as are needed: each insert does a bounded amount of work.
+    ExpiryTime now = steadyNowMs();
+    while(data_.size() >= capacity_ && !expiry_index_.empty() &&
+          expiry_index_.begin()->first <= now) {
+        std::string key = *expiry_index_.begin()->second;   // a copy, as above
+        expireKey(key);
+    }
+    while(data_.size() >= capacity_) evictLRU();
+}
+
+void InMemoryStorage::setLoading(bool loading){
+    std::unique_lock lock(mutex_);
+    loading_ = loading;
+    // The AOF may hold more keys than the capacity allows now (a smaller
+    // --maxkeys than when it was written). Evicting during replay could drop a
+    // key and then rebuild it from its later records alone, a wrong value
+    // rather than a missing one, so evict only once everything is loaded.
+    if(!loading_) {
+        while(data_.size() > capacity_) evictLRU();
+    }
 }
 
 bool InMemoryStorage::isExpired(const CacheEntry& entry) const{
-    if(!entry.has_expiry) return false;   
-    return std::chrono::steady_clock::now() >= entry.expiry_time;
+    if(!entry.has_expiry || loading_) return false;   // see setLoading()
+    return steadyNowMs() >= entry.expiry_time;
 }
 
 void InMemoryStorage::removeKey(const std::string& key){
     auto it = data_.find(key);
-    if(it != data_.end()) {
-        lru_list_.erase(it->second.lru_it);
-        data_.erase(it);
+    if(it != data_.end()) eraseEntry(it);
+}
+
+void InMemoryStorage::setExpiry(DataMap::iterator it, std::optional<ExpiryTime> expiry){
+    CacheEntry& entry = it->second;
+    if(entry.has_expiry) expiry_index_.erase({entry.expiry_time, &it->first});
+    entry.has_expiry = expiry.has_value();
+    if(expiry) {
+        entry.expiry_time = *expiry;
+        expiry_index_.insert({*expiry, &it->first});
     }
+}
+
+void InMemoryStorage::eraseEntry(DataMap::iterator it){
+    // Out of the index first: it points at the key that erase() destroys
+    if(it->second.has_expiry) expiry_index_.erase({it->second.expiry_time, &it->first});
+    lru_list_.erase(it->second.lru_it);
+    data_.erase(it);
 }
