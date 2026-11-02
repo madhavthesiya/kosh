@@ -12,6 +12,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`insert_latency.cpp`](insert_latency.cpp) | How long one insert of a new key can take in the storage engine, and every rehash of the hash table (no network) | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
+| [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
 
 Results live in [`results/`](results/), one directory per measured version (for example `results/v0-baseline/`).
 
@@ -41,6 +42,9 @@ python3 bench/cpu_profile.py  --out bench/results/<name>/profile
 # The select() limit: 1,100 connections against a build (and against real Redis)
 python3 bench/idle_clients.py --server-bin build-bench/mini_redis_server --connections 1100
 python3 bench/idle_clients.py --redis-server redis-server --connections 1100
+
+# A busy client among 1,000 idle ones, select() against epoll
+python3 bench/idle_load.py --out bench/results/<name>/idle-load.md
 ```
 
 Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1 whenever systemd starts. Under WSL2 that includes the distribution restarting after it has been idle, so run the `sysctl` right before profiling, in the same session.
