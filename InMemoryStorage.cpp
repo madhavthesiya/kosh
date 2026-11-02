@@ -36,6 +36,10 @@ int64_t toUnixTimeMs(ExpiryTime expiry) {
     return addSaturating(InMemoryStorage::unixTimeMs(), remaining);
 }
 
+// The hash table is sized at construction for up to this many keys: 4,355,707
+// buckets with libstdc++, about 35 MB at 8 bytes each. See the constructor.
+constexpr size_t kPresizedKeys = size_t{1} << 22;
+
 }  // namespace
 
 int64_t InMemoryStorage::unixTimeMs() {
@@ -50,6 +54,16 @@ InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
+
+    // Size the hash table for the capacity now, so it never rehashes while
+    // serving. std::unordered_map grows all at once, moving every key: the
+    // SET that added the 85,230th key took about 20 ms (bench/insert_latency),
+    // and the single-threaded server makes every client wait that long. The
+    // cost is the bucket array, 8 bytes per key of capacity, allocated up
+    // front. It is capped, so a huge --maxkeys meant as "unlimited" doesn't
+    // allocate gigabytes; past the cap the table grows by rehashing, as
+    // before. (Redis instead rehashes incrementally, a few buckets at a time.)
+    data_.reserve(std::min(capacity_, kPresizedKeys));
 }
 
 // Centralized AOF logging — serializes command parts as RESP and writes to AOF.
@@ -670,6 +684,11 @@ void InMemoryStorage::setLoading(bool loading){
     if(!loading_) {
         while(data_.size() > capacity_) evictLRU();
     }
+}
+
+size_t InMemoryStorage::bucketCount() const{
+    std::shared_lock lock(mutex_);
+    return data_.bucket_count();
 }
 
 bool InMemoryStorage::isExpired(const CacheEntry& entry) const{

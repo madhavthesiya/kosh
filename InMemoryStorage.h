@@ -94,6 +94,10 @@ class InMemoryStorage : public StorageInterface {
         //   DELs. Once loading is done, keys beyond the capacity are evicted.
         void setLoading(bool loading);
 
+        // Buckets in the key table. It is sized for the capacity at
+        // construction, so this doesn't change as keys are added (tests check it).
+        size_t bucketCount() const;
+
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;

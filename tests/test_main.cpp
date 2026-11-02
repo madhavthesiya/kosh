@@ -149,6 +149,25 @@ TEST(test_capacity_zero_is_rejected) {
     ASSERT_TRUE(threw);
 }
 
+TEST(test_table_sized_for_capacity) {
+    // The key table is sized for the capacity up front, so filling it never
+    // rehashes. A rehash moves every key at once, and the single-threaded
+    // server stalls meanwhile: about 20 ms at 85,000 keys (bench/insert_latency).
+    InMemoryStorage s(5000);
+    size_t buckets = s.bucketCount();
+    ASSERT_TRUE(buckets >= 5000);
+    for(int i = 0; i < 5000; i++) s.set("key:" + std::to_string(i), "v");
+    ASSERT_EQ(s.bucketCount(), buckets);
+}
+
+TEST(test_table_presize_is_capped) {
+    // A capacity meant as "unlimited" must not allocate a table for it
+    InMemoryStorage s(SIZE_MAX);
+    ASSERT_TRUE(s.bucketCount() < (size_t{1} << 23));
+    s.set("k", "v");
+    ASSERT_EQ(s.get("k").value, "v");
+}
+
 // ==================== TTL Expiration ====================
 
 TEST(test_ttl_expiration) {
@@ -1641,6 +1660,8 @@ int main() {
     RUN_TEST(test_exists_does_not_refresh_lru);
     RUN_TEST(test_lru_capacity_one);
     RUN_TEST(test_capacity_zero_is_rejected);
+    RUN_TEST(test_table_sized_for_capacity);
+    RUN_TEST(test_table_presize_is_capped);
 
     std::cout << "\n[TTL Expiration]\n";
     RUN_TEST(test_ttl_expiration);
