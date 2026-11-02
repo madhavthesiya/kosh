@@ -1,8 +1,9 @@
 #pragma once
 #include <atomic>
-#include <string>
-#include <vector>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // Append-Only File logger: every write command is appended to a file in RESP
 // format (binary-safe), so the state can be rebuilt by replaying it at startup.
@@ -26,30 +27,38 @@
 class AOFLogger {
 public:
     explicit AOFLogger(const std::string& filename);
-    ~AOFLogger();
+    ~AOFLogger();       // writes what is still buffered
 
     AOFLogger(const AOFLogger&) = delete;
     AOFLogger& operator=(const AOFLogger&) = delete;
 
-    // Append raw RESP data to the AOF file (thread-safe).
-    // The caller is responsible for formatting the data as RESP.
-    // No trailing \n is added — RESP already has its own terminators (\r\n).
-    // Each call is one write() to the OS: the data survives a process crash,
-    // but without fsync a power cut can still lose recent writes.
+    // Appends a complete RESP record to the AOF (thread-safe). No trailing \n is
+    // added: RESP has its own terminators (\r\n). It is written at once, with
+    // one write(): it then survives a process crash, but without fsync a power
+    // cut can still lose it.
     //
-    // If the write fails (a full disk), the bytes it didn't write wait in
-    // memory, and later calls append after them, so nothing is lost or
-    // reordered; they are written as soon as the file takes them. Returns false
-    // while bytes are waiting. The command that hit the error has already
-    // changed the data in memory, so it still succeeds; the server refuses the
-    // writes after it (see flushPending()), as Redis does.
-    bool log(const std::string& data);
+    // If a write fails (a full disk), the bytes it didn't write stay buffered,
+    // and later records go after them, so nothing is lost or reordered; they are
+    // written as soon as the file takes them. Returns false while writes are
+    // failing. The command that hit the error has already changed the data in
+    // memory, so it still succeeds; the server refuses the writes after it (see
+    // flushPending()), as Redis does.
+    bool log(std::string_view data);
 
-    // Tries again to write what failed writes left waiting. True if nothing
-    // is waiting: then a write command may run (its record can be saved).
+    // The same, but `append(buffer)` appends the record to the buffer itself,
+    // so the record is never built as a separate string.
+    template<typename Append>
+    bool logWith(Append&& append) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        append(buffer_);
+        return writeBuffer();
+    }
+
+    // Tries again to write what failed writes left buffered. True if writes
+    // aren't failing: then a write command may run (its record can be saved).
     bool flushPending();
 
-    // Why writing failed, while bytes are waiting
+    // Why writing failed, while it is failing
     std::string lastWriteError() const;
 
     // False if the file could not be opened; log() would then silently drop writes.
@@ -75,16 +84,16 @@ public:
     std::string getFilename() const { return filename_; }
 
 private:
-    // With mutex_ held. writePending() writes what is waiting; setWriteError()
+    // With mutex_ held. writeBuffer() writes what is buffered; setWriteError()
     // records why it can't, and returns false.
-    bool writePending();
+    bool writeBuffer();
     bool setWriteError(const std::string& error);
 
     std::string filename_;
     int fd_ = -1;           // opened for appending; -1 if it couldn't be opened
     std::string last_error_;        // why the last rewrite or truncate failed
-    std::string pending_;           // bytes a failed write left unwritten, in order
-    std::string write_error_;       // why, while pending_ isn't empty
-    std::atomic<bool> failing_{false};  // pending_ isn't empty (read without the lock)
+    std::string buffer_;            // records not written yet, in order
+    std::string write_error_;       // why, while writes are failing
+    std::atomic<bool> failing_{false};  // a write failed; read without the lock
     mutable std::mutex mutex_;      // separate mutex from storage — no contention
 };

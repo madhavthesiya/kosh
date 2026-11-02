@@ -4,9 +4,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <list>
 #include <set>
 #include <deque>
@@ -141,8 +143,14 @@ class InMemoryStorage : public StorageInterface {
         // If key exists with wrong type, returns error. If expired, removes and creates new.
         CacheEntry* getOrCreateEntry(const std::string& key, DataType expected);
 
-        // AOF logging helper — serializes parts as RESP and logs to AOF file
-        void logAOF(const std::vector<std::string>& parts);
+        // Log one command to the AOF as a RESP array: `parts`, or `head` followed
+        // by `tail` (values, or field/value pairs). Built straight into the AOF's
+        // buffer, and not at all without an AOF or while loading.
+        void logAOF(std::initializer_list<std::string_view> parts);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::vector<std::string>& tail);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::vector<std::pair<std::string, std::string>>& pairs);
 
         DataMap data_;
         std::list<std::string> lru_list_;

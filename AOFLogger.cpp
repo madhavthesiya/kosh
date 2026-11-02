@@ -74,39 +74,33 @@ size_t writeAll(int fd, const char* data, size_t size) {
     return done;
 }
 
+// After a write, the buffer keeps its memory for the next records, up to this
+// much; a larger one, grown by a burst, is given back.
+constexpr size_t kKeepBufferBytes = size_t(1) << 20;
+
 }  // namespace
 
 AOFLogger::AOFLogger(const std::string& filename)
     : filename_(filename), fd_(openFile(filename, kAppendFlags)) {}
 
 AOFLogger::~AOFLogger() {
-    // Last chance for bytes an earlier write left waiting (no other thread
-    // can use the logger any more, so no lock)
-    if(!pending_.empty() && !writePending()) {
-        std::cerr << "Warning: " << pending_.size()
+    // Last chance for buffered records (no other thread can use the logger any
+    // more, so no lock)
+    if(!buffer_.empty() && !writeBuffer()) {
+        std::cerr << "Warning: " << buffer_.size()
                   << " bytes could not be written to the AOF and are lost\n";
     }
     if(fd_ >= 0) closeFile(fd_);
 }
 
-bool AOFLogger::log(const std::string& data) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if(pending_.empty() && fd_ >= 0) {      // the usual case: written straight away
-        size_t written = writeAll(fd_, data.data(), data.size());
-        if(written == data.size()) return true;
-        int error = errno;
-        pending_.assign(data, written, std::string::npos);
-        return setWriteError(std::generic_category().message(error));
-    }
-    // Earlier bytes are waiting: these go after them, so the order is kept
-    pending_ += data;
-    return writePending();
+bool AOFLogger::log(std::string_view data) {
+    return logWith([data](std::string& buffer) { buffer.append(data); });
 }
 
 bool AOFLogger::flushPending() {
     if(!failing_) return true;      // checked without the lock: one load per write command
     std::lock_guard<std::mutex> lock(mutex_);
-    return writePending();
+    return writeBuffer();
 }
 
 std::string AOFLogger::lastWriteError() const {
@@ -114,12 +108,20 @@ std::string AOFLogger::lastWriteError() const {
     return write_error_;
 }
 
-bool AOFLogger::writePending() {
+bool AOFLogger::writeBuffer() {
     if(fd_ < 0) return setWriteError("the AOF is not open");
-    size_t written = writeAll(fd_, pending_.data(), pending_.size());
+    size_t written = writeAll(fd_, buffer_.data(), buffer_.size());
     int error = errno;
-    pending_.erase(0, written);
-    if(!pending_.empty()) return setWriteError(std::generic_category().message(error));
+    if(written < buffer_.size()) {
+        // Keep what wasn't written, in order, for the next attempt
+        buffer_.erase(0, written);
+        return setWriteError(std::generic_category().message(error));
+    }
+    // clear() keeps the capacity, so the next records need no allocation. A
+    // burst (a large pipeline) can grow the buffer to megabytes, though, so
+    // give that memory back, as Redis does with its AOF buffer.
+    if(buffer_.capacity() > kKeepBufferBytes) std::string().swap(buffer_);
+    else buffer_.clear();
     if(failing_) {
         failing_ = false;
         write_error_.clear();
@@ -184,9 +186,10 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
         std::filesystem::remove(temp, ignored);
         return false;
     }
-    // The new file holds all the data, including what earlier failed writes
-    // left waiting: that is no longer needed
-    pending_.clear();
+    // The new file holds all the data, including the effect of every record
+    // still buffered (left by failed writes). Those records belong at the end
+    // of the old file; appending them to the new one would apply them twice.
+    buffer_.clear();
     if(failing_ && fd_ >= 0) {
         failing_ = false;
         write_error_.clear();

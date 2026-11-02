@@ -66,12 +66,37 @@ InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
     data_.reserve(std::min(capacity_, kPresizedKeys));
 }
 
-// Centralized AOF logging — serializes command parts as RESP and writes to AOF.
-// RESP format is binary-safe: values with spaces, newlines etc. are length-prefixed.
-void InMemoryStorage::logAOF(const std::vector<std::string>& parts) {
-    if(aof_ && !loading_) {
-        aof_->log(RespParser::array(parts));
-    }
+// AOF logging. Each record is a RESP array (binary-safe: values with spaces or
+// newlines are length-prefixed), serialized straight into the AOF's buffer.
+// This used to build a vector<string> of copies (twice for the key, through an
+// initializer_list) and then a string of the record, before even checking for
+// an AOF: 3 allocations per SET with the AOF off, 6 with it on.
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> parts) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) { RespParser::appendArray(out, parts); });
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::vector<std::string>& tail) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) {
+        RespParser::appendLength(out, '*', head.size() + tail.size());
+        for(std::string_view part : head) RespParser::appendBulk(out, part);
+        for(const auto& part : tail) RespParser::appendBulk(out, part);
+    });
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::vector<std::pair<std::string, std::string>>& pairs) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) {
+        RespParser::appendLength(out, '*', head.size() + 2 * pairs.size());
+        for(std::string_view part : head) RespParser::appendBulk(out, part);
+        for(const auto& [first, second] : pairs) {
+            RespParser::appendBulk(out, first);
+            RespParser::appendBulk(out, second);
+        }
+    });
 }
 
 // ==================== Type Helpers ====================
@@ -281,9 +306,7 @@ Result InMemoryStorage::lpush(const std::string& key, const std::vector<std::str
     for(const auto& v : values) {
         list.push_front(v);
     }
-    std::vector<std::string> parts = {"LPUSH", key};
-    parts.insert(parts.end(), values.begin(), values.end());
-    logAOF(parts);
+    logAOF({"LPUSH", key}, values);
     return Result::ok(static_cast<int>(list.size()));
 }
 
@@ -295,9 +318,7 @@ Result InMemoryStorage::rpush(const std::string& key, const std::vector<std::str
     for(const auto& v : values) {
         list.push_back(v);
     }
-    std::vector<std::string> parts = {"RPUSH", key};
-    parts.insert(parts.end(), values.begin(), values.end());
-    logAOF(parts);
+    logAOF({"RPUSH", key}, values);
     return Result::ok(static_cast<int>(list.size()));
 }
 
@@ -383,9 +404,7 @@ Result InMemoryStorage::sadd(const std::string& key, const std::vector<std::stri
     for(const auto& m : members) {
         if(set.insert(m).second) added++;
     }
-    std::vector<std::string> parts = {"SADD", key};
-    parts.insert(parts.end(), members.begin(), members.end());
-    logAOF(parts);
+    logAOF({"SADD", key}, members);
     return Result::ok(added);
 }
 
@@ -405,9 +424,7 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
     }
     if(set.empty()) removeKey(key);
     else touchLRU(*entry);
-    std::vector<std::string> parts = {"SREM", key};
-    parts.insert(parts.end(), members.begin(), members.end());
-    logAOF(parts);
+    logAOF({"SREM", key}, members);
     return Result::ok(removed);
 }
 
@@ -448,14 +465,11 @@ Result InMemoryStorage::hset(const std::string& key, const std::vector<std::pair
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
     auto& hash = std::get<std::unordered_map<std::string,std::string>>(entry->value);
     int added = 0;
-    std::vector<std::string> parts = {"HSET", key};
     for(const auto& [field, val] : fields) {
         auto [it, inserted] = hash.insert_or_assign(field, val);
         if(inserted) added++;
-        parts.push_back(field);
-        parts.push_back(val);
     }
-    logAOF(parts);
+    logAOF({"HSET", key}, fields);
     return Result::ok(added);
 }
 
@@ -487,9 +501,7 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
     }
     if(hash.empty()) removeKey(key);
     else touchLRU(*entry);
-    std::vector<std::string> parts = {"HDEL", key};
-    parts.insert(parts.end(), fields.begin(), fields.end());
-    logAOF(parts);
+    logAOF({"HDEL", key}, fields);
     return Result::ok(removed);
 }
 

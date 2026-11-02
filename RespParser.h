@@ -4,6 +4,7 @@
 #include <charconv>
 #include <climits>
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -103,6 +104,28 @@ public:
 
     static std::string emptyArray() {
         return "*0\r\n";
+    }
+
+    // Appending forms, for building into a buffer that is reused: unlike the
+    // forms above, they create no temporary strings, so once the buffer has
+    // grown, building a reply or an AOF record allocates nothing.
+    static void appendLength(std::string& out, char type, size_t n) {
+        char digits[20];    // enough for any 64-bit size_t
+        auto result = std::to_chars(digits, digits + sizeof(digits), n);
+        out += type;
+        out.append(digits, result.ptr);
+        out += "\r\n";
+    }
+
+    static void appendBulk(std::string& out, std::string_view s) {
+        appendLength(out, '$', s.size());
+        out.append(s);
+        out += "\r\n";
+    }
+
+    static void appendArray(std::string& out, std::initializer_list<std::string_view> items) {
+        appendLength(out, '*', items.size());
+        for(std::string_view item : items) appendBulk(out, item);
     }
 
 private:
