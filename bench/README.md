@@ -5,7 +5,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | Script | Measures | Output |
 |---|---|---|
 | [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
-| [`compare_commits.py`](compare_commits.py) | Mini-Redis throughput at several commits in one interleaved session: the before/after numbers for a change | a Markdown table |
+| [`compare_commits.py`](compare_commits.py) | Mini-Redis at several commits in one session, compared round by round with a sign test: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
@@ -52,6 +52,11 @@ Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1
 - **Two `redis-benchmark` threads.** The client makes about as many system calls per request as the server, so a single client thread can run out of CPU before the server does, and the result would then measure the client.
 - **Middle of 3 runs, with the spread shown.** One run can be off for reasons unrelated to the code. The spread ((max − min) / median) says how much to trust a row: compare two versions only when the difference is clearly larger than both spreads.
 - **Runs interleaved:** every combination once, then all again. Slow drift, such as a laptop heating up and throttling, then affects all combinations alike instead of whichever ran last.
+- **Commits compared in pairs, round by round** (`compare_commits.py`). Each round measures every version, in an order that rotates from round to round.
+  - The ratio within a round compares two versions measured minutes apart, so drift across the session cancels out.
+  - The report gives the median of those ratios, their range, and a two-sided sign test: how likely it is that the rounds would agree this much if the change made no difference.
+  - With 5 rounds (the default) that all agree, p = 0.0625; with 6, p = 0.031.
+  - Phase 3's comparison, which compared each version's median instead, had spreads up to 35%, too wide for small changes.
 - **CPU use recorded for both sides.** A single-threaded server at 100% of a core is the bottleneck, so the row measures the server. If the server is well below 100% while the client is near its limit, the row measures `redis-benchmark`.
 - **Optimised build enforced.** The scripts build `RelWithDebInfo` (`-O2 -g`) into `build-bench/` and refuse Debug or sanitizer builds.
 
