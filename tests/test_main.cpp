@@ -700,8 +700,18 @@ TEST(test_aof_rewrite_compaction) {
 // While it exists, files are limited to `bytes`: writes past that fail with
 // EFBIG, as on a full disk. (SIGXFSZ, which would kill the process, is
 // ignored.) The destructor restores both, even when an assertion throws.
+//
+// The limit applies to every file this process writes, including its own
+// output when that is redirected to a file ("./tests > log"). A failed write
+// leaves std::cout or std::cerr failed for good, and every later line is
+// lost; std::cerr is tied to std::cout, so the logger's expected error
+// message alone flushes std::cout. So output is flushed before the limit is
+// set, and the streams are cleared after it is lifted. Only what is printed
+// meanwhile (the logger's message) can be lost.
 struct FileSizeLimit {
     explicit FileSizeLimit(rlim_t bytes) {
+        std::cout.flush();
+        std::cerr.flush();
         old_handler = std::signal(SIGXFSZ, SIG_IGN);
         getrlimit(RLIMIT_FSIZE, &old_limit);
         rlimit limit = old_limit;
@@ -711,6 +721,8 @@ struct FileSizeLimit {
     ~FileSizeLimit() {
         setrlimit(RLIMIT_FSIZE, &old_limit);
         std::signal(SIGXFSZ, old_handler);
+        std::cout.clear();
+        std::cerr.clear();
     }
     void (*old_handler)(int);
     rlimit old_limit;
