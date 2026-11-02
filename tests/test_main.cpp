@@ -1225,16 +1225,40 @@ std::string describe(const std::map<std::string, KeyState>& keys, const std::str
     return text + "expiry " + std::to_string(it->second.expiry);
 }
 
+// The wall clock minus the monotonic clock, in ms. It changes when the wall
+// clock is stepped: WSL2 steps it every 30 s to follow Windows, measured by up
+// to 341 ms.
+int64_t wallMinusMonotonicMs() {
+    using namespace std::chrono;
+    return InMemoryStorage::unixTimeMs() -
+           duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 // Runs `ops` random commands, through the dispatcher the server uses, against 8
 // keys in room for 5, with short and long TTLs, reads that touch the LRU order
 // and the odd rewrite. Then replays the AOF into a new instance and checks it
 // holds exactly what the live one holds.
-void checkReplayMatchesLive(unsigned seed, int ops) {
+//
+// Expiry is logged as wall-clock time but kept in memory on the monotonic
+// clock. If the wall clock is stepped during the run, replay legitimately
+// differs from the live data (as designed: see the README's trade-offs): a key
+// that expired live can come back with time left, and expiry times shift by the
+// step. So a mismatch is a failure only if the wall clock held steady; if it
+// was stepped, this returns false and the caller runs the seed again. Measured
+// after every command, so a step anywhere in the run is seen.
+bool checkReplayMatchesLive(unsigned seed, int ops) {
     const std::string aof_file = "test_aof_random.aof";
     std::remove(aof_file.c_str());
     std::mt19937 rng(seed);
     auto pick = [&](unsigned n) { return static_cast<int>(rng() % n); };
     std::map<std::string, KeyState> live, replayed;
+
+    int64_t lowest_offset = wallMinusMonotonicMs(), highest_offset = lowest_offset;
+    auto trackClock = [&] {
+        int64_t offset = wallMinusMonotonicMs();
+        lowest_offset = std::min(lowest_offset, offset);
+        highest_offset = std::max(highest_offset, offset);
+    };
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(5, &aof);
@@ -1261,11 +1285,13 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
                 case 14: executeCommand(ctx, {"HDEL", key, value}); break;
                 case 15: if(pick(25) == 0) executeCommand(ctx, {"BGREWRITEAOF"}); break;
             }
+            trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
         }
         // Let every short TTL pass, so none expires between the two snapshots
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
         live = snapshot(s);
+        trackClock();
     }
     {
         AOFLogger aof(aof_file);
@@ -1275,8 +1301,14 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
             throw std::runtime_error("seed " + std::to_string(seed) + ": the AOF didn't load cleanly: " + loaded.error);
         }
         replayed = snapshot(s);
+        trackClock();
     }
     std::remove(aof_file.c_str());
+
+    // Reading the two clocks a moment apart, and to the millisecond, moves the
+    // offset by a ms or so; more than this is a step of the wall clock
+    constexpr int64_t kClockJitterMs = 10;
+    bool clock_stepped = highest_offset - lowest_offset > kClockJitterMs;
 
     std::map<std::string, KeyState> all = live;
     all.insert(replayed.begin(), replayed.end());
@@ -1285,18 +1317,31 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
         bool same = l != live.end() && r != replayed.end() && l->second.record == r->second.record &&
                     (l->second.expiry == -1) == (r->second.expiry == -1) &&
                     std::llabs(l->second.expiry - r->second.expiry) <= 50;   // clock reads differ by a ms or so
-        if(!same) {
-            throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
-                                     describe(live, key) + ", replayed " + describe(replayed, key));
-        }
+        if(same) continue;
+        if(clock_stepped) return false;     // not a valid run: the caller runs it again
+        throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
+                                 describe(live, key) + ", replayed " + describe(replayed, key));
     }
+    return true;
 }
 
 TEST(test_aof_replay_matches_live_randomized) {
     // RANDOM_TEST_SEEDS=<n> runs more seeds than the default 4 (each ~0.2 s)
     unsigned seeds = 4;
     if(const char* n = std::getenv("RANDOM_TEST_SEEDS")) seeds = static_cast<unsigned>(std::atoi(n));
-    for(unsigned seed = 1; seed <= seeds; seed++) checkReplayMatchesLive(seed, 2500);
+    for(unsigned seed = 1; seed <= seeds; seed++) {
+        // A run that mismatched while the wall clock was stepped proves nothing
+        // either way; the same seed (the same commands) runs again. WSL2 steps
+        // the clock every 30 s and a run takes well under a second, so a rerun
+        // nearly always has a steady clock.
+        int attempts = 1;
+        while(!checkReplayMatchesLive(seed, 2500)) {
+            if(++attempts > 5) {
+                throw std::runtime_error("seed " + std::to_string(seed) +
+                                         ": the wall clock was stepped during 5 runs in a row");
+            }
+        }
+    }
 }
 
 TEST(test_aof_replay_uses_command_table) {
