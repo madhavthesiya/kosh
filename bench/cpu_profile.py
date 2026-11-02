@@ -44,7 +44,7 @@ WORKLOADS = {   # name: (redis-benchmark test, pipeline depth)
 # Share of all samples with this frame anywhere on the stack (inclusive time),
 # by the names stackcollapse-perf.pl prints (argument lists already removed).
 INCLUSIVE = [
-    ("send(), one call per reply", {"__send", "__libc_send", "send"}),
+    ("send()", {"__send", "__libc_send", "send"}),
     ("write(), the AOF", {"__GI___libc_write", "__libc_write", "write"}),
     ("recv()", {"__libc_recv", "__recv", "recv"}),
     ("select()", {"__select", "___select", "select"}),

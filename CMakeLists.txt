@@ -94,6 +94,15 @@ add_executable(insert_latency
 )
 target_link_libraries(insert_latency Threads::Threads)
 
+# Counts heap allocations per request, layer by layer (see bench/README.md)
+add_executable(alloc_count
+    bench/alloc_count.cpp
+    Commands.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(alloc_count Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
