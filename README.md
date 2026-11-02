@@ -8,23 +8,26 @@ This is a learning project, not production software. What it does not handle yet
 
 ## Performance
 
-Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability: both write their AOF to the OS without `fsync`. 100,000 random keys, 50 clients, middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
+Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability: both write their AOF to the OS without `fsync`. 100,000 random keys, 50 clients, middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the correctness fixes](bench/results/after-correctness-fixes/README.md). Earlier stages: [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
 
-| Test | Mini-Redis | Redis | Mini-Redis / Redis | At v0-baseline |
-|---|---:|---:|---:|---:|
-| SET, no pipelining, AOF on | 24,616 req/s | 25,443 req/s | 0.97× | 0.97× |
-| GET, no pipelining, AOF on | 26,291 req/s | 24,450 req/s | 1.08× | 0.97× |
-| SET, pipeline 16, AOF on | 172,247 req/s | 213,192 req/s | 0.81× | 0.43× |
-| GET, pipeline 16, AOF on | 282,008 req/s | 293,669 req/s | 0.96× | 0.56× |
-| SET, pipeline 16, AOF off | 285,486 req/s | 285,339 req/s | 1.00× | 0.50× |
-| Startup, replaying a 1,000,000-command AOF (45 MB) | over 15 min | 1.2 s | | |
+| Test | Mini-Redis | Redis | Mini-Redis / Redis | After network fixes | At v0-baseline |
+|---|---:|---:|---:|---:|---:|
+| SET, no pipelining, AOF on | 28,395 req/s | 30,734 req/s | 0.92× | 0.97× | 0.97× |
+| GET, no pipelining, AOF on | 31,097 req/s | 30,500 req/s | 1.02× | 1.08× | 0.97× |
+| SET, pipeline 16, AOF on | 191,666 req/s | 228,990 req/s | 0.84× | 0.81× | 0.43× |
+| GET, pipeline 16, AOF on | 277,577 req/s | 293,686 req/s | 0.95× | 0.96× | 0.56× |
+| SET, pipeline 16, AOF off | 276,855 req/s | 277,393 req/s | 1.00× | 1.00× | 0.50× |
+| Startup, replaying a 1,000,000-command AOF (45 MB) | 0.72 s | 0.65 s | 1.12× | not re-measured | over 750× |
 
 What the measurements show:
+- **AOF replay is now linear, and close to Redis.** It used to erase each command from the front of a buffer holding the rest of the file, moving the remaining bytes once per command. 400,000 commands took 2 min 54 s and 1,000,000 over 15 minutes; they now take 0.30 s and 0.72 s.
+- **The correctness fixes cost no measurable throughput.** Against Redis, the ratios are the same as after the network fixes (0.84× vs 0.81× for pipelined `SET` with AOF on, 0.95× vs 0.96× for `GET`).
 - **The event-loop rewrite made pipelined throughput 1.45–1.71× faster** (before and after measured in one session). Nearly all of it came from sending the replies to a whole batch of commands with one `send()`, where there used to be one call per command.
-- **Pipelined, Mini-Redis now reaches about the same throughput as Redis, but uses more CPU for it:** 1.10–1.14× Redis's CPU per request, and 1.33× for `SET` with AOF on.
-- **The largest remaining costs are visible in the profile.** AOF logging takes 43% of pipelined `SET`, because it makes one `write()` per command where Redis writes once per event-loop pass. Hash lookups take 15–27%, because each command looks its key up two or three times.
+- **Pipelined, Mini-Redis reaches about the same throughput as Redis, but uses more CPU for it:** 1.03–1.14× Redis's CPU per request, and 1.30× for `SET` with AOF on.
+- **The largest remaining costs were visible in the last profile (after the network fixes).**
+  - AOF logging took 43% of pipelined `SET`, because it makes one `write()` per command where Redis writes once per event-loop pass.
+  - Hash lookups took 15–27%, because each command looks its key up two or three times.
 - **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip sets the pace for both.
-- **AOF replay is quadratic:** each command is erased from the front of a buffer holding the rest of the file. 400,000 commands take 2 min 54 s.
 - **316 bytes of heap per key** for a 16-byte key and a 3-byte value.
 
 Raw numbers vary between sessions on this machine (WSL2 on a hybrid CPU) by more than most code changes, so comparisons are made within one session and reported with their spread.
@@ -67,13 +70,14 @@ flowchart TD
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
-| **Network** | `Server.h/.cpp` | Accepting clients, the event loop, per-client buffers, command dispatch |
+| **Network** | `Server.h/.cpp` | Accepting clients, the event loop, per-client buffers |
 | **Readiness** | `Poller.h/.cpp` | Which sockets are ready (`select()` today, behind an interface `epoll` can implement) |
 | **Portability** | `Socket.h` | Winsock vs BSD sockets: types, non-blocking mode, error codes |
 | **Protocol** | `RespParser.h` | RESP parsing (binary-safe, with limits) + inline command support |
-| **Controller** | `RedisLite.h/.cpp` | Input validation, command routing (used by the CLI; the server calls the engine directly) |
-| **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL, type dispatch, AOF integration |
-| **Persistence** | `AOFLogger.h` | Append-only file I/O in RESP format |
+| **Commands** | `Commands.h/.cpp` | One table of commands (name, number of arguments, write flag, handler), used by both the server and AOF replay |
+| **Controller** | `RedisLite.h/.cpp` | Input validation, command routing for the interactive CLI |
+| **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL with an expiry index, type dispatch, AOF integration |
+| **Persistence** | `AOFLogger.h/.cpp` | Append-only file: appends, crash-safe rewrite, failed writes |
 | **Entry points** | `server_main.cpp`, `main.cpp` | Server (command-line flags) and interactive CLI |
 
 ---
@@ -153,10 +157,14 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 
 | Feature | Details |
 |---------|---------|
-| Durability | `flush()` after every command. The data survives a process crash, but without `fsync` a power cut or OS crash can lose recent writes. |
+| Durability | Each write command's record is handed to the OS with `write()` before its reply is sent. It survives a crash of the process, but without `fsync` a power cut or OS crash can lose recent writes. |
 | Binary safety | RESP format — spaces, newlines, any byte in values |
-| Replay on startup | `replayAOF()` rebuilds state from the file |
-| Compaction | `BGREWRITEAOF` rewrites the file with the minimal set of commands. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
+| Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
+| Removals | Every key the server removes on its own, by LRU eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The LRU order isn't rebuilt: reads aren't logged. |
+| Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
+| Damaged file | An incomplete last record, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
+| Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis. |
+| Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
 | Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file |
 
 ### 4. O(1) LRU Eviction
@@ -188,7 +196,8 @@ graph LR
 - HashMap for O(1) lookup + doubly-linked list for O(1) reordering
 - Iterator stored in each entry — no linear scan to find position
 - Capacity is set with `--maxkeys` (default 10,000)
-- Before `SET` evicts, it removes expired keys from the least-recently-used end of the list. An expired key elsewhere in the list is not removed, so a live key can still be evicted while expired keys remain.
+- **Expired keys go before live ones.** Keys with a TTL are also kept in an index ordered by expiry time (a `std::set` of expiry time and a pointer to the key in the hash map). When a new key needs room, expired keys are removed from the front of the index first, and a live key is evicted only when none is left. Only as many are removed as are needed, so one insert never sweeps a large backlog.
+- The pointers stay valid because `std::unordered_map` keeps references to its elements valid until they are erased, even when it rehashes.
 
 ### 5. Thread Safety
 
@@ -199,7 +208,7 @@ graph LR
 | `GET`, `EXISTS` | `unique_lock` | Lazy expiration may trigger write |
 | `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data |
 | `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read |
-| `SAVE` | `shared_lock` | Snapshot is read-only |
+| `SAVE` (CLI only) | `shared_lock` | Snapshot is read-only |
 
 The single-threaded server doesn't need this lock. It exists so the storage engine is safe to use from several threads, which the stress tests do.
 
@@ -223,7 +232,7 @@ while(true) {
     if(parsed.status == ParseStatus::NeedMore) break;   // incomplete: wait for more data
     if(parsed.status == ParseStatus::Error) { /* reply, then disconnect */ return; }
     pos += parsed.consumed;
-    client.out += executeCommand(parsed.args);
+    client.out += executeCommand(ctx, parsed.args);    // via the command table
 }
 client.in.erase(0, pos);    // once per batch, not once per command
 ```
@@ -260,7 +269,7 @@ An earlier version copied every client into a vector on each pass for the same r
 
 **Problem:** Expiry is lazy: an expired key stays in memory until something touches it. `DEL` didn't check expiry, so `DEL` on a key whose TTL had passed returned 1 ("deleted") and logged a `DEL` to the AOF. Redis returns 0, because logically the key no longer exists.
 
-**Solution:** `DEL` now checks `isExpired()` first, like `GET` and `EXISTS`. An expired key is removed silently, `DEL` returns 0, and nothing is logged.
+**Solution:** `DEL` now checks `isExpired()` first, like `GET` and `EXISTS`. An expired key is removed and `DEL` returns 0. The removal is logged as an expiration, a `DEL` record, like every key the server removes on its own (Challenge 11).
 
 ### Challenge 5: BGREWRITEAOF Was Silently Broken
 
@@ -270,7 +279,7 @@ An earlier version copied every client into a vector on each pass for the same r
 
 **Solution:** Pass `AOFLogger*` to Server constructor. BGREWRITEAOF now calls `aof_->rewrite(commands)`.
 
-**Still open:** the rewrite truncates the live AOF before writing the new contents, so a crash in between loses the file. The standard fix is to write a temporary file, `fsync` it, and `rename()` it over the old one; on POSIX file systems the rename replaces the file atomically.
+**A second problem:** the rewrite truncated the live AOF before writing the new contents, so a crash or a full disk in between lost the file. Challenge 12 covers the fix.
 
 ### Challenge 6: Cross-Platform Socket Portability
 
@@ -327,6 +336,47 @@ Testing exposed two more problems:
 
 **How it was found:** a test opens 1,100 connections against a server started with a 1024-file limit. Another limits the server to 64 files and checks that it stays idle (under 0.2 s of CPU in a second) while refusing the excess.
 
+### Challenge 11: A Restart Didn't Bring Back the Same Data
+
+**Problem:** The AOF is only correct if replaying it rebuilds exactly the data the server held. Two things broke that:
+- **TTLs were logged as relative seconds** (`SETEX key 10 …`). Replay gave every key its full TTL again, counted from the restart, so a key that expired while the server was down came back.
+- **Keys the server removed on its own weren't logged.** Replay re-ran the `SET`s and evicted keys by its own LRU order. But `GET`s change that order and aren't in the AOF, so replay evicted different keys. After a restart, a key the server had evicted could be back, and a key it still held could be gone.
+
+**Solution**, as in Redis:
+- **Expiry times are logged as absolute Unix times in milliseconds** (`SET k v PXAT …`, `PEXPIREAT k …`).
+  - In memory they stay on the monotonic clock (`std::chrono::steady_clock`), so changing the system clock doesn't move them.
+  - Only the file uses wall-clock time, because the monotonic clock starts again from an arbitrary point when the machine reboots.
+  - Clients choose these numbers, so the conversions saturate instead of overflowing; signed overflow is undefined behaviour.
+- **Every eviction and expiry is logged as a `DEL`.** While loading, nothing expires, nothing is evicted and nothing is logged, so replay does exactly what the file says.
+
+**How it's tested:**
+- **Expiry:** keys that expired before a restart must stay expired after it, and a rewrite must keep a TTL with under a second left. Both tests failed before; the second found a rewrite bug that dropped such TTLs.
+- **Removals:** a randomized test, which failed on its first seed before the fix.
+  - It runs 2,500 random commands through the command table: 8 keys in room for 5, short and long TTLs, reads, and the odd rewrite.
+  - It then replays the AOF into a fresh instance and compares the two key by key: type, contents and expiry.
+  - It now passes 300 seeds, also under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+### Challenge 12: A Crash or a Full Disk Could Lose the AOF
+
+Three problems, each reproduced by a test before it was fixed. The tests make writes fail with a file size limit (`RLIMIT_FSIZE`), which fails them with `EFBIG` the way a full disk does.
+
+**A failed rewrite destroyed the AOF.** `BGREWRITEAOF` truncated the live file, then wrote the new contents into it. Under a 4 KB limit, a 26,490-byte AOF was left at 4,096 bytes, and the client was told `OK`. The rewrite now:
+1. writes a temporary file;
+2. `fsync`s it, so the rename can't reach the disk before the data does;
+3. renames it over the AOF, which replaces the file atomically;
+4. `fsync`s the directory, which makes the rename itself durable.
+
+A crash at any point leaves either the old file or the new one, whole. `strace` of a live rewrite shows the calls in this order.
+
+**A crash mid-write lost every later write.** The incomplete record stayed at the end of the file, new records were appended after it, and at the next start they were read as its missing part. Now, as with Redis's `aof-load-truncated`:
+- an incomplete last record is cut off at startup, with a warning;
+- damage before the end stops startup and gives its byte offset.
+
+**A full disk lost writes silently.** Failed writes were ignored: clients got `OK`, and every record from then on was missing. Past a file size limit it was worse: `SIGXFSZ` killed the server.
+- Now the bytes not written wait in memory, in order, and write commands get `-MISCONF` until the file takes them. Each refused write first retries, so writes resume as soon as there is room. Reads keep working.
+- The server ignores `SIGXFSZ`, so it gets the error instead of being killed.
+- The integration test raises the server's file size limit while it runs (`prlimit`). It then checks that writes resume, and that after a restart every acknowledged key is there.
+
 ---
 
 ## Full Command Reference
@@ -335,7 +385,7 @@ Testing exposed two more problems:
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `SET` | `SET key value` | Set key-value pair |
-| `SET` | `SET key value EX seconds` | Set with TTL in seconds (`PX` and other `SET` options are not supported yet) |
+| `SET` | `SET key value EX seconds` | Set with a TTL. Also `PX milliseconds`, `EXAT unix-seconds` and `PXAT unix-milliseconds`. The number must be a positive integer, with Redis's error replies. `NX`, `XX`, `GET` and `KEEPTTL` are not supported and return a syntax error. |
 | `SETEX` | `SETEX key seconds value` | Set with TTL (alternative) |
 | `GET` | `GET key` | Get value |
 
@@ -345,8 +395,9 @@ Testing exposed two more problems:
 | `DEL` | `DEL key` | Delete key |
 | `EXISTS` | `EXISTS key` | Check existence |
 | `TYPE` | `TYPE key` | Get data type |
-| `EXPIRE` | `EXPIRE key seconds` | Set TTL |
-| `TTL` | `TTL key` | Get remaining TTL |
+| `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less makes the key expire at once |
+| `PEXPIREAT` | `PEXPIREAT key unix-milliseconds` | Set the expiry as an absolute time (the form the AOF records) |
+| `TTL` | `TTL key` | Remaining TTL in seconds, rounded to the nearest second; -1 without a TTL, -2 if the key doesn't exist |
 
 ### List Commands
 | Command | Syntax | Description |
@@ -381,9 +432,10 @@ Testing exposed two more problems:
 |---------|-------------|
 | `PING` | Returns PONG |
 | `INFO` | Server info (version, connected clients) |
-| `SAVE` | Writes string keys only to `dump.rdb`. Lists, sets, hashes and TTLs are skipped, and the server doesn't load this file at startup. |
-| `BGREWRITEAOF` | Compacts the AOF. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled. |
+| `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
+
+There is no `SAVE`: the AOF is the server's only persistence. A wrong number of arguments gets Redis's `-ERR wrong number of arguments for '…' command`. While AOF writes are failing, write commands get `-MISCONF` (see AOF Persistence).
 
 ---
 
@@ -391,51 +443,57 @@ Testing exposed two more problems:
 
 | Operation | Time | Space |
 |-----------|:----:|:-----:|
-| SET / GET / DEL | O(1) average | O(1) |
+| SET / GET / DEL | O(1) average, plus O(log T) when a TTL is set or removed | O(1) |
+| Making room for a new key | O(log T) per expired key removed, then O(1) to evict | O(1) |
 | LPUSH / RPUSH | O(1) per element | O(1) per element |
 | LPOP / RPOP | O(1) | O(1) |
 | LRANGE | O(K) | O(K) |
 | SADD / SREM / SISMEMBER | O(1) average per member | O(1) |
 | HSET / HGET / HDEL | O(1) average per field | O(1) |
-| SAVE / LOAD | O(N) | O(N) |
 | BGREWRITEAOF | O(N) | O(N) |
+| AOF replay at startup | O(F) | O(F) |
+| SAVE / LOAD (CLI only) | O(N) | O(N) |
 
-Overall space: **O(N)** where N = number of stored keys (bounded by `--maxkeys`).
+N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = elements returned, F = size of the AOF: replay reads the whole file into memory first. Overall space: **O(N)**.
 
 ---
 
 ## Tests
 
-**60 unit tests** (`tests/test_main.cpp`):
+**85 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Mini-Redis Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
-[LRU Eviction]          4 tests    ✅
+[LRU Eviction]          5 tests    ✅
 [TTL Expiration]        5 tests    ✅
-[TTL > LRU Priority]    1 test     ✅
-[Persistence]           4 tests    ✅
+[TTL > LRU Priority]    2 tests    ✅
+[Persistence]           4 tests    ✅  (the CLI's SAVE/LOAD)
 [Controller Validation] 1 test     ✅
 [List Operations]       6 tests    ✅
 [Set Operations]        5 tests    ✅
 [Hash Operations]       5 tests    ✅
 [Type Safety]           4 tests    ✅
 [LRU with Mixed Types]  1 test     ✅
-[AOF Persistence]       7 tests    ✅  (includes binary-safety regression test)
+[AOF Persistence]      20 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes)
+[Command Table]        10 tests    ✅  (arity, SET options, strict integers, error replies)
 [RESP Parser]          10 tests    ✅  (malformed input, size limits, every split point)
 
-Results: 60 passed, 0 failed
+Results: 85 passed, 0 failed
 ```
+
+The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more.
 
 **Thread-safety stress tests** (`tests/test_thread_safety.cpp`):
 - 5 tests, each running 8 threads at once against one storage instance (20,000 operations in total).
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 25 tests that start the real server binary on a free port and speak RESP over TCP.
+- 29 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags, and AOF replay after a restart;
+  - a damaged AOF at startup, and failed AOF writes under a file size limit (Challenge 12);
   - protocol errors and error replies;
   - a client that never reads its replies (Challenge 8);
   - 1,100 connections, and running out of file descriptors (Challenge 10);
@@ -456,10 +514,11 @@ mini-redis/
 ├── Poller.h / .cpp           # Readiness interface + select() implementation
 ├── Socket.h                  # Winsock / BSD socket differences (header-only)
 ├── RespParser.h              # RESP protocol parser + serializer (header-only)
+├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
 ├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
 ├── StorageInterface.h        # Abstract interface (pure virtual base class)
 ├── InMemoryStorage.h / .cpp  # Storage engine — LRU, TTL, variant types, AOF
-├── AOFLogger.h               # Append-only file persistence (header-only)
+├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
@@ -467,7 +526,7 @@ mini-redis/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 60 unit tests
+    ├── test_main.cpp              # 85 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     └── integration/
         └── test_server.py         # Integration tests against the real server binary
@@ -556,10 +615,10 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 
 ```bash
 # Linux / macOS
-g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server
-g++ -std=c++17 -O2 -pthread main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
-g++ -std=c++17 -O2 -pthread tests/test_main.cpp InMemoryStorage.cpp RedisLite.cpp -o run_tests
-g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o run_thread_tests
+g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis_server
+g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis
+g++ -std=c++17 -O2 -pthread tests/test_main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
+g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_thread_tests
 ```
 
 On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
@@ -574,10 +633,13 @@ On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
 | **Pause a slow reader instead of disconnecting it** | When a client's replies pile up, the server stops reading from it until they are sent, so TCP slows that client down. Memory per client stays bounded without a limit at which clients are cut off. **Cost:** a client that never reads keeps its connection, and the replies already produced (a batch stops once 1 MB is waiting, after the reply that crossed it), until it closes. |
 | **Single-threaded server** | Same model as Redis's main thread: commands run one at a time, so they can't race each other. **Cost:** one slow operation delays every client. |
 | **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
-| **`flush()` over `fsync()`** | `fsync()` waits until the data is on disk, which is much slower than `flush()`, which only hands it to the OS. **Cost:** a power cut or OS crash can lose writes the OS hasn't written out yet; Linux typically writes them within about 30 seconds. |
+| **`write()` without `fsync()`** | Each record is handed to the OS with `write()`. `fsync()` would wait until it is on disk, which is much slower. **Cost:** a power cut or OS crash can lose writes the OS hasn't written out yet; Linux typically writes them within about 30 seconds. |
+| **Monotonic clock in memory, Unix time in the AOF** | `steady_clock` can't jump when the system clock is changed, so a TTL lasts as long as it says. But it starts again from an arbitrary point when the machine reboots, so the file needs wall-clock time. **Cost:** expiry is converted between the two clocks at the AOF, and a change of the system clock moves the expiry of every key loaded at the next start (Redis has the same property). |
+| **Refuse writes while the AOF can't be written** | Same as Redis's `MISCONF`. Acknowledging writes that can't be saved would lose them silently at the next restart; exiting would take reads down too. **Cost:** a full disk makes the server read-only until there is room. |
+| **Reject unsupported `SET` options** | `NX`, `XX`, `GET` and `KEEPTTL` return a syntax error. Ignoring `NX` would let `SET lock me NX` take a lock that someone else holds. |
 | **`TCP_NODELAY` enabled** | Disables Nagle's algorithm. Trades bandwidth efficiency for latency — correct for request-response protocols. |
 | **`std::variant` over inheritance** | No vtable pointer, no separate heap object per value, compile-time type checks. **Cost:** every value is as large as the largest alternative (88 bytes on x86-64 GCC 13, even for a 3-byte string). |
-| **Lazy TTL over active expiration** | No background thread. O(1) per access. **Cost:** expired keys use memory until they're accessed or evicted. |
+| **Lazy TTL over active expiration** | No background thread or timer. O(1) per access. **Cost:** expired keys use memory until they're accessed or a new key needs their room. Redis also samples keys with a TTL about 10 times a second. |
 | **`shared_mutex` over lock-free** | Correct and easy to reason about. Lock-free structures can scale better under contention but are much harder to get right. The single-threaded server needs neither. |
 | **Assert-based tests over gtest** | Zero dependencies (the integration tests use only Python's standard library). Tests are the spec — readable by anyone. |
 
@@ -585,7 +647,7 @@ On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
 
 ## Known Limitations
 
-Found while reviewing the code. Each one is planned to be fixed with a test that reproduces it first.
+Found while reviewing the code. Each fix starts with a test that reproduces the problem.
 
 **Networking**
 
@@ -600,19 +662,17 @@ Found while reviewing the code. Each one is planned to be fixed with a test that
 | Limitation | Planned fix |
 |---|---|
 | No `fsync`: a power cut or OS crash can lose writes the OS hasn't written to disk yet. | Configurable policy: `always` / `everysec` / `no` |
-| TTLs are logged as relative seconds (`SETEX key 10 …`). After a restart, replay gives keys their full TTL again, even keys that had already expired. | Log absolute expiry times (`PXAT` / `PEXPIREAT`, as Redis does) |
-| Evictions and lazy expirations aren't logged, so after a restart a different set of keys can survive than on the live server. | Log a `DEL` for every removal the server makes on its own |
-| `BGREWRITEAOF` runs in the foreground and truncates the live AOF before writing the new one. | Write a temp file, `fsync`, `rename()`; later a background (`fork()`) rewrite |
-| Replay erases each command from the front of its buffer, so startup time grows quadratically with AOF size. Measured: 100,000 commands take 11.5 s, 400,000 take 2 min 54 s, 1,000,000 over 15 min; Redis loads the same files in 0.1 s, 0.4 s and 1.2 s. | Parse with a read position |
-| An incomplete last record (crash mid-write) stops replay. Later writes are appended after it and are lost at the next restart. | Truncate the AOF to its last complete record at startup |
-| `SAVE` writes only string keys, as `S\|key=value` lines, and the server never loads that file. | Remove it from the server or reuse the AOF format |
+| The write command that first hits a failed AOF write has already changed the data, so it gets its normal reply, but its record only waits in memory. If the server stops before the disk has room, that write is lost. Redis does the same unless `appendfsync always`. | With the `always` policy, stop the server instead, as Redis does |
+| `BGREWRITEAOF` runs in the foreground: every client waits while the whole data set is written. | A background rewrite in a `fork()`ed child |
+| A record whose length field is damaged into a larger number looks like an incomplete last record. Startup then cuts it off with everything after it, with a warning giving the number of bytes. Nothing in the file tells the two apart; Redis has the same ambiguity. | None yet; a checksum per record would tell them apart |
+| Replay reads the whole AOF into memory before running it, so startup briefly needs memory for the file as well as the data. | Read it in fixed-size chunks |
+| The interactive CLI (`mini_redis`) still has `SAVE` and `LOAD`, in a text format that holds string keys only and isn't binary-safe. `LOAD` isn't logged to the AOF, so the next start goes back to the data from before it. | Remove them, as in the server |
 
 **Commands and storage**
 
 | Limitation | Planned fix |
 |---|---|
-| `SET key value EX` with a missing or non-positive number, `SET … PX`, and `SETEX` with a TTL ≤ 0 store the key without a TTL instead of returning an error. | Full `SET` option parsing with errors |
-| Expired keys are cleared before eviction only when they sit at the least-recently-used end of the list (see LRU section). | Remove expired keys before evicting a live one |
+| `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
 
 **Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), `AUTH`.
 
