@@ -946,16 +946,23 @@ TEST(test_aof_expiry_is_absolute) {
     // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
     // so every restart gave keys their full TTL again, even keys that had
     // already expired. They must expire at the same moment after a restart.
+    //
+    // The AOF holds wall-clock times, but this test waits on the monotonic
+    // clock, so a step of the wall clock during the wait shifts the result.
+    // WSL2 steps it when it resyncs with Windows (its journal logs "Time
+    // jumped backwards"). With 1 s TTLs and a 1.1 s wait, a step back of over
+    // 100 ms made this fail once; 200 ms TTLs leave a 900 ms margin.
     const std::string aof_file = "test_aof_absolute.aof";
     std::remove(aof_file.c_str());
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.set("setex", "v", 1);
+        int64_t soon = InMemoryStorage::unixTimeMs() + 200;
+        s.setExpiringAt("setex", "v", soon);
         s.set("expire", "v");
-        s.expire("expire", 1);
-        s.set("extended", "v", 1);      // its first TTL passes before the restart,
-        s.expire("extended", 100);      // but a later record extends it
+        s.expireAt("expire", soon);
+        s.setExpiringAt("extended", "v", soon);     // its first TTL passes before the restart,
+        s.expire("extended", 100);                  // but a later record extends it
         s.set("long", "v", 100);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
