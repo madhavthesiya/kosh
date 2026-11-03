@@ -16,6 +16,7 @@ Usage:
 import argparse
 import re
 import sys
+from array import array
 from collections import OrderedDict
 
 
@@ -84,15 +85,20 @@ POLICIES = {"lru": lru_misses, "sieve": sieve_misses}
 
 
 def read_traces(path):
-    """[(name, [ids])] from an --dump-trace file"""
-    traces = []
+    """Yields (name, ids) from an --dump-trace file, one trace at a time, the
+    ids in a compact array (4 bytes each: a list of Python ints would take
+    about 36, over a gigabyte for a few 10-million-request traces)."""
+    name, ids = None, None
     with open(path) as f:
         for line in f:
             if line.startswith("# trace "):
-                traces.append((line[len("# trace "):].strip(), []))
+                if name is not None:
+                    yield name, ids
+                name, ids = line[len("# trace "):].strip(), array("I")
             elif line.strip():
-                traces[-1][1].append(int(line))
-    return traces
+                ids.append(int(line))
+    if name is not None:
+        yield name, ids
 
 
 def read_expected(path, policy):
