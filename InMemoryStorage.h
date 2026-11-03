@@ -9,19 +9,27 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <set>
 #include <deque>
 #include <optional>
 #include <variant>
 #include <shared_mutex>
 
-// Type-safe tagged union for storing different Redis data types
-// std::variant enforces compile-time type checking — no void* or std::any needed
+using ListValue = std::deque<std::string>;                      // O(1) push and pop at both ends
+using SetValue = std::unordered_set<std::string>;
+using HashValue = std::unordered_map<std::string, std::string>;
+
+// A key's value, as a type-safe tagged union. Strings, the common case, are
+// stored inline; lists, sets and hashes behind a pointer. A variant is as
+// large as its largest alternative, and a std::deque is 80 bytes, so storing
+// them inline made every key, strings included, pay 88 bytes for its value;
+// boxed, it is 40.
 using ValueType = std::variant<
-    std::string,                                    // String
-    std::deque<std::string>,                        // List (deque for O(1) push/pop at both ends)
-    std::unordered_set<std::string>,                // Set
-    std::unordered_map<std::string, std::string>    // Hash
+    std::string,
+    std::unique_ptr<ListValue>,
+    std::unique_ptr<SetValue>,
+    std::unique_ptr<HashValue>
 >;
 
 enum class DataType { STRING, LIST, SET, HASH };

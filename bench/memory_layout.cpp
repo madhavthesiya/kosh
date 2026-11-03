@@ -30,7 +30,7 @@ struct MemoryLayoutReport {
         row("`std::unordered_set<std::string>` (Set)", sizeof(std::unordered_set<std::string>));
         row("`std::unordered_map<std::string, std::string>` (Hash)",
             sizeof(std::unordered_map<std::string, std::string>));
-        row("`ValueType` (`std::variant` of the four)", sizeof(ValueType));
+        row("`ValueType` (`std::variant`: a string, or a pointer to a list, set or hash)", sizeof(ValueType));
         row("`CacheEntry` (value, expiry, eviction queue links, key pointer)", sizeof(Entry));
         row("Map element `std::pair<const std::string, CacheEntry>`",
             sizeof(std::pair<const std::string, Entry>));

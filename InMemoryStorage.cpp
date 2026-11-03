@@ -41,6 +41,12 @@ int64_t toUnixTimeMs(ExpiryTime expiry) {
 // buckets with libstdc++, about 35 MB at 8 bytes each. See the constructor.
 constexpr size_t kPresizedKeys = size_t{1} << 22;
 
+// The list, set or hash in a value already known to hold one (see ValueType)
+template<typename T>
+T& boxed(ValueType& value) { return *std::get<std::unique_ptr<T>>(value); }
+template<typename T>
+const T& boxed(const ValueType& value) { return *std::get<std::unique_ptr<T>>(value); }
+
 }  // namespace
 
 int64_t InMemoryStorage::unixTimeMs() {
@@ -104,8 +110,8 @@ void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
 
 DataType InMemoryStorage::getDataType(const CacheEntry& entry) const {
     if(std::holds_alternative<std::string>(entry.value)) return DataType::STRING;
-    if(std::holds_alternative<std::deque<std::string>>(entry.value)) return DataType::LIST;
-    if(std::holds_alternative<std::unordered_set<std::string>>(entry.value)) return DataType::SET;
+    if(std::holds_alternative<std::unique_ptr<ListValue>>(entry.value)) return DataType::LIST;
+    if(std::holds_alternative<std::unique_ptr<SetValue>>(entry.value)) return DataType::SET;
     return DataType::HASH;
 }
 
@@ -154,9 +160,9 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
     CacheEntry entry;
     switch(expected) {
         case DataType::STRING: entry.value = std::string(); break;
-        case DataType::LIST:   entry.value = std::deque<std::string>(); break;
-        case DataType::SET:    entry.value = std::unordered_set<std::string>(); break;
-        case DataType::HASH:   entry.value = std::unordered_map<std::string,std::string>(); break;
+        case DataType::LIST:   entry.value = std::make_unique<ListValue>(); break;
+        case DataType::SET:    entry.value = std::make_unique<SetValue>(); break;
+        case DataType::HASH:   entry.value = std::make_unique<HashValue>(); break;
     }
     entry.has_expiry = false;
     return &insertEntry(key, std::move(entry))->second;
@@ -291,7 +297,7 @@ Result InMemoryStorage::lpush(const std::string& key, const std::vector<std::str
     std::unique_lock lock(mutex_);
     auto* entry = getOrCreateEntry(key, DataType::LIST);
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
-    auto& list = std::get<std::deque<std::string>>(entry->value);
+    auto& list = boxed<ListValue>(entry->value);
     for(const auto& v : values) {
         list.push_front(v);
     }
@@ -303,7 +309,7 @@ Result InMemoryStorage::rpush(const std::string& key, const std::vector<std::str
     std::unique_lock lock(mutex_);
     auto* entry = getOrCreateEntry(key, DataType::LIST);
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
-    auto& list = std::get<std::deque<std::string>>(entry->value);
+    auto& list = boxed<ListValue>(entry->value);
     for(const auto& v : values) {
         list.push_back(v);
     }
@@ -320,7 +326,7 @@ Result InMemoryStorage::lpop(const std::string& key){
             return Result::fail(ErrorCode::WRONG_TYPE);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    auto& list = std::get<std::deque<std::string>>(entry->value);
+    auto& list = boxed<ListValue>(entry->value);
     if(list.empty()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     std::string val = list.front();
     list.pop_front();
@@ -340,7 +346,7 @@ Result InMemoryStorage::rpop(const std::string& key){
             return Result::fail(ErrorCode::WRONG_TYPE);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    auto& list = std::get<std::deque<std::string>>(entry->value);
+    auto& list = boxed<ListValue>(entry->value);
     if(list.empty()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     std::string val = list.back();
     list.pop_back();
@@ -357,7 +363,7 @@ Result InMemoryStorage::lrange(const std::string& key, int start, int stop){
     if(isExpired(it->second)) return Result::ok(std::vector<std::string>{});
     if(getDataType(it->second) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
     
-    const auto& list = std::get<std::deque<std::string>>(it->second.value);
+    const auto& list = boxed<ListValue>(it->second.value);
     int len = static_cast<int>(list.size());
     
     // Handle negative indices (like real Redis: -1 = last element)
@@ -379,7 +385,7 @@ Result InMemoryStorage::llen(const std::string& key){
     if(it == data_.end()) return Result::ok(0);
     if(isExpired(it->second)) return Result::ok(0);
     if(getDataType(it->second) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
-    return Result::ok(static_cast<int>(std::get<std::deque<std::string>>(it->second.value).size()));
+    return Result::ok(static_cast<int>(boxed<ListValue>(it->second.value).size()));
 }
 
 // ==================== Set Operations ====================
@@ -388,7 +394,7 @@ Result InMemoryStorage::sadd(const std::string& key, const std::vector<std::stri
     std::unique_lock lock(mutex_);
     auto* entry = getOrCreateEntry(key, DataType::SET);
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
-    auto& set = std::get<std::unordered_set<std::string>>(entry->value);
+    auto& set = boxed<SetValue>(entry->value);
     int added = 0;
     for(const auto& m : members) {
         if(set.insert(m).second) added++;
@@ -406,7 +412,7 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
             return Result::fail(ErrorCode::WRONG_TYPE);
         return Result::ok(0);
     }
-    auto& set = std::get<std::unordered_set<std::string>>(entry->value);
+    auto& set = boxed<SetValue>(entry->value);
     int removed = 0;
     for(const auto& m : members) {
         removed += static_cast<int>(set.erase(m));
@@ -423,7 +429,7 @@ Result InMemoryStorage::smembers(const std::string& key){
     if(it == data_.end()) return Result::ok(std::vector<std::string>{});
     if(isExpired(it->second)) return Result::ok(std::vector<std::string>{});
     if(getDataType(it->second) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
-    const auto& set = std::get<std::unordered_set<std::string>>(it->second.value);
+    const auto& set = boxed<SetValue>(it->second.value);
     return Result::ok(std::vector<std::string>(set.begin(), set.end()));
 }
 
@@ -433,7 +439,7 @@ Result InMemoryStorage::sismember(const std::string& key, const std::string& mem
     if(it == data_.end()) return Result::ok(0);
     if(isExpired(it->second)) return Result::ok(0);
     if(getDataType(it->second) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
-    const auto& set = std::get<std::unordered_set<std::string>>(it->second.value);
+    const auto& set = boxed<SetValue>(it->second.value);
     return Result::ok(set.count(member) > 0 ? 1 : 0);
 }
 
@@ -443,7 +449,7 @@ Result InMemoryStorage::scard(const std::string& key){
     if(it == data_.end()) return Result::ok(0);
     if(isExpired(it->second)) return Result::ok(0);
     if(getDataType(it->second) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
-    return Result::ok(static_cast<int>(std::get<std::unordered_set<std::string>>(it->second.value).size()));
+    return Result::ok(static_cast<int>(boxed<SetValue>(it->second.value).size()));
 }
 
 // ==================== Hash Operations ====================
@@ -452,7 +458,7 @@ Result InMemoryStorage::hset(const std::string& key, const std::vector<std::pair
     std::unique_lock lock(mutex_);
     auto* entry = getOrCreateEntry(key, DataType::HASH);
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
-    auto& hash = std::get<std::unordered_map<std::string,std::string>>(entry->value);
+    auto& hash = boxed<HashValue>(entry->value);
     int added = 0;
     for(const auto& [field, val] : fields) {
         auto [it, inserted] = hash.insert_or_assign(field, val);
@@ -468,7 +474,7 @@ Result InMemoryStorage::hget(const std::string& key, const std::string& field){
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(getDataType(it->second) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
-    const auto& hash = std::get<std::unordered_map<std::string,std::string>>(it->second.value);
+    const auto& hash = boxed<HashValue>(it->second.value);
     auto fit = hash.find(field);
     if(fit == hash.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     return Result::ok(fit->second);
@@ -483,7 +489,7 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
             return Result::fail(ErrorCode::WRONG_TYPE);
         return Result::ok(0);
     }
-    auto& hash = std::get<std::unordered_map<std::string,std::string>>(entry->value);
+    auto& hash = boxed<HashValue>(entry->value);
     int removed = 0;
     for(const auto& f : fields) {
         removed += static_cast<int>(hash.erase(f));
@@ -500,7 +506,7 @@ Result InMemoryStorage::hgetall(const std::string& key){
     if(it == data_.end()) return Result::ok(std::vector<std::string>{});
     if(isExpired(it->second)) return Result::ok(std::vector<std::string>{});
     if(getDataType(it->second) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
-    const auto& hash = std::get<std::unordered_map<std::string,std::string>>(it->second.value);
+    const auto& hash = boxed<HashValue>(it->second.value);
     // Return as alternating field, value pairs (same as real Redis)
     std::vector<std::string> result;
     for(const auto& [field, val] : hash) {
@@ -516,7 +522,7 @@ Result InMemoryStorage::hlen(const std::string& key){
     if(it == data_.end()) return Result::ok(0);
     if(isExpired(it->second)) return Result::ok(0);
     if(getDataType(it->second) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
-    return Result::ok(static_cast<int>(std::get<std::unordered_map<std::string,std::string>>(it->second.value).size()));
+    return Result::ok(static_cast<int>(boxed<HashValue>(it->second.value).size()));
 }
 
 // ==================== Persistence ====================
@@ -599,7 +605,7 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
                 break;
             }
             case DataType::LIST: {
-                const auto& list = std::get<std::deque<std::string>>(entry.value);
+                const auto& list = boxed<ListValue>(entry.value);
                 if(!list.empty()) {
                     std::vector<std::string> parts = {"RPUSH", key};
                     parts.insert(parts.end(), list.begin(), list.end());
@@ -608,7 +614,7 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
                 break;
             }
             case DataType::SET: {
-                const auto& s = std::get<std::unordered_set<std::string>>(entry.value);
+                const auto& s = boxed<SetValue>(entry.value);
                 if(!s.empty()) {
                     std::vector<std::string> parts = {"SADD", key};
                     parts.insert(parts.end(), s.begin(), s.end());
@@ -617,7 +623,7 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
                 break;
             }
             case DataType::HASH: {
-                const auto& hash = std::get<std::unordered_map<std::string,std::string>>(entry.value);
+                const auto& hash = boxed<HashValue>(entry.value);
                 if(!hash.empty()) {
                     std::vector<std::string> parts = {"HSET", key};
                     for(const auto& [f, v] : hash) {
