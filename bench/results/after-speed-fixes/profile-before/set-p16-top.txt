@@ -1,0 +1,35 @@
+Mini-Redis SET P=16, AOF on: 50 clients, 100,000 keys
+Server CPU 86%, of which 36% in the kernel
+
+== Inclusive time (the call and everything under it)
+   10.60%  send(), one call per reply
+   24.85%  write(), the AOF
+    2.98%  recv()
+    0.49%  select()
+   39.71%  All AOF logging (InMemoryStorage::logAOF)
+    6.35%  RESP parsing
+
+== Self time by binary or library
+  36.74%  [kernel.kallsyms]
+  33.60%  mini_redis_server
+  17.95%  libc.so.6
+  11.72%  libstdc++.so.6.0.33
+
+== Self time by function (at least 1%)
+  15.72%  mini_redis_server    [.] std::_Hashtable<…>::_M_find_before_node(…) const
+   3.65%  mini_redis_server    [.] RespParser::bulkString(…)
+   3.07%  libstdc++.so.6.0.33  [.] std::__detail::_List_node_base::_M_unhook(…)
+   2.84%  libc.so.6            [.] malloc
+   2.63%  libc.so.6            [.] __memmove_avx_unaligned_erms
+   2.28%  libc.so.6            [.] _int_free
+   2.19%  libc.so.6            [.] __GI___libc_write
+   2.12%  libstdc++.so.6.0.33  [.] std::string::_M_append(…)
+   1.79%  libc.so.6            [.] cfree@GLIBC_2.2.5
+   1.74%  [kernel.kallsyms]    [k] syscall_enter_from_user_mode
+   1.49%  libc.so.6            [.] __memcmp_avx2_movbe
+   1.46%  mini_redis_server    [.] RespParser::parseResp(…)
+   1.33%  mini_redis_server    [.] RespParser::readHeader(…)
+   1.21%  [kernel.kallsyms]    [k] copyin
+   1.07%  mini_redis_server    [.] InMemoryStorage::set(…)
+   1.05%  mini_redis_server    [.] RespParser::array(…)
+   1.02%  [kernel.kallsyms]    [k] _raw_spin_unlock_irqrestore

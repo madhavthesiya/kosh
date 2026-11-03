@@ -1,0 +1,34 @@
+Mini-Redis SET P=1, AOF on: 50 clients, 100,000 keys
+Server CPU 86%, of which 76% in the kernel
+
+== Inclusive time (the call and everything under it)
+   50.05%  send()
+    6.86%  write(), the AOF
+   11.89%  recv()
+    7.96%  Waiting: select() or epoll_wait()
+    2.17%  All AOF logging (InMemoryStorage::logAOF)
+    2.36%  RESP parsing
+
+== Self time by binary or library
+  76.68%  [kernel.kallsyms]
+  12.27%  mini_redis_server
+   7.07%  libc.so.6
+   3.92%  libstdc++.so.6.0.33
+
+== Self time by function (at least 1%)
+   4.50%  [kernel.kallsyms]    [k] _raw_spin_unlock_irqrestore
+   3.54%  mini_redis_server    [.] std::_Hashtable<…>::_M_find_before_node(…) const
+   2.21%  [kernel.kallsyms]    [k] __nf_conntrack_find_get
+   1.80%  [kernel.kallsyms]    [k] clear_page_erms
+   1.49%  libstdc++.so.6.0.33  [.] std::__detail::_List_node_base::_M_transfer(…)
+   1.37%  libc.so.6            [.] __send
+   1.23%  [kernel.kallsyms]    [k] __fget_light
+   1.23%  [kernel.kallsyms]    [k] copyout
+   1.23%  [kernel.kallsyms]    [k] mod_memcg_state
+   1.20%  [kernel.kallsyms]    [k] __raw_callee_save___pv_queued_spin_unlock
+   1.13%  [kernel.kallsyms]    [k] sock_poll
+   1.11%  [kernel.kallsyms]    [k] finish_task_switch.isra.0
+   1.11%  [kernel.kallsyms]    [k] syscall_enter_from_user_mode
+   1.08%  [kernel.kallsyms]    [k] tcp_recvmsg_locked
+   1.03%  [kernel.kallsyms]    [k] tcp_sendmsg_locked
+   1.01%  [kernel.kallsyms]    [k] __tcp_transmit_skb
