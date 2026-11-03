@@ -14,6 +14,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`eviction_sim.cpp`](eviction_sim.cpp) | Miss ratio of the engine's eviction on cache traces (Zipf, Zipf with scans, or a CSV such as Twitter's), at capacities given as fractions of the trace's distinct keys. Each request is a GET; a miss SETs the key (no network) | stdout |
 | [`eviction_reference.py`](eviction_reference.py) | Replays the requests `eviction_sim --dump-trace` ran through a textbook implementation of each policy; `--expect` fails unless every miss count is exactly the engine's | stdout |
 | [`memory_compare.py`](memory_compare.py) | Memory per key, Mini-Redis against real Redis for the same keys: growth of resident memory (RSS), with Mini-Redis also under jemalloc to separate the allocator from the data layout | `memory.md` |
+| [`layout_bias.py`](layout_bias.py) | How much `lookup_latency` moves from code and stack layout alone: every link order of its objects, each under several environment sizes, in shuffled order. The spread (with run-to-run noise) is the floor a microbenchmark gain must clear | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -47,6 +48,9 @@ python3 bench/eviction_reference.py /tmp/trace.txt --expect sim.md
 
 # Memory per key against real Redis (1,000,000 keys, 3 runs; about 2 minutes)
 python3 bench/memory_compare.py --out bench/results/<name>/memory.md
+
+# The layout-and-noise floor for lookup_latency's numbers (about 10 minutes)
+python3 bench/layout_bias.py > bench/results/<name>/layout-bias.md
 cmake --build build --target alloc_count && ./build/alloc_count
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
