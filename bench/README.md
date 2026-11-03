@@ -5,11 +5,14 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | Script | Measures | Output |
 |---|---|---|
 | [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
-| [`compare_commits.py`](compare_commits.py) | Mini-Redis throughput at several commits in one interleaved session: the before/after numbers for a change | a Markdown table |
+| [`compare_commits.py`](compare_commits.py) | Mini-Redis at several commits in one session, compared round by round with a sign test: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
+| [`insert_latency.cpp`](insert_latency.cpp) | How long one insert of a new key can take in the storage engine, and every rehash of the hash table (no network) | stdout |
+| [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
+| [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
 
 Results live in [`results/`](results/), one directory per measured version (for example `results/v0-baseline/`).
 
@@ -27,6 +30,8 @@ python3 bench/replay_bench.py --out bench/results/<name>
 python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
 ./build/memory_layout > bench/results/<name>/memory-layout.md
+cmake --build build --target insert_latency && taskset -c 2 ./build/insert_latency 100000 5
+cmake --build build --target alloc_count && ./build/alloc_count
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
 sudo apt install linux-tools-generic
@@ -37,6 +42,9 @@ python3 bench/cpu_profile.py  --out bench/results/<name>/profile
 # The select() limit: 1,100 connections against a build (and against real Redis)
 python3 bench/idle_clients.py --server-bin build-bench/mini_redis_server --connections 1100
 python3 bench/idle_clients.py --redis-server redis-server --connections 1100
+
+# A busy client among 1,000 idle ones, select() against epoll
+python3 bench/idle_load.py --out bench/results/<name>/idle-load.md
 ```
 
 Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1 whenever systemd starts. Under WSL2 that includes the distribution restarting after it has been idle, so run the `sysctl` right before profiling, in the same session.
@@ -52,6 +60,12 @@ Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1
 - **Two `redis-benchmark` threads.** The client makes about as many system calls per request as the server, so a single client thread can run out of CPU before the server does, and the result would then measure the client.
 - **Middle of 3 runs, with the spread shown.** One run can be off for reasons unrelated to the code. The spread ((max − min) / median) says how much to trust a row: compare two versions only when the difference is clearly larger than both spreads.
 - **Runs interleaved:** every combination once, then all again. Slow drift, such as a laptop heating up and throttling, then affects all combinations alike instead of whichever ran last.
+- **The order alternates.** `bench.py` swaps which server goes first from run to run, and `compare_commits.py` reverses its order every other round. Interleaving balances slow drift, but drift *within* a run (a CPU's boost budget running out, for instance) favours whichever is measured first. Until Phase 4 the order never changed: Mini-Redis always went before Redis, and neighbouring commits kept their order in all but one round (see [after-speed-fixes](results/after-speed-fixes/README.md)).
+- **Commits compared in pairs, round by round** (`compare_commits.py`). Each round measures every version, in an order that rotates from round to round.
+  - The ratio within a round compares two versions measured minutes apart, so drift across the session cancels out.
+  - The report gives the median of those ratios, their range, and a two-sided sign test: how likely it is that the rounds would agree this much if the change made no difference.
+  - With 5 rounds (the default) that all agree, p = 0.0625; with 6, p = 0.031.
+  - Phase 3's comparison, which compared each version's median instead, had spreads up to 35%, too wide for small changes.
 - **CPU use recorded for both sides.** A single-threaded server at 100% of a core is the bottleneck, so the row measures the server. If the server is well below 100% while the client is near its limit, the row measures `redis-benchmark`.
 - **Optimised build enforced.** The scripts build `RelWithDebInfo` (`-O2 -g`) into `build-bench/` and refuse Debug or sanitizer builds.
 

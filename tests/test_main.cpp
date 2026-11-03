@@ -11,7 +11,10 @@
 #ifndef _WIN32
 #include <csignal>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
+#include "../Poller.h"
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -147,6 +150,25 @@ TEST(test_capacity_zero_is_rejected) {
         threw = true;
     }
     ASSERT_TRUE(threw);
+}
+
+TEST(test_table_sized_for_capacity) {
+    // The key table is sized for the capacity up front, so filling it never
+    // rehashes. A rehash moves every key at once, and the single-threaded
+    // server stalls meanwhile: about 20 ms at 85,000 keys (bench/insert_latency).
+    InMemoryStorage s(5000);
+    size_t buckets = s.bucketCount();
+    ASSERT_TRUE(buckets >= 5000);
+    for(int i = 0; i < 5000; i++) s.set("key:" + std::to_string(i), "v");
+    ASSERT_EQ(s.bucketCount(), buckets);
+}
+
+TEST(test_table_presize_is_capped) {
+    // A capacity meant as "unlimited" must not allocate a table for it
+    InMemoryStorage s(SIZE_MAX);
+    ASSERT_TRUE(s.bucketCount() < (size_t{1} << 23));
+    s.set("k", "v");
+    ASSERT_EQ(s.get("k").value, "v");
 }
 
 // ==================== TTL Expiration ====================
@@ -819,6 +841,158 @@ TEST(test_aof_rewrite_replaces_failed_writes) {
 #endif
 }
 
+TEST(test_aof_deferred_writes_wait_for_flush) {
+    // Group commit: in deferred mode (the server's), records are only buffered,
+    // and flush() writes them all, in order, with one write()
+    const std::string aof_file = "test_aof_deferred.aof";
+    std::remove(aof_file.c_str());
+    const std::string a = RespParser::array({"SET", "a", "1"});
+    const std::string b = RespParser::array({"SET", "b", "2"});
+    {
+        AOFLogger aof(aof_file);
+        aof.setDeferred(true);
+        ASSERT_TRUE(aof.log(a));
+        ASSERT_TRUE(aof.log(b));
+        ASSERT_TRUE(aof.readRaw().empty());         // nothing written yet
+        ASSERT_TRUE(aof.flush());
+        ASSERT_TRUE(aof.readRaw() == a + b);
+        ASSERT_TRUE(aof.flush());                   // nothing left to write
+        ASSERT_TRUE(aof.log(a));
+        aof.setDeferred(false);                     // writes what is buffered
+        ASSERT_TRUE(aof.readRaw() == a + b + a);
+        ASSERT_TRUE(aof.log(b));                    // written at once again
+        ASSERT_TRUE(aof.readRaw() == a + b + a + b);
+        aof.setDeferred(true);
+        ASSERT_TRUE(aof.log(a));
+    }                                               // the destructor writes it
+    AOFLogger aof(aof_file);
+    ASSERT_TRUE(aof.readRaw() == a + b + a + b + a);
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_deferred_write_errors) {
+#ifndef _WIN32
+    // A flush that fails (a full disk) keeps what it didn't write, in order,
+    // as an immediate write does, and writes it all once there is room
+    const std::string aof_file = "test_aof_deferred_error.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setDeferred(true);
+    const std::string record = RespParser::array({"SET", "k", std::string(100, 'v')});
+    std::string expected;
+    for(int i = 0; i < 20; i++) {                   // 128 bytes each
+        ASSERT_TRUE(aof.log(record));
+        expected += record;
+    }
+    {
+        FileSizeLimit limit(1000);
+        ASSERT_FALSE(aof.flush());
+        ASSERT_EQ(aof.readRaw().size(), (size_t)1000);
+        ASSERT_FALSE(aof.flushPending());
+        ASSERT_EQ(aof.lastWriteError(), "File too large");
+        ASSERT_FALSE(aof.log(record));              // buffered behind the rest
+        expected += record;
+    }
+    ASSERT_TRUE(aof.flushPending());                // room again: everything is written
+    ASSERT_TRUE(aof.readRaw() == expected);
+    ASSERT_EQ(aof.lastWriteError(), "");
+    std::remove(aof_file.c_str());
+#endif
+}
+
+TEST(test_aof_rewrite_drops_buffered_records) {
+    // A rewrite writes a snapshot that already includes the effect of every
+    // record still buffered. Those records must not be written after it:
+    // replay would apply them twice, and an RPUSH twice is a wrong value.
+    const std::string aof_file = "test_aof_rewrite_buffered.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        aof.setDeferred(true);
+        InMemoryStorage s(100, &aof);
+        s.rpush("list", {"x"});                     // buffered, and in the snapshot below
+        ASSERT_TRUE(aof.rewrite(s.dumpState()));
+        s.rpush("list", {"y"});                     // after the rewrite: must be kept
+        ASSERT_TRUE(aof.flush());
+    }
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(100, &aof);
+        ASSERT_TRUE(replayAOF(s, aof).ok);
+        ASSERT_EQ(s.llen("list").value, "2");       // x, y; not x, x, y
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_fsync_always_syncs_each_write_or_group) {
+    // appendfsync always: a sync after every write, so before any reply. With
+    // group commit the server writes once per pass, so one sync covers every
+    // command of the pass: that is what makes "always" affordable.
+    const std::string aof_file = "test_aof_fsync_always.aof";
+    std::remove(aof_file.c_str());
+    const std::string record = RespParser::array({"SET", "k", "v"});
+    {
+        AOFLogger aof(aof_file);
+        aof.setFsyncPolicy(AOFLogger::FsyncPolicy::Always);
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)2);          // one per write
+        aof.setDeferred(true);
+        for(int i = 0; i < 3; i++) ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)2);          // buffered: nothing to sync yet
+        ASSERT_TRUE(aof.flush());
+        ASSERT_EQ(aof.syncs(), (size_t)3);          // one write, one sync, for all three
+        ASSERT_TRUE(aof.flush());
+        ASSERT_EQ(aof.syncs(), (size_t)3);          // nothing new: no sync
+        ASSERT_FALSE(aof.failedForGood());
+    }
+    {
+        AOFLogger aof(aof_file);                    // no: the OS decides
+        aof.setFsyncPolicy(AOFLogger::FsyncPolicy::No);
+        ASSERT_TRUE(aof.log(record));
+        ASSERT_EQ(aof.syncs(), (size_t)0);
+        ASSERT_EQ(aof.readRaw().size(), 6 * record.size());
+    }
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_fsync_everysec_syncs_in_the_background) {
+    // appendfsync everysec: a background thread syncs about once a second,
+    // and only if something was written since the last sync
+    const std::string aof_file = "test_aof_fsync_everysec.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setFsyncPolicy(AOFLogger::FsyncPolicy::EverySecond);
+    ASSERT_TRUE(aof.log(RespParser::array({"SET", "k", "v"})));
+    ASSERT_EQ(aof.syncs(), (size_t)0);              // not by the write itself
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while(aof.syncs() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(aof.syncs(), (size_t)1);              // within about a second
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    ASSERT_EQ(aof.syncs(), (size_t)1);              // nothing new: no sync
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_fsync_always_write_error_is_fatal) {
+#ifndef _WIN32
+    // With "always", a reply must mean the write is on the disk. A write that
+    // fails breaks that promise for good, so the server must stop (Redis exits)
+    const std::string aof_file = "test_aof_fsync_always_error.aof";
+    std::remove(aof_file.c_str());
+    AOFLogger aof(aof_file);
+    aof.setFsyncPolicy(AOFLogger::FsyncPolicy::Always);
+    {
+        FileSizeLimit limit(100);
+        ASSERT_FALSE(aof.log(RespParser::array({"SET", "k", std::string(200, 'v')})));
+    }
+    ASSERT_TRUE(aof.failedForGood());
+    ASSERT_EQ(aof.lastWriteError(), "File too large");
+    std::remove(aof_file.c_str());
+#endif
+}
+
 TEST(test_aof_no_log_on_failed_ops) {
     const std::string aof_file = "test_aof_nolog.aof";
     std::remove(aof_file.c_str());
@@ -927,16 +1101,23 @@ TEST(test_aof_expiry_is_absolute) {
     // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
     // so every restart gave keys their full TTL again, even keys that had
     // already expired. They must expire at the same moment after a restart.
+    //
+    // The AOF holds wall-clock times, but this test waits on the monotonic
+    // clock, so a step of the wall clock during the wait shifts the result.
+    // WSL2 steps it when it resyncs with Windows (its journal logs "Time
+    // jumped backwards"). With 1 s TTLs and a 1.1 s wait, a step back of over
+    // 100 ms made this fail once; 200 ms TTLs leave a 900 ms margin.
     const std::string aof_file = "test_aof_absolute.aof";
     std::remove(aof_file.c_str());
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
-        s.set("setex", "v", 1);
+        int64_t soon = InMemoryStorage::unixTimeMs() + 200;
+        s.setExpiringAt("setex", "v", soon);
         s.set("expire", "v");
-        s.expire("expire", 1);
-        s.set("extended", "v", 1);      // its first TTL passes before the restart,
-        s.expire("extended", 100);      // but a later record extends it
+        s.expireAt("expire", soon);
+        s.setExpiringAt("extended", "v", soon);     // its first TTL passes before the restart,
+        s.expire("extended", 100);                  // but a later record extends it
         s.set("long", "v", 100);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -1116,16 +1297,40 @@ std::string describe(const std::map<std::string, KeyState>& keys, const std::str
     return text + "expiry " + std::to_string(it->second.expiry);
 }
 
+// The wall clock minus the monotonic clock, in ms. It changes when the wall
+// clock is stepped: WSL2 steps it every 30 s to follow Windows, measured by up
+// to 341 ms.
+int64_t wallMinusMonotonicMs() {
+    using namespace std::chrono;
+    return InMemoryStorage::unixTimeMs() -
+           duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 // Runs `ops` random commands, through the dispatcher the server uses, against 8
 // keys in room for 5, with short and long TTLs, reads that touch the LRU order
 // and the odd rewrite. Then replays the AOF into a new instance and checks it
 // holds exactly what the live one holds.
-void checkReplayMatchesLive(unsigned seed, int ops) {
+//
+// Expiry is logged as wall-clock time but kept in memory on the monotonic
+// clock. If the wall clock is stepped during the run, replay legitimately
+// differs from the live data (as designed: see the README's trade-offs): a key
+// that expired live can come back with time left, and expiry times shift by the
+// step. So a mismatch is a failure only if the wall clock held steady; if it
+// was stepped, this returns false and the caller runs the seed again. Measured
+// after every command, so a step anywhere in the run is seen.
+bool checkReplayMatchesLive(unsigned seed, int ops) {
     const std::string aof_file = "test_aof_random.aof";
     std::remove(aof_file.c_str());
     std::mt19937 rng(seed);
     auto pick = [&](unsigned n) { return static_cast<int>(rng() % n); };
     std::map<std::string, KeyState> live, replayed;
+
+    int64_t lowest_offset = wallMinusMonotonicMs(), highest_offset = lowest_offset;
+    auto trackClock = [&] {
+        int64_t offset = wallMinusMonotonicMs();
+        lowest_offset = std::min(lowest_offset, offset);
+        highest_offset = std::max(highest_offset, offset);
+    };
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(5, &aof);
@@ -1152,11 +1357,13 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
                 case 14: executeCommand(ctx, {"HDEL", key, value}); break;
                 case 15: if(pick(25) == 0) executeCommand(ctx, {"BGREWRITEAOF"}); break;
             }
+            trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
         }
         // Let every short TTL pass, so none expires between the two snapshots
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
         live = snapshot(s);
+        trackClock();
     }
     {
         AOFLogger aof(aof_file);
@@ -1166,8 +1373,14 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
             throw std::runtime_error("seed " + std::to_string(seed) + ": the AOF didn't load cleanly: " + loaded.error);
         }
         replayed = snapshot(s);
+        trackClock();
     }
     std::remove(aof_file.c_str());
+
+    // Reading the two clocks a moment apart, and to the millisecond, moves the
+    // offset by a ms or so; more than this is a step of the wall clock
+    constexpr int64_t kClockJitterMs = 10;
+    bool clock_stepped = highest_offset - lowest_offset > kClockJitterMs;
 
     std::map<std::string, KeyState> all = live;
     all.insert(replayed.begin(), replayed.end());
@@ -1176,18 +1389,31 @@ void checkReplayMatchesLive(unsigned seed, int ops) {
         bool same = l != live.end() && r != replayed.end() && l->second.record == r->second.record &&
                     (l->second.expiry == -1) == (r->second.expiry == -1) &&
                     std::llabs(l->second.expiry - r->second.expiry) <= 50;   // clock reads differ by a ms or so
-        if(!same) {
-            throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
-                                     describe(live, key) + ", replayed " + describe(replayed, key));
-        }
+        if(same) continue;
+        if(clock_stepped) return false;     // not a valid run: the caller runs it again
+        throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
+                                 describe(live, key) + ", replayed " + describe(replayed, key));
     }
+    return true;
 }
 
 TEST(test_aof_replay_matches_live_randomized) {
     // RANDOM_TEST_SEEDS=<n> runs more seeds than the default 4 (each ~0.2 s)
     unsigned seeds = 4;
     if(const char* n = std::getenv("RANDOM_TEST_SEEDS")) seeds = static_cast<unsigned>(std::atoi(n));
-    for(unsigned seed = 1; seed <= seeds; seed++) checkReplayMatchesLive(seed, 2500);
+    for(unsigned seed = 1; seed <= seeds; seed++) {
+        // A run that mismatched while the wall clock was stepped proves nothing
+        // either way; the same seed (the same commands) runs again. WSL2 steps
+        // the clock every 30 s and a run takes well under a second, so a rerun
+        // nearly always has a steady clock.
+        int attempts = 1;
+        while(!checkReplayMatchesLive(seed, 2500)) {
+            if(++attempts > 5) {
+                throw std::runtime_error("seed " + std::to_string(seed) +
+                                         ": the wall clock was stepped during 5 runs in a row");
+            }
+        }
+    }
 }
 
 TEST(test_aof_replay_uses_command_table) {
@@ -1347,6 +1573,22 @@ TEST(test_dispatch_replies) {
     ASSERT_EQ(executeCommand(ctx, {"BGREWRITEAOF"}).substr(0, 5), "-ERR ");   // AOF is off
 }
 
+TEST(test_dispatch_appends_replies) {
+    // The server passes a client's output buffer, which can still hold replies
+    // the socket hasn't taken: a reply must be appended, never replace them
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    std::string out = "+earlier reply\r\n";
+    executeCommand(ctx, {"SET", "k", std::string(100, 'v')}, out);
+    executeCommand(ctx, {"GET", "k"}, out);
+    executeCommand(ctx, {"GET", "missing"}, out);
+    executeCommand(ctx, {"LPUSH", "k", "x"}, out);       // wrong type
+    executeCommand(ctx, {"NOSUCH"}, out);
+    ASSERT_EQ(out, "+earlier reply\r\n+OK\r\n$100\r\n" + std::string(100, 'v') + "\r\n$-1\r\n"
+                   "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                   "-ERR unknown command 'NOSUCH'\r\n");
+}
+
 TEST(test_dispatch_quit_closes_connection) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
@@ -1458,6 +1700,63 @@ TEST(test_dispatch_write_flags) {
     }
 }
 
+// ==================== Pollers ====================
+
+#ifndef _WIN32
+// The same checks for every poller: the event loop relies on each behaving
+// alike, level-triggered (a ready socket is reported until it is drained)
+void checkPoller(Poller& poller) {
+    int fds[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    std::vector<Poller::Event> ready;
+    poller.add(fds[0]);
+    ASSERT_EQ(poller.wait(0, ready), 0);            // nothing to read; writing wasn't asked about
+
+    ASSERT_TRUE(write(fds[1], "x", 1) == 1);
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].fd == fds[0] && ready[0].readable && !ready[0].writable);
+    ASSERT_EQ(poller.wait(0, ready), 1);            // level-triggered: still there until read
+    char c;
+    ASSERT_TRUE(read(fds[0], &c, 1) == 1);
+    ASSERT_EQ(poller.wait(0, ready), 0);
+
+    poller.setInterest(fds[0], false, true);        // only "can it take more data?"
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].writable && !ready[0].readable);
+    poller.setInterest(fds[0], true, false);
+
+    close(fds[1]);                                  // the peer hangs up: end of stream
+    ASSERT_EQ(poller.wait(100, ready), 1);
+    ASSERT_TRUE(ready[0].readable);                 // the next recv() returns 0
+
+    poller.remove(fds[0]);
+    ASSERT_EQ(poller.wait(0, ready), 0);
+    close(fds[0]);
+}
+#endif
+
+TEST(test_poller_select) {
+#ifndef _WIN32
+    SelectPoller poller;
+    ASSERT_TRUE(poller.canWatch(FD_SETSIZE - 1) && !poller.canWatch(FD_SETSIZE));
+    checkPoller(poller);
+#endif
+}
+
+TEST(test_poller_epoll) {
+#ifdef __linux__
+    EpollPoller poller;
+    ASSERT_TRUE(poller.isOpen());
+    ASSERT_TRUE(poller.canWatch(FD_SETSIZE));       // any socket number
+    checkPoller(poller);
+    ASSERT_TRUE(makePoller("epoll") != nullptr);
+#else
+    ASSERT_TRUE(makePoller("epoll") == nullptr);    // only on Linux
+#endif
+    ASSERT_TRUE(makePoller("select") != nullptr);
+    ASSERT_TRUE(makePoller("kqueue") == nullptr);
+}
+
 // ==================== RESP Parser ====================
 
 using ParseStatus = RespParser::ParseStatus;
@@ -1499,6 +1798,35 @@ TEST(test_resp_parse_incomplete) {
     ASSERT_TRUE(parsed.status == ParseStatus::NeedMore);
     ASSERT_EQ(parsed.consumed, (size_t)0);
     ASSERT_TRUE(parsed.args.empty());
+}
+
+TEST(test_resp_parse_into_reuses_argument_strings) {
+    // The server parses every command into the same strings, so parsing
+    // allocates nothing once they are large enough. A 16-byte key is too long
+    // for the small-string buffer: the same heap buffer must be reused.
+    std::vector<std::string> args;
+    auto first = RespParser::parseInto(RespParser::array({"SET", "key:000000000001", "v"}), args);
+    ASSERT_TRUE(first.status == RespParser::ParseStatus::Ok);
+    ASSERT_EQ(first.argc, (size_t)3);
+    const char* key_buffer = args[1].data();
+    auto second = RespParser::parseInto(RespParser::array({"SET", "key:000000000002", "w"}), args);
+    ASSERT_EQ(second.argc, (size_t)3);
+    ASSERT_EQ(args[1], "key:000000000002");
+    ASSERT_EQ(args[2], "w");
+    ASSERT_TRUE(args[1].data() == key_buffer);          // no new allocation
+
+    // A shorter command: argc says how many are its own; the rest are kept
+    auto get = RespParser::parseInto(RespParser::array({"GET", "k"}), args);
+    ASSERT_EQ(get.argc, (size_t)2);
+    ASSERT_EQ(args[0], "GET");
+    ASSERT_EQ(args[1], "k");
+    ASSERT_EQ(args.size(), (size_t)3);
+
+    // Inline commands go into the same strings
+    auto inline_cmd = RespParser::parseInto("RPUSH list a b c\r\n", args);
+    ASSERT_EQ(inline_cmd.argc, (size_t)5);
+    ASSERT_EQ(args[4], "c");
+    ASSERT_EQ(inline_cmd.consumed, (size_t)18);
 }
 
 TEST(test_resp_parse_multiple_commands) {
@@ -1641,6 +1969,8 @@ int main() {
     RUN_TEST(test_exists_does_not_refresh_lru);
     RUN_TEST(test_lru_capacity_one);
     RUN_TEST(test_capacity_zero_is_rejected);
+    RUN_TEST(test_table_sized_for_capacity);
+    RUN_TEST(test_table_presize_is_capped);
 
     std::cout << "\n[TTL Expiration]\n";
     RUN_TEST(test_ttl_expiration);
@@ -1700,6 +2030,12 @@ int main() {
     RUN_TEST(test_aof_rewrite_failure_keeps_old_file);
     RUN_TEST(test_aof_failed_writes_wait_and_are_retried);
     RUN_TEST(test_aof_rewrite_replaces_failed_writes);
+    RUN_TEST(test_aof_deferred_writes_wait_for_flush);
+    RUN_TEST(test_aof_deferred_write_errors);
+    RUN_TEST(test_aof_rewrite_drops_buffered_records);
+    RUN_TEST(test_aof_fsync_always_syncs_each_write_or_group);
+    RUN_TEST(test_aof_fsync_everysec_syncs_in_the_background);
+    RUN_TEST(test_aof_fsync_always_write_error_is_fatal);
     RUN_TEST(test_aof_no_log_on_failed_ops);
     RUN_TEST(test_aof_rewrite_preserves_ttl);
     RUN_TEST(test_aof_logs_absolute_expiry_times);
@@ -1720,6 +2056,7 @@ int main() {
     RUN_TEST(test_dispatch_checks_arity);
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
+    RUN_TEST(test_dispatch_appends_replies);
     RUN_TEST(test_dispatch_quit_closes_connection);
     RUN_TEST(test_dispatch_set_options);
     RUN_TEST(test_dispatch_set_rejects_bad_options);
@@ -1727,10 +2064,15 @@ int main() {
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
 
+    std::cout << "\n[Pollers]\n";
+    RUN_TEST(test_poller_select);
+    RUN_TEST(test_poller_epoll);
+
     std::cout << "\n[RESP Parser]\n";
     RUN_TEST(test_resp_parse_array);
     RUN_TEST(test_resp_parse_inline);
     RUN_TEST(test_resp_parse_incomplete);
+    RUN_TEST(test_resp_parse_into_reuses_argument_strings);
     RUN_TEST(test_resp_parse_multiple_commands);
     RUN_TEST(test_resp_empty_array_is_skipped);
     RUN_TEST(test_resp_rejects_malformed_input);

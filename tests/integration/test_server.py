@@ -63,6 +63,12 @@ class ServerProcess:
             if fsize:
                 resource.setrlimit(resource.RLIMIT_FSIZE,
                                    (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
+        # ctest runs the suite once more with MINI_REDIS_POLLER=select, so the
+        # select() path stays tested now that Linux uses epoll by default. A
+        # test that names a poller itself keeps it.
+        poller = os.environ.get("MINI_REDIS_POLLER")
+        if poller and "--poller" not in args:
+            args = (*args, "--poller", poller)
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
@@ -365,10 +371,29 @@ class ClientLimitTest(ServerTestCase):
         self.allow_open_files(1100 + 64)
         # A common default limit: below it, socket 1024 can't even be created, so
         # the server must raise its own limit to be able to refuse anyone.
-        server = self.start_server("--appendonly", "no", nofile=1024)
+        server = self.start_server("--appendonly", "no", "--poller", "select", nofile=1024)
         accepted, refused = self.connect_and_sort(server, 1100)
         self.assertGreater(len(accepted), 1000)
         self.assertGreater(refused, 0)
+        self.assertStillServing(server, accepted)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "epoll is Linux only")
+    def test_epoll_serves_clients_beyond_select_limit(self):
+        # epoll watches any socket number: the clients select() had to refuse
+        # are served, and the server raises its open-file limit to make room
+        self.allow_open_files(1100 + 64)
+        server = self.start_server("--appendonly", "no", "--poller", "epoll", nofile=1024)
+        accepted, refused = self.connect_and_sort(server, 1100)
+        self.assertEqual(refused, 0)
+        self.assertEqual(len(accepted), 1100)
+        self.assertStillServing(server, accepted)
+
+    def test_maxclients_refuses_the_next_client(self):
+        # As Redis does at maxclients (10,000 by default)
+        server = self.start_server("--appendonly", "no", "--maxclients", "10")
+        accepted, refused = self.connect_and_sort(server, 12)
+        self.assertEqual(len(accepted), 10)
+        self.assertEqual(refused, 2)
         self.assertStillServing(server, accepted)
 
     @unittest.skipUnless(os.path.exists("/proc/self/stat"), "measures CPU time via /proc")
@@ -377,16 +402,23 @@ class ClientLimitTest(ServerTestCase):
         # before select()'s limit. accept() then fails with EMFILE and the
         # connection stays queued, so select() reported it again at once: the
         # server spun at 100% CPU and logged "accept() failed" thousands of
-        # times a second, and the waiting clients never got an answer.
-        server = self.start_server("--appendonly", "no", nofile=(64, 64))
-        accepted, refused = self.connect_and_sort(server, 100)
+        # times a second, and the waiting clients never got an answer. Both
+        # pollers report a queued connection until it is accepted.
+        pollers = ["select", "epoll"] if sys.platform.startswith("linux") else ["select"]
+        for poller in pollers:
+            with self.subTest(poller=poller):
+                server = self.start_server("--appendonly", "no", "--poller", poller, nofile=(64, 64))
+                accepted, refused = self.connect_and_sort(server, 100)
 
-        cpu = server.cpu_seconds()
-        time.sleep(1)
-        self.assertLess(server.cpu_seconds() - cpu, 0.2, "server busy while idle")
-        self.assertGreater(len(accepted), 40)
-        self.assertGreater(refused, 0)
-        self.assertStillServing(server, accepted)
+                cpu = server.cpu_seconds()
+                time.sleep(1)
+                self.assertLess(server.cpu_seconds() - cpu, 0.2, "server busy while idle")
+                self.assertGreater(len(accepted), 40)
+                self.assertGreater(refused, 0)
+                self.assertStillServing(server, accepted)
+                for s in accepted:
+                    s.close()
+                server.stop()
 
 
 @unittest.skipIf(os.name == "nt", "POSIX signals")
@@ -511,6 +543,64 @@ class AofDamageTest(ServerTestCase):
             self.assertIn(b"damaged at byte %d" % len(good), result.stderr)
 
 
+def pipeline(client, commands):
+    """Sends all `commands` at once, then reads one reply for each."""
+    client.sock.sendall(b"".join(Client.encode(cmd) for cmd in commands))
+    return [client.read_reply() for _ in commands]
+
+
+class AofGroupCommitTest(ServerTestCase):
+    """The server writes the AOF records of every command in one pass of its
+    event loop with one write(), before sending any of their replies. These
+    tests put many commands, from many clients, into the same passes."""
+
+    def test_pipelined_writes_from_many_clients_survive_a_restart(self):
+        # RPUSH is not idempotent: a record written twice, or lost, changes a
+        # list's length, so this catches duplicates as well as gaps
+        clients, per_client = 5, 400
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            connections = [Client(server.port) for _ in range(clients)]
+            try:
+                for i, c in enumerate(connections):     # send everything first...
+                    c.sock.sendall(b"".join(
+                        Client.encode(("SET", f"k{i}:{n}", f"v{n}")) + Client.encode(("RPUSH", f"list{i}", n))
+                        for n in range(per_client)))
+                for i, c in enumerate(connections):     # ...then read every reply
+                    for n in range(per_client):
+                        self.assertEqual(c.read_reply(), b"OK")
+                        self.assertEqual(c.read_reply(), n + 1)
+            finally:
+                for c in connections:
+                    c.close()
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in range(clients):
+                    self.assertEqual(c.call("LLEN", f"list{i}"), per_client)
+                    for n in (0, per_client // 2, per_client - 1):
+                        self.assertEqual(c.call("GET", f"k{i}:{n}"), f"v{n}".encode())
+            restarted.stop()
+
+    def test_bgrewriteaof_in_the_middle_of_a_pipeline(self):
+        # The rewrite's snapshot includes the first RPUSH, whose record is still
+        # buffered: it must not also be written after the new file, or replay
+        # would apply it twice. The second RPUSH comes after the snapshot and
+        # must be kept.
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                replies = pipeline(c, [("RPUSH", "l", "a"), ("BGREWRITEAOF",), ("RPUSH", "l", "b")])
+                self.assertEqual(replies, [1, b"OK", 2])
+            server.stop()
+
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                self.assertEqual(c.call("LRANGE", "l", 0, -1), [b"a", b"b"])
+            restarted.stop()
+
+
 @unittest.skipIf(resource is None or not hasattr(resource, "prlimit"), "needs Linux prlimit")
 class AofWriteErrorTest(ServerTestCase):
     """A full disk, played by a 4 KB limit on the size of the files the server
@@ -549,6 +639,34 @@ class AofWriteErrorTest(ServerTestCase):
                 self.assertEqual(c.call("GET", "after"), b"1")
             restarted.stop()
 
+    def test_appendfsync_always_stops_the_server_when_the_aof_fails(self):
+        # With "always", a reply means the write is on the disk. Once a write
+        # fails, that can't be promised any more: the server must not reply,
+        # and stops with exit code 1 (Redis exits too), instead of refusing
+        # writes with MISCONF as it does with "everysec" or "no".
+        value = b"v" * 100
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server("--appendfsync", "always", workdir=workdir, fsize=4096)
+            acknowledged = 0
+            with Client(server.port) as c:
+                with self.assertRaises((ConnectionError, OSError)):
+                    for i in range(100):    # about 30 fit in 4 KB
+                        self.assertEqual(c.call("SET", f"k{i}", value), b"OK")
+                        acknowledged += 1
+            self.assertGreater(acknowledged, 0)
+            self.assertLess(acknowledged, 100)
+            self.assertEqual(server.proc.wait(timeout=5), 1)
+            self.assertIn("with --appendfsync always a reply must mean the write is on disk",
+                          server.output())
+            server.stop()
+
+            # Every write that was acknowledged is on the disk
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                for i in range(acknowledged):
+                    self.assertEqual(c.call("GET", f"k{i}"), value, f"k{i} was acknowledged")
+            restarted.stop()
+
 
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
@@ -565,6 +683,8 @@ class CommandLineTest(ServerTestCase):
             ("--port", "0"), ("--port", "65536"), ("--port", "80abc"), ("--port", "-1"),
             ("--port",), ("--maxkeys", "0"), ("--maxkeys", "ten"),
             ("--appendonly", "maybe"), ("--appendfilename", ""), ("--bogus",),
+            ("--appendfsync", "sometimes"), ("--appendfsync",),
+            ("--poller", "kqueue"), ("--maxclients", "0"), ("--maxclients", "many"),
         ]
         for args in cases:
             with self.subTest(args=args):

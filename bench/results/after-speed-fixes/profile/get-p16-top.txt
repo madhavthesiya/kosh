@@ -1,0 +1,35 @@
+Mini-Redis GET P=16, AOF on: 50 clients, 100,000 keys
+Server CPU 66%, of which 30% in the kernel
+
+== Inclusive time (the call and everything under it)
+   20.22%  send()
+    0.09%  write(), the AOF
+    7.00%  recv()
+    3.33%  Waiting: select() or epoll_wait()
+    0.00%  All AOF logging (InMemoryStorage::logAOF)
+    7.21%  RESP parsing
+
+== Self time by binary or library
+  44.28%  mini_redis_server
+  30.63%  [kernel.kallsyms]
+  14.36%  libstdc++.so.6.0.33
+  10.72%  libc.so.6
+
+== Self time by function (at least 1%)
+  31.46%  mini_redis_server    [.] (…)::cmdGet(…)
+  10.79%  libstdc++.so.6.0.33  [.] std::__detail::_List_node_base::_M_transfer(…)
+   2.80%  mini_redis_server    [.] RespParser::readHeader(…)
+   1.82%  libc.so.6            [.] pthread_rwlock_unlock@@GLIBC_2.34
+   1.69%  [kernel.kallsyms]    [k] _raw_spin_unlock_irqrestore
+   1.57%  libc.so.6            [.] toupper
+   1.54%  libc.so.6            [.] __memcmp_avx2_movbe
+   1.48%  libc.so.6            [.] __memchr_avx2
+   1.45%  libc.so.6            [.] __memmove_avx_unaligned_erms
+   1.29%  mini_redis_server    [.] RespParser::parseRespInto(…)
+   1.23%  libstdc++.so.6.0.33  [.] std::string::_M_replace(…)
+   1.11%  mini_redis_server    [.] InMemoryStorage::touchLRU(…)
+   1.08%  libc.so.6            [.] pthread_rwlock_wrlock@@GLIBC_2.34
+   1.08%  mini_redis_server    [.] lookupCommand(…)
+   1.05%  libstdc++.so.6.0.33  [.] std::_Hash_bytes(…)
+   1.02%  [kernel.kallsyms]    [k] __nf_conntrack_find_get
+   1.02%  libstdc++.so.6.0.33  [.] std::string::_M_append(…)

@@ -62,12 +62,16 @@ endif()
 # Unit tests
 add_executable(tests
     tests/test_main.cpp
+    Poller.cpp
     Commands.cpp
     InMemoryStorage.cpp
     AOFLogger.cpp
     RedisLite.cpp
 )
 target_link_libraries(tests Threads::Threads)
+if(WIN32)
+    target_link_libraries(tests ws2_32)
+endif()
 
 # Thread safety stress test
 add_executable(test_threads
@@ -86,6 +90,23 @@ add_executable(memory_layout
 )
 target_link_libraries(memory_layout Threads::Threads)
 
+# Times every insert of a new key, to find the storage engine's worst case (see bench/README.md)
+add_executable(insert_latency
+    bench/insert_latency.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(insert_latency Threads::Threads)
+
+# Counts heap allocations per request, layer by layer (see bench/README.md)
+add_executable(alloc_count
+    bench/alloc_count.cpp
+    Commands.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(alloc_count Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
@@ -97,6 +118,14 @@ if(Python3_FOUND)
     add_test(NAME integration_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                      $<TARGET_FILE:mini_redis_server>)
+    # Linux serves with epoll by default; run everything with select() as well,
+    # so both pollers stay tested
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME integration_tests_select
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
+                         $<TARGET_FILE:mini_redis_server>)
+        set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "MINI_REDIS_POLLER=select")
+    endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")
 endif()

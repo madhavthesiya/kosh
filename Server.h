@@ -11,12 +11,23 @@
 
 class Server {
 public:
-    Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr);
+    // Clients served at once, as Redis's maxclients default
+    static constexpr size_t kDefaultMaxClients = 10000;
+
+    // `poller`: how to wait for sockets; the system's best (epoll on Linux,
+    // select() elsewhere) if none is given. Beyond `max_clients` clients, or
+    // what the poller can watch, a new client gets "-ERR max number of clients
+    // reached" and is disconnected.
+    Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr,
+           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
     ~Server();
 
     bool start();       // Create socket, bind, listen
     void run();         // Event loop — handles multiple clients concurrently
     void stop();
+
+    // 0, or 1 if the server stopped because the AOF failed for good (see flushAof())
+    int exitCode() const { return exit_code_; }
 
 private:
     // One connected client. Received bytes wait in `in` until they form whole
@@ -30,6 +41,7 @@ private:
         bool close_after_reply = false;  // QUIT or a protocol error: close once `out` is sent
         bool want_read = true;           // what the poller is currently asked to report
         bool want_write = false;
+        bool queued = false;             // in to_serve_ for this pass of the loop
     };
 
     enum class SendStatus { Done, Blocked, Failed };
@@ -37,8 +49,11 @@ private:
     // I/O multiplexing handlers
     void acceptNewClients();                         // New connections on listen socket
     void handleReadable(socket_t fd);                // Data or end of stream on a client socket
+    void queueToServe(socket_t fd, Client& client);  // Serve it once this pass has written the AOF
+    bool flushAof();                                 // Before replies go out; false: stop
     void serveClient(socket_t fd);                   // Send replies, run commands, until blocked
     void runCommands(Client& client);                // Execute whole commands from in into out
+    void releaseLargeArgs(size_t argc);              // Bound the memory args_ keeps
     SendStatus sendReplies(socket_t fd, Client& client);
     void updateInterest(socket_t fd, Client& client);
     void removeClient(socket_t fd);                  // Cleanup on disconnect
@@ -64,15 +79,22 @@ private:
     // slowed down by TCP flow control instead of being cut off.
     static constexpr size_t kOutputHighWater = size_t(1) << 20;
 
+    // The parsed arguments keep their memory between commands, up to this much
+    // per argument and this many arguments; more is given back after use
+    static constexpr size_t kKeepArgBytes = 64 * 1024;
+    static constexpr size_t kKeepArgs = 1024;
+
     int port_;
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
     bool running_ = false;
+    int exit_code_ = 0;
 
-    AOFLogger* aof_ = nullptr;  // optional — for BGREWRITEAOF
+    AOFLogger* aof_ = nullptr;  // optional: flushed before replies are sent, and for BGREWRITEAOF
 
     // Tells the event loop which sockets are ready
-    std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();
+    std::unique_ptr<Poller> poller_;
+    size_t max_clients_;
 
     // A spare file descriptor (POSIX), given up for a moment when the process
     // runs out, so a waiting connection can still be accepted and refused
@@ -80,4 +102,13 @@ private:
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
+
+    // Clients with replies to send in this pass of the loop, in order. They are
+    // served after the pass's AOF records are written (group commit).
+    std::vector<socket_t> to_serve_;
+
+    // Every command is parsed into these strings, which keep their memory, so
+    // parsing allocates nothing once they are large enough. One set serves all
+    // clients: commands run one at a time, and none keeps its arguments.
+    std::vector<std::string> args_;
 };

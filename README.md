@@ -1,6 +1,6 @@
 # Mini-Redis — Redis-Compatible In-Memory Key-Value Server in C++17
 
-A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and a **reader–writer-locked storage engine**.
+A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
@@ -8,29 +8,38 @@ This is a learning project, not production software. What it does not handle yet
 
 ## Performance
 
-Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability: both write their AOF to the OS without `fsync`. 100,000 random keys, 50 clients, middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the correctness fixes](bench/results/after-correctness-fixes/README.md). Earlier stages: [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
+Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability (both with `appendfsync no`). 100,000 random keys, 50 clients, middle of 3 runs, the server measured first alternating from run to run. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the speed fixes](bench/results/after-speed-fixes/README.md). Earlier stages: [after the correctness fixes](bench/results/after-correctness-fixes/README.md), [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
 
-| Test | Mini-Redis | Redis | Mini-Redis / Redis | After network fixes | At v0-baseline |
+| Test | Mini-Redis | Redis | Mini-Redis / Redis | CPU per request vs Redis | At v0-baseline |
 |---|---:|---:|---:|---:|---:|
-| SET, no pipelining, AOF on | 28,395 req/s | 30,734 req/s | 0.92× | 0.97× | 0.97× |
-| GET, no pipelining, AOF on | 31,097 req/s | 30,500 req/s | 1.02× | 1.08× | 0.97× |
-| SET, pipeline 16, AOF on | 191,666 req/s | 228,990 req/s | 0.84× | 0.81× | 0.43× |
-| GET, pipeline 16, AOF on | 277,577 req/s | 293,686 req/s | 0.95× | 0.96× | 0.56× |
-| SET, pipeline 16, AOF off | 276,855 req/s | 277,393 req/s | 1.00× | 1.00× | 0.50× |
-| Startup, replaying a 1,000,000-command AOF (45 MB) | 0.72 s | 0.65 s | 1.12× | not re-measured | over 750× |
+| SET, pipeline 16, AOF on | 232,148 req/s | 192,485 req/s | **1.21×** | **0.73×** | 0.43× |
+| GET, pipeline 16, AOF on | 277,316 req/s | 252,653 req/s | 1.10× | 0.90× | 0.56× |
+| SET, pipeline 16, AOF off | 262,743 req/s | 262,688 req/s | 1.00× | 0.99× | 0.50× |
+| GET, pipeline 16, AOF off | 247,011 req/s | 261,083 req/s | 0.95× | 1.00× | 0.48× |
+| SET, no pipelining, AOF on | 22,701 req/s | 21,044 req/s | 1.08× | | 0.97× |
+| GET, no pipelining, AOF on | 23,833 req/s | 24,217 req/s | 0.98× | | 0.97× |
+| Startup, replaying a 1,000,000-command AOF (45 MB) | 0.68 s | 0.64 s | 1.07× | | over 750× |
 
 What the measurements show:
-- **AOF replay is now linear, and close to Redis.** It used to erase each command from the front of a buffer holding the rest of the file, moving the remaining bytes once per command. 400,000 commands took 2 min 54 s and 1,000,000 over 15 minutes; they now take 0.30 s and 0.72 s.
-- **The correctness fixes cost no measurable throughput.** Against Redis, the ratios are the same as after the network fixes (0.84× vs 0.81× for pipelined `SET` with AOF on, 0.95× vs 0.96× for `GET`).
-- **The event-loop rewrite made pipelined throughput 1.45–1.71× faster** (before and after measured in one session). Nearly all of it came from sending the replies to a whole batch of commands with one `send()`, where there used to be one call per command.
-- **Pipelined, Mini-Redis reaches about the same throughput as Redis, but uses more CPU for it:** 1.03–1.14× Redis's CPU per request, and 1.30× for `SET` with AOF on.
-- **The largest remaining costs were visible in the last profile (after the network fixes).**
-  - AOF logging took 43% of pipelined `SET`, because it makes one `write()` per command where Redis writes once per event-loop pass.
-  - Hash lookups took 15–27%, because each command looks its key up two or three times.
+- **With AOF on, Mini-Redis serves pipelined `SET`s faster than Redis, on less CPU:**
+  - 1.21× the throughput, and 0.73–0.82× the CPU per request, in two sessions;
+  - faster in every one of 6 runs, including the runs where Redis was measured first.
+  - The change behind it is **group commit**: the AOF records of every command in a pass of the event loop now go out in one `write()`, before any of their replies. 100,000 pipelined `SET`s made 132 `write()` calls where they made 100,002, and SET got 1.42–1.71× faster in every round of a commit-by-commit comparison.
+- **Everything else ties with Redis:** pipelined `GET`, and both without AOF (0.90–1.02× the CPU per request). At v0 Mini-Redis was at 0.43–0.56×.
+- **p99 is lower than Redis's in all four pipelined tests,** in both sessions: for `SET` with AOF on, 6.0 ms against 7.0. A table that grew all at once used to freeze every client for about 20 ms at 85,000 keys (Challenge 13), so the worst `SET` took 23–77 ms; with the table sized at startup the slowest insert takes 28–112 µs.
+- **No request allocates memory:**
+  - commands are parsed into reused strings;
+  - replies are built straight into the client's buffer, AOF records straight into the log's.
+  - [`bench/alloc_count`](bench/alloc_count.cpp) counts 0 allocations per `GET` or `SET`, where Phase 3's code made 5 and 11.
+- **What is left is memory latency.** Both are cache misses on separately allocated nodes, and the next things to change:
+  - the hash table's bucket walk: 24% of pipelined `SET`'s CPU, and most of the 31% `GET` spends in `cmdGet`, where it is inlined;
+  - the LRU list relink: 9–11%.
+- **With 1,000 idle clients, `epoll` uses 9–14× less CPU per busy request than `select()`**, which rebuilds and scans every socket on each wakeup.
+- **With `--appendfsync always`, both servers wait for the disk and tie**: each syncs once per pass of its event loop, about 390 `SET`s per `fdatasync()` at pipeline 16.
 - **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip sets the pace for both.
-- **316 bytes of heap per key** for a 16-byte key and a 3-byte value.
+- **312 bytes of heap per key** for a 16-byte key and a 3-byte value.
 
-Raw numbers vary between sessions on this machine (WSL2 on a hybrid CPU) by more than most code changes, so comparisons are made within one session and reported with their spread.
+Raw numbers vary between sessions on this machine (WSL2 on a hybrid CPU) by more than most code changes, so comparisons are made within one session, with the order of measurements alternating, and reported with their spread. The full results also say which differences were too small to resolve.
 
 > **Why does pipelining help so much?** Without pipelining, every command waits a full network round trip. With P=16 the client sends 16 commands at once, the server reads them with a single `recv()` and sends all 16 replies with a single `send()`, and the round trip is shared by 16 commands.
 
@@ -46,7 +55,7 @@ flowchart TD
     Client2["redis-cli / Client 2"]
     Client3["redis-cli / Client N"]
 
-    Server["TCP Server\n<i>select() event loop</i>\nI/O multiplexing · RESP protocol"]
+    Server["TCP Server\n<i>epoll event loop</i>\nI/O multiplexing · RESP protocol"]
     Storage["InMemoryStorage\n<i>std::variant · shared_mutex</i>\nLRU · TTL · Type dispatch"]
     AOF["AOFLogger\n<i>Binary RESP format</i>\nAppend-only file"]
 
@@ -64,14 +73,14 @@ flowchart TD
     style AOF fill:#a855f7,color:#fff,stroke:none
 ```
 
-**Single-threaded event loop:** one thread waits on all sockets with `select()` and runs each command to completion, so commands never race each other. Sockets are non-blocking, so the thread never waits on any one client. Redis's main thread uses the same model, but with `epoll`/`kqueue` instead of `select()`.
+**Single-threaded event loop:** one thread waits on all sockets, with `epoll` on Linux (`select()` elsewhere), and runs each command to completion, so commands never race each other. Sockets are non-blocking, so the thread never waits on any one client. Redis's main thread uses the same model.
 
 ### Layered Design
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
 | **Network** | `Server.h/.cpp` | Accepting clients, the event loop, per-client buffers |
-| **Readiness** | `Poller.h/.cpp` | Which sockets are ready (`select()` today, behind an interface `epoll` can implement) |
+| **Readiness** | `Poller.h/.cpp` | Which sockets are ready: `epoll` on Linux, `select()` elsewhere, behind one interface |
 | **Portability** | `Socket.h` | Winsock vs BSD sockets: types, non-blocking mode, error codes |
 | **Protocol** | `RespParser.h` | RESP parsing (binary-safe, with limits) + inline command support |
 | **Commands** | `Commands.h/.cpp` | One table of commands (name, number of arguments, write flag, handler), used by both the server and AOF replay |
@@ -140,8 +149,13 @@ After:  wait until some sockets are ready → handle those, never waiting on any
 - **One thread** serves every client, with no thread per connection.
 - **Non-blocking sockets:** `recv()`, `send()` and `accept()` return at once. Each client has an input buffer (bytes until they form whole commands) and an output buffer (replies until its socket takes them). A partial `send()` is normal; the rest goes when the socket is writable again.
 - **Backpressure:** a client's next commands run only once its earlier replies are sent, and a batch stops at 1 MB of waiting replies. Meanwhile the server stops reading from that client, so TCP flow control slows it down. A client that never reads its replies can't stall anyone else or make the server's memory grow without limit.
-- **`Poller` interface:** sockets are registered once, with what to watch for: always readability, and writability only while replies are waiting. `SelectPoller` implements it with `select()`; an `epoll` version is planned.
-- **Cost of `select()`:** each call scans every socket (O(N)), and on Linux it can only watch sockets numbered below 1024. A client beyond that gets `-ERR max number of clients reached` and is disconnected. The server raises its open-file limit at startup so it can reply at all, and keeps a spare file descriptor to refuse clients properly if it runs out (`EMFILE`).
+- **`Poller` interface:** sockets are registered once, with what to watch for: always readability, and writability only while replies are waiting.
+  - `EpollPoller` (Linux, the default): the kernel keeps the watched set, so a wait costs O(ready sockets).
+  - `SelectPoller` (everywhere): each wait scans every watched socket, and on Linux it can only watch sockets numbered below 1024.
+  - Both are level-triggered, so the event loop is the same for both; `--poller` chooses.
+- **Group commit:** a pass of the loop reads from every ready client and runs its commands. Then one `write()` hands the OS the AOF records of all of them, and only then are the replies sent (as Redis does in `beforeSleep()`).
+- **Client limit:** `--maxclients` (10,000 by default, as in Redis). A client beyond it, or beyond what `select()` can watch, gets `-ERR max number of clients reached` and is disconnected. The server raises its open-file limit at startup to fit them, and keeps a spare file descriptor to refuse clients properly if it runs out anyway (`EMFILE`).
+- **No allocation per request:** commands are parsed into argument strings that are reused, replies are built straight into the client's buffer, and AOF records straight into the log's buffer. Once those have grown, a request allocates nothing (counted by [`bench/alloc_count`](bench/alloc_count.cpp)).
 - **Clean shutdown:** Ctrl+C or `SIGTERM` sets an atomic flag, the loop stops, connections and the AOF are closed, and the process exits with code 0.
 - **SIGPIPE ignored (Linux/macOS):** a client that disconnects early can't kill the server. Writes to it fail with `EPIPE` instead (see Challenge 7).
 
@@ -157,15 +171,16 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 
 | Feature | Details |
 |---------|---------|
-| Durability | Each write command's record is handed to the OS with `write()` before its reply is sent. It survives a crash of the process, but without `fsync` a power cut or OS crash can lose recent writes. |
+| Durability | Every write command's record reaches the OS before its reply is sent, so it survives a crash of the process. When it reaches the disk, which is what survives a power cut, is set by `--appendfsync`, as in Redis: `always` (synced before the reply), `everysec` (by a background thread once a second; the default) or `no` (when the OS decides). |
+| Group commit | The records of every command in one pass of the event loop go out in one `write()`, and with `always` one `fdatasync()`. Measured with `strace`: 100,000 pipelined `SET`s took 132 `write()` calls, where they took 100,002; with `always`, one sync covers about 390 `SET`s at pipeline 16 and 25 without pipelining. |
 | Binary safety | RESP format — spaces, newlines, any byte in values |
 | Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
 | Removals | Every key the server removes on its own, by LRU eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The LRU order isn't rebuilt: reads aren't logged. |
 | Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
 | Damaged file | An incomplete last record, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
-| Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis. |
+| Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis; a failed `everysec` sync does the same. With `always`, a failed write or sync can no longer be made good, so the server sends none of the waiting replies and stops with exit code 1, as Redis does. |
 | Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
-| Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file |
+| Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file; `--appendfsync` the sync policy |
 
 ### 4. O(1) LRU Eviction
 
@@ -196,6 +211,8 @@ graph LR
 - HashMap for O(1) lookup + doubly-linked list for O(1) reordering
 - Iterator stored in each entry — no linear scan to find position
 - Capacity is set with `--maxkeys` (default 10,000)
+- **The hash table is sized for the capacity at startup,** so it never rehashes while serving. `std::unordered_map` rehashes all at once, moving every key: the insert of the 85,230th key took about 20 ms, during which every client waited (Challenge 13). The bucket array costs 8 bytes per key of capacity, up front; it is capped at 4,194,304 keys (35 MB), beyond which the table grows by rehashing as before.
+- **A read relinks the key's LRU node** with `std::list::splice`: no allocation and no second hash lookup.
 - **Expired keys go before live ones.** Keys with a TTL are also kept in an index ordered by expiry time (a `std::set` of expiry time and a pointer to the key in the hash map). When a new key needs room, expired keys are removed from the front of the index first, and a live key is evicted only when none is left. Only as many are removed as are needed, so one insert never sweeps a large backlog.
 - The pointers stay valid because `std::unordered_map` keeps references to its elements valid until they are erased, even when it rehashes.
 
@@ -336,6 +353,8 @@ Testing exposed two more problems:
 
 **How it was found:** a test opens 1,100 connections against a server started with a 1024-file limit. Another limits the server to 64 files and checks that it stays idle (under 0.2 s of CPU in a second) while refusing the excess.
 
+**Later:** on Linux the server now uses `epoll`, which has no such limit, and refuses clients only beyond `--maxclients` (10,000 by default, as in Redis). The `select()` path is still tested, with `--poller select`.
+
 ### Challenge 11: A Restart Didn't Bring Back the Same Data
 
 **Problem:** The AOF is only correct if replaying it rebuilds exactly the data the server held. Two things broke that:
@@ -376,6 +395,37 @@ A crash at any point leaves either the old file or the new one, whole. `strace` 
 - Now the bytes not written wait in memory, in order, and write commands get `-MISCONF` until the file takes them. Each refused write first retries, so writes resume as soon as there is room. Reads keep working.
 - The server ignores `SIGXFSZ`, so it gets the error instead of being killed.
 - The integration test raises the server's file size limit while it runs (`prlimit`). It then checks that writes resume, and that after a restart every acknowledged key is there.
+
+### Challenge 13: A 20 ms Freeze Every Time the Table Grew
+
+**Problem:** In every benchmark run, Mini-Redis's maximum `SET` latency (23–77 ms) was above its maximum `GET` latency (14–22 ms); Redis's `SET`s mostly stayed at 13–17 ms. One max from one run is a noisy sample, so the storage engine was measured directly instead: [`bench/insert_latency`](bench/insert_latency.cpp) times every insert of 100,000 new keys, with no network.
+
+**Cause:** `std::unordered_map` grows all at once. The insert that crosses its load factor allocates a bucket array twice the size and moves every key into it. In 5 out of 5 repeats, the slowest inserts were exactly those:
+
+| Insert of key | Rehash (buckets) | That one insert |
+|---:|---|---:|
+| 85,230 | 85,229 → 172,933 | 19.3–21.8 ms |
+| 42,044 | 42,043 → 85,229 | 6.8–12.1 ms |
+| any other | | p50 about 1 µs |
+
+The server is single-threaded, so such a `SET` makes every client wait: about 800 requests at 50 clients pipelining 16. Only new keys trigger it, which is why only `SET`s showed it.
+
+**Solution:** The table is sized for `--maxkeys` at startup (`reserve()`), as low-latency systems preallocate, so it never rehashes while serving: the slowest insert dropped to 0.15–0.33 ms. Redis instead rehashes incrementally, a few buckets per operation, which needs a hash table of its own. The cost is 8 bytes of buckets per key of capacity, allocated up front, capped at 4,194,304 keys (35 MB), so a huge `--maxkeys` meant as "unlimited" doesn't allocate gigabytes.
+
+### Challenge 14: A Test That Failed Once in Eight Runs
+
+**Problem:** The randomized replay test (Challenge 11) failed once in a 300-seed run under AddressSanitizer, then passed six identical runs, 1,800 seeds. A test that fails once is either a real bug or a test that can't be trusted, and both need finding.
+
+**How it was found:**
+- A sampler ran alongside the repeats, recording the offset between the wall clock and the monotonic clock every 100 ms.
+- **WSL2 steps the wall clock every 30 seconds** to follow Windows: 21 steps in 11 minutes, from −341 ms to +60 ms.
+- The AOF stores wall-clock expiry times and memory keeps monotonic ones, so a step between a command and the replay legitimately changes the result: a key that expired live can come back with time left. That is the documented trade-off of absolute expiry, not a bug.
+
+**Solution:** The test measures the clock offset after every command. A mismatch counts as a failure only if the wall clock held steady; if it was stepped, the same seed runs again.
+
+**Proof**, with an `LD_PRELOAD` shim that steps `CLOCK_REALTIME` and leaves `CLOCK_MONOTONIC` alone:
+- the old test fails exactly as on WSL, and the new one passes;
+- with the bug the test exists for put back (expired keys not logged), the new test still fails, on a steady clock and on a stepping one.
 
 ---
 
@@ -460,13 +510,13 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**85 unit tests** (`tests/test_main.cpp`):
+**97 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Mini-Redis Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
-[LRU Eviction]          5 tests    ✅
+[LRU Eviction]          7 tests    ✅  (includes: the table never rehashes up to its capacity)
 [TTL Expiration]        5 tests    ✅
 [TTL > LRU Priority]    2 tests    ✅
 [Persistence]           4 tests    ✅  (the CLI's SAVE/LOAD)
@@ -476,31 +526,34 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Hash Operations]       5 tests    ✅
 [Type Safety]           4 tests    ✅
 [LRU with Mixed Types]  1 test     ✅
-[AOF Persistence]      20 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes)
-[Command Table]        10 tests    ✅  (arity, SET options, strict integers, error replies)
-[RESP Parser]          10 tests    ✅  (malformed input, size limits, every split point)
+[AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
+[Command Table]        11 tests    ✅  (arity, SET options, strict integers, error replies, replies appended in place)
+[Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
+[RESP Parser]          11 tests    ✅  (malformed input, size limits, every split point, reused argument strings)
 
-Results: 85 passed, 0 failed
+Results: 97 passed, 0 failed
 ```
 
-The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more.
+The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
 
 **Thread-safety stress tests** (`tests/test_thread_safety.cpp`):
 - 5 tests, each running 8 threads at once against one storage instance (20,000 operations in total).
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 29 tests that start the real server binary on a free port and speak RESP over TCP.
+- 34 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags, and AOF replay after a restart;
-  - a damaged AOF at startup, and failed AOF writes under a file size limit (Challenge 12);
+  - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
+  - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
   - a client that never reads its replies (Challenge 8);
-  - 1,100 connections, and running out of file descriptors (Challenge 10);
+  - 1,100 connections: refused beyond `select()`'s limit, served with `epoll`; `--maxclients`; running out of file descriptors (Challenge 10);
   - shutdown on `SIGINT`/`SIGTERM`;
   - the client-disconnect regression (Challenge 7).
+- `ctest` runs them twice: with the default poller, and with `--poller select`, so the path `epoll` replaced as the default stays tested.
 
-All three suites run under `ctest` and pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety tests also pass under ThreadSanitizer. The Windows build is compile-checked with MinGW-w64 (GCC 13) but not run.
+All four `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13) but not run.
 
 ---
 
@@ -511,7 +564,7 @@ mini-redis/
 ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 ├── main.cpp                  # CLI entry point (interactive mode)
 ├── Server.h / .cpp           # TCP server — event loop, per-client buffers, RESP I/O
-├── Poller.h / .cpp           # Readiness interface + select() implementation
+├── Poller.h / .cpp           # Readiness interface: epoll (Linux) and select()
 ├── Socket.h                  # Winsock / BSD socket differences (header-only)
 ├── RespParser.h              # RESP protocol parser + serializer (header-only)
 ├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
@@ -522,11 +575,12 @@ mini-redis/
 ├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
-├── bench/                    # Measurement scripts (throughput, replay, profile, memory)
+├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
+│                             #   memory, allocations per request, insert latency, idle clients
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 85 unit tests
+    ├── test_main.cpp              # 97 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     └── integration/
         └── test_server.py         # Integration tests against the real server binary
@@ -560,7 +614,7 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 redis-cli -p 6379
 ```
 
-Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections and the AOF and exits with code 0.
+Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, writes what is left of the AOF (and syncs it, unless `--appendfsync no`), and exits with code 0. With `--appendfsync always`, an AOF that can't be written or synced stops it with exit code 1.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
@@ -568,6 +622,9 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections and th
 | `--maxkeys <n>` | 10000 | Keys to hold before LRU eviction |
 | `--appendonly <yes\|no>` | yes | Log writes to the AOF and replay it at startup |
 | `--appendfilename <path>` | appendonly.aof | AOF file; the server refuses to start if it can't be opened |
+| `--appendfsync <always\|everysec\|no>` | everysec | When the AOF reaches the disk: before every reply, once a second, or when the OS decides |
+| `--maxclients <n>` | 10000 | Clients served at once; more get an error and are disconnected |
+| `--poller <epoll\|select>` | epoll on Linux, else select | How the event loop waits for sockets (`select()` serves about 1,000 clients) |
 
 ### Benchmark
 
@@ -617,11 +674,11 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 # Linux / macOS
 g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis_server
 g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis
-g++ -std=c++17 -O2 -pthread tests/test_main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
+g++ -std=c++17 -O2 -pthread tests/test_main.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
 g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_thread_tests
 ```
 
-On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
+On Windows (MinGW), add `-lws2_32` to the server and unit-test commands for Winsock.
 
 ---
 
@@ -629,11 +686,13 @@ On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
 
 | Decision | Why |
 |----------|-----|
-| **`select()` over `epoll`/IOCP** | Portable across Windows, Linux and macOS, and behind a `Poller` interface so `epoll` can be added without touching the event loop. **Cost:** every call scans all sockets (O(N)), and about 1,020 clients at most: on Linux `select()` can't watch socket numbers ≥ 1024, and on Windows the set holds 1024 sockets (this code raises Winsock's default of 64). Clients beyond that are refused. |
+| **`epoll` on Linux, `select()` elsewhere** | Behind one `Poller` interface, so the event loop is the same for both. `epoll` keeps the watched set in the kernel and returns only ready sockets. `select()` is portable to Windows and macOS. **Cost of `select()`:** every call scans all sockets (O(N)), and about 1,020 clients at most: on Linux it can't watch socket numbers ≥ 1024, and on Windows the set holds 1024 sockets (this code raises Winsock's default of 64). There is no `kqueue` (macOS) or IOCP (Windows) version. |
+| **Level-triggered `epoll`** | A ready socket is reported until it is drained, as with `select()`, so the loop can stop reading a client whose replies are waiting and pick it up later. Edge-triggered `epoll` saves wakeups, but every socket would have to be drained completely each time it is reported, or it would never be reported again. Redis uses level-triggered too. |
 | **Pause a slow reader instead of disconnecting it** | When a client's replies pile up, the server stops reading from it until they are sent, so TCP slows that client down. Memory per client stays bounded without a limit at which clients are cut off. **Cost:** a client that never reads keeps its connection, and the replies already produced (a batch stops once 1 MB is waiting, after the reply that crossed it), until it closes. |
 | **Single-threaded server** | Same model as Redis's main thread: commands run one at a time, so they can't race each other. **Cost:** one slow operation delays every client. |
 | **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
-| **`write()` without `fsync()`** | Each record is handed to the OS with `write()`. `fsync()` would wait until it is on disk, which is much slower. **Cost:** a power cut or OS crash can lose writes the OS hasn't written out yet; Linux typically writes them within about 30 seconds. |
+| **`everysec` by default, as in Redis** | A background thread syncs the AOF once a second, so a power cut loses at most about a second of writes, without any client waiting for the disk. `always` waits for the disk before every reply, which group commit makes affordable: one `fdatasync()` per pass of the loop, not per command. It syncs a `dup()` of the file descriptor without holding the logger's lock, so the event loop never waits for a slow disk. **Cost:** with `everysec`, up to a second of acknowledged writes can be lost. |
+| **Group commit** | One `write()` (and with `always`, one sync) per pass of the event loop, not per command, with replies sent only after it. A reply still means the same as with one `write()` per command. **Cost:** a reply waits for the other clients' commands of the same pass to run. |
 | **Monotonic clock in memory, Unix time in the AOF** | `steady_clock` can't jump when the system clock is changed, so a TTL lasts as long as it says. But it starts again from an arbitrary point when the machine reboots, so the file needs wall-clock time. **Cost:** expiry is converted between the two clocks at the AOF, and a change of the system clock moves the expiry of every key loaded at the next start (Redis has the same property). |
 | **Refuse writes while the AOF can't be written** | Same as Redis's `MISCONF`. Acknowledging writes that can't be saved would lose them silently at the next restart; exiting would take reads down too. **Cost:** a full disk makes the server read-only until there is room. |
 | **Reject unsupported `SET` options** | `NX`, `XX`, `GET` and `KEEPTTL` return a syntax error. Ignoring `NX` would let `SET lock me NX` take a lock that someone else holds. |
@@ -653,7 +712,6 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 
 | Limitation | Planned fix |
 |---|---|
-| `select()` serves about 1,020 clients at most (see Design Trade-offs); more are refused, and each call scans every socket. | An `epoll` `Poller` on Linux |
 | A command that arrives over many reads is parsed again from its start after each read. Nothing is copied, but a command with very many arguments costs O(n²) to scan. Redis keeps the parser's state between reads instead. | Parser that resumes where it stopped |
 | After a protocol error, the server closes the connection at once. If the client is still sending, unread data makes the kernel answer with RST, which can discard the error reply before the client reads it (Redis behaves the same way). | Read and discard the rest before closing (a lingering close) |
 
@@ -661,8 +719,8 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 
 | Limitation | Planned fix |
 |---|---|
-| No `fsync`: a power cut or OS crash can lose writes the OS hasn't written to disk yet. | Configurable policy: `always` / `everysec` / `no` |
-| The write command that first hits a failed AOF write has already changed the data, so it gets its normal reply, but its record only waits in memory. If the server stops before the disk has room, that write is lost. Redis does the same unless `appendfsync always`. | With the `always` policy, stop the server instead, as Redis does |
+| With `everysec` or `no`, the write command that first hits a failed AOF write has already changed the data, so it gets its normal reply, but its record only waits in memory. If the server stops before the disk has room, that write is lost. Redis does the same; use `--appendfsync always` to make the server stop instead. | None: it is the trade-off those policies make |
+| With `everysec`, the event loop's `write()` of the AOF can wait behind a slow background sync of the same file, and a sync longer than a second widens what a power cut can lose. Redis holds back its own AOF write (for up to 2 s) while a sync is still running, for the first reason. Not measured here. | Measure on a slow disk, then hold back the write as Redis does |
 | `BGREWRITEAOF` runs in the foreground: every client waits while the whole data set is written. | A background rewrite in a `fork()`ed child |
 | A record whose length field is damaged into a larger number looks like an incomplete last record. Startup then cuts it off with everything after it, with a warning giving the number of bytes. Nothing in the file tells the two apart; Redis has the same ambiguity. | None yet; a checksum per record would tell them apart |
 | Replay reads the whole AOF into memory before running it, so startup briefly needs memory for the file as well as the data. | Read it in fixed-size chunks |
@@ -673,6 +731,7 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
+| The hash table is sized at startup for at most 4,194,304 keys. With a larger `--maxkeys`, it grows past that by rehashing all at once, which stalls every client for longer the bigger the table (20 ms at 85,000 keys, Challenge 13). | Incremental rehashing, as Redis does, with the storage rework (one key copy, intrusive LRU links) |
 
 **Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), `AUTH`.
 

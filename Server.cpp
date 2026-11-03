@@ -49,19 +49,29 @@ void raiseOpenFileLimit(rlim_t wanted) {
     limit.rlim_cur = std::min(wanted, limit.rlim_max);
     setrlimit(RLIMIT_NOFILE, &limit);
     if(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < wanted) {
-        std::cerr << "Warning: open file limit is " << limit.rlim_cur
-                  << ", so fewer clients than select() allows can connect\n";
+        std::cerr << "Warning: the open file limit is " << limit.rlim_cur << ", so about "
+                  << (limit.rlim_cur > 32 ? limit.rlim_cur - 32 : 0)
+                  << " clients can connect at once\n";
     }
 }
 #endif
 
 }  // namespace
 
-Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
-    : port_(port), storage_(storage), aof_(aof) {}
+// The server batches AOF writes (group commit, see run()): the logger only
+// buffers records, and the server writes them before sending any reply.
+Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
+               std::unique_ptr<Poller> poller, size_t max_clients)
+    : port_(port), storage_(storage), aof_(aof), poller_(std::move(poller)),
+      max_clients_(max_clients) {
+    if(!poller_) poller_ = makePoller(defaultPollerName());
+    if(!poller_) poller_ = makePoller("select");    // epoll_create1() failed: select() always works
+    if(aof_) aof_->setDeferred(true);
+}
 
 Server::~Server() {
     stop();
+    if(aof_) aof_->setDeferred(false);      // writes whatever is still buffered
 }
 
 // ==================== Lifecycle ====================
@@ -96,12 +106,12 @@ bool Server::start() {
     // EFBIG instead, and the AOF reports it like any other write error.
     std::signal(SIGXFSZ, SIG_IGN);
 
-    // select() watches sockets numbered below FD_SETSIZE. A client beyond that
-    // gets socket FD_SETSIZE or higher and is refused with an error reply; the
-    // server must be allowed to open that socket to reply at all. With a lower
-    // limit, accept() would fail with EMFILE instead. (Redis also raises its
-    // limit at startup.)
-    raiseOpenFileLimit(FD_SETSIZE + 32);
+    // Room for every client the server will serve, plus a few files of its own
+    // and the socket of one client too many, which must be opened to be refused
+    // with an error reply (with a lower limit, accept() would fail with EMFILE
+    // instead). That is max_clients_, or with select() its FD_SETSIZE. Redis
+    // raises its limit to maxclients + 32 at startup the same way.
+    raiseOpenFileLimit(static_cast<rlim_t>(std::min(max_clients_, poller_->capacity())) + 32);
     reserve_fd_ = open("/dev/null", O_RDONLY);
 #endif
 
@@ -149,7 +159,9 @@ bool Server::start() {
     running_ = true;
     std::cout << "Mini-Redis server listening on port " << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
-    std::cout << "I/O multiplexing: select() — single-threaded, concurrent clients\n";
+    std::cout << "I/O multiplexing: " << poller_->name();
+    if(poller_->capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << poller_->capacity() << ")";
+    std::cout << ", single-threaded | maxclients " << max_clients_ << "\n";
     return true;
 }
 
@@ -180,7 +192,7 @@ void Server::stop() {
 //
 // How the loop works:
 //   1. The listening socket and every client socket are registered with the
-//      poller (select() today; see Poller.h)
+//      poller (epoll on Linux, select() elsewhere; see Poller.h)
 //   2. wait() blocks until at least one of them is ready
 //   3. Handle only the ready ones:
 //      - listen socket ready → new client connecting → accept()
@@ -194,8 +206,8 @@ void Server::stop() {
 //
 // Why single-threaded?
 //   Commands run one at a time, so no two commands can race each other.
-//   Redis's main thread uses the same model, but waits with epoll/kqueue,
-//   which return only the ready sockets; select() scans every socket each call.
+//   Redis's main thread uses the same model, also with epoll on Linux, which
+//   returns only the ready sockets; select() scans every socket each call.
 
 void Server::run() {
     std::vector<Poller::Event> ready;
@@ -206,12 +218,14 @@ void Server::run() {
         // On Windows the console handler runs on another thread, so the timeout
         // is what lets the loop notice.
         if(poller_->wait(1000, ready) < 0) {
-            if(running_) std::cerr << "select() error\n";
+            if(running_) std::cerr << poller_->name() << " error " << lastSocketError() << "\n";
             continue;
         }
 
-        // `ready` is a separate list, so removing a client below while going
-        // through it is safe.
+        // 1. Read from every ready client and run its commands. Their replies
+        //    wait in each client's output buffer, their AOF records in the AOF's.
+        //    (`ready` is a separate list, so removing a client while going
+        //    through it is safe.)
         for(const auto& event : ready) {
             if(event.fd == listen_socket_) {
                 acceptNewClients();
@@ -219,8 +233,25 @@ void Server::run() {
             }
             // Each check also skips a client removed earlier in this pass
             if(event.readable && clients_.count(event.fd)) handleReadable(event.fd);
-            if(event.writable && clients_.count(event.fd)) serveClient(event.fd);
+            if(event.writable && clients_.count(event.fd)) queueToServe(event.fd, clients_.at(event.fd));
         }
+
+        // 2. Group commit: one write() hands the OS the AOF records of every
+        //    command this pass ran, where each command used to make its own
+        //    (with --appendfsync always, one sync puts them on the disk).
+        //    Redis does the same in beforeSleep().
+        if(!flushAof()) break;
+
+        // 3. Only now send the replies, so none leaves before its record is
+        //    with the OS. (serveClient() flushes again before sending replies to
+        //    commands it runs itself.)
+        for(socket_t fd : to_serve_) {
+            auto it = clients_.find(fd);
+            if(it == clients_.end()) continue;      // removed earlier in this pass
+            it->second.queued = false;
+            serveClient(fd);
+        }
+        to_serve_.clear();
     }
     // Connections and the AOF are closed by stop() and the destructors, which
     // run normally now instead of the process being killed by the signal.
@@ -243,7 +274,7 @@ void Server::acceptNewClients() {
         if(client == INVALID_SOCKET) {
             int error = lastSocketError();
 #ifndef _WIN32
-            // Out of file descriptors: the connection stays queued, so select()
+            // Out of file descriptors: the connection stays queued, so the poller
             // would report it again at once and the loop would spin at 100% CPU.
             // Free the spare descriptor, accept the connection with it, refuse
             // it properly, then take the spare back (as nginx and libev do).
@@ -273,11 +304,17 @@ void Server::acceptNewClients() {
             continue;
         }
 
+        // As Redis does at maxclients
+        if(clients_.size() >= max_clients_) {
+            refuseClient(client);
+            std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
+            continue;
+        }
         // Watching a socket select() can't hold would write past the end of
         // fd_set (Linux) or silently never serve it (Windows)
         if(!poller_->canWatch(client)) {
             refuseClient(client);
-            std::cout << "Client refused: the server is at its select() limit ("
+            std::cout << "Client refused: the server is at its " << poller_->name() << " limit ("
                       << clients_.size() << " clients)\n";
             continue;
         }
@@ -341,7 +378,33 @@ void Server::handleReadable(socket_t fd) {
         removeClient(fd);
         return;
     }
-    serveClient(fd);
+    // Run its commands now; the replies are sent once the pass has written
+    // the AOF (see run())
+    runCommands(client);
+    if(!client.out.empty()) queueToServe(fd, client);
+}
+
+// Hands the AOF records of the commands run so far to the OS, and with
+// --appendfsync always to the disk. False if that has failed for good: with
+// always, a reply must mean the write is on the disk, which can no longer be
+// promised. Then no reply is sent and the server stops, as Redis exits.
+bool Server::flushAof() {
+    if(!aof_) return true;
+    aof_->flush();
+    if(!aof_->failedForGood()) return true;
+    if(running_) {
+        std::cerr << "Stopping: the AOF can't be written or synced (" << aof_->lastWriteError()
+                  << "), and with --appendfsync always a reply must mean the write is on disk\n";
+    }
+    running_ = false;
+    exit_code_ = 1;
+    return false;
+}
+
+void Server::queueToServe(socket_t fd, Client& client) {
+    if(client.queued) return;
+    client.queued = true;
+    to_serve_.push_back(fd);
 }
 
 // Sends what the client has waiting, then runs its next commands, until it has
@@ -353,6 +416,9 @@ void Server::serveClient(socket_t fd) {
     Client& client = clients_.at(fd);
     while(true) {
         if(client.out_sent < client.out.size()) {
+            // No reply leaves before the AOF records of its commands are with the
+            // OS. Usually run() has written them already and this does nothing.
+            if(!flushAof()) return;
             SendStatus status = sendReplies(fd, client);
             if(status == SendStatus::Failed) {     // the client has gone
                 removeClient(fd);
@@ -382,7 +448,8 @@ void Server::runCommands(Client& client) {
     size_t pos = 0;
     CommandContext ctx{storage_, aof_, clients_.size()};
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
-        auto parsed = RespParser::parse(std::string_view(client.in).substr(pos));
+        // Into args_, whose strings are reused from command to command
+        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_);
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
@@ -393,10 +460,11 @@ void Server::runCommands(Client& client) {
             return;
         }
         pos += parsed.consumed;
-        const auto& args = parsed.args;
-        if(args.empty()) continue;
+        if(parsed.argc == 0) continue;
 
-        client.out += executeCommand(ctx, args);
+        // The reply goes straight into the client's buffer
+        executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
+        releaseLargeArgs(parsed.argc);
 
         // QUIT: send its reply, then disconnect; commands after it don't run
         if(ctx.close_connection) {
@@ -406,6 +474,19 @@ void Server::runCommands(Client& client) {
         }
     }
     client.in.erase(0, pos);
+}
+
+// args_ keeps its memory so that parsing allocates nothing, but one command
+// with a huge argument (up to 512 MB) or very many would leave it that large
+// for good. Give such memory back, as Redis shrinks a client's query buffer.
+void Server::releaseLargeArgs(size_t argc) {
+    for(size_t i = 0; i < argc; i++) {
+        if(args_[i].capacity() > kKeepArgBytes) std::string().swap(args_[i]);
+    }
+    if(args_.size() > kKeepArgs) {
+        args_.resize(kKeepArgs);
+        args_.shrink_to_fit();
+    }
 }
 
 // Sends as much of the waiting replies as the socket takes. A partial send is

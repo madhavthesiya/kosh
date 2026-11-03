@@ -3,7 +3,9 @@
 #include <cctype>
 #include <charconv>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -53,15 +55,47 @@ public:
     // header line without "\r\n" is an error, not something to wait for.
     static constexpr size_t kMaxHeaderLength = 32;
 
-    // Parses one command from the start of `buffer`.
-    static ParseResult parse(std::string_view buffer) {
+    // What parseInto() found; the arguments themselves are in the caller's vector
+    struct Parsed {
+        ParseStatus status = ParseStatus::NeedMore;
+        size_t argc = 0;        // when Ok: the arguments are args[0..argc); 0 for a blank line or "*0"
+        size_t consumed = 0;    // when Ok: bytes of input the command used
+        std::string error;      // when Error: the reason, for "-ERR Protocol error: ..."
+    };
+
+    // Parses one command from the start of `buffer` into args[0..argc).
+    //
+    // `args` is reused from one command to the next: it only grows, and each
+    // argument is assign()ed into a string that keeps its memory, so once the
+    // strings are large enough, parsing a command allocates nothing. (It used to
+    // allocate a vector of positions, a vector of arguments, and every argument
+    // too long for the small-string buffer: 3 allocations for "GET <16-byte
+    // key>".) Arguments are copied only once the whole command has arrived, so
+    // a command that arrives in many pieces isn't copied again each time.
+    static Parsed parseInto(std::string_view buffer, std::vector<std::string>& args) {
         if(buffer.empty()) return needMore();
 
         // RESP commands start with '*' (array). Anything else is inline.
         if(buffer[0] == '*') {
-            return parseResp(buffer);
+            return parseRespInto(buffer, args);
         }
-        return parseInline(buffer);
+        return parseInlineInto(buffer, args);
+    }
+
+    // The same, with the arguments in a vector of their own (exactly argc of
+    // them): for tests and tools, where an allocation doesn't matter.
+    static ParseResult parse(std::string_view buffer) {
+        std::vector<std::string> args;
+        Parsed parsed = parseInto(buffer, args);
+        ParseResult r;
+        r.status = parsed.status;
+        r.consumed = parsed.consumed;
+        r.error = std::move(parsed.error);
+        if(parsed.status == ParseStatus::Ok) {
+            args.resize(parsed.argc);
+            r.args = std::move(args);
+        }
+        return r;
     }
 
     // ==================== Serialization ====================
@@ -105,13 +139,76 @@ public:
         return "*0\r\n";
     }
 
-private:
-    static ParseResult needMore() { return {}; }
+    // Appending forms, for building into a buffer that is reused: unlike the
+    // forms above, they create no temporary strings, so once the buffer has
+    // grown, building a reply or an AOF record allocates nothing.
+    static void appendLength(std::string& out, char type, size_t n) {
+        char digits[20];    // enough for any 64-bit size_t
+        auto result = std::to_chars(digits, digits + sizeof(digits), n);
+        out += type;
+        out.append(digits, result.ptr);
+        out += "\r\n";
+    }
 
-    static ParseResult protocolError(std::string reason) {
-        ParseResult r;
+    static void appendBulk(std::string& out, std::string_view s) {
+        appendLength(out, '$', s.size());
+        out.append(s);
+        out += "\r\n";
+    }
+
+    static void appendArray(std::string& out, std::initializer_list<std::string_view> items) {
+        appendLength(out, '*', items.size());
+        for(std::string_view item : items) appendBulk(out, item);
+    }
+
+    static void appendArray(std::string& out, const std::vector<std::string>& items) {
+        appendLength(out, '*', items.size());
+        for(const auto& item : items) appendBulk(out, item);
+    }
+
+    static void appendSimpleString(std::string& out, std::string_view s) {
+        out += '+';
+        out.append(s);
+        out += "\r\n";
+    }
+
+    // As error(): line breaks in the message become spaces
+    static void appendError(std::string& out, std::string_view message) {
+        out += '-';
+        size_t start = out.size();
+        out.append(message);
+        std::replace_if(out.begin() + static_cast<std::ptrdiff_t>(start), out.end(),
+                        [](char c) { return c == '\r' || c == '\n'; }, ' ');
+        out += "\r\n";
+    }
+
+    static void appendInteger(std::string& out, long long n) {
+        char digits[24];    // enough for any 64-bit value and its sign
+        auto result = std::to_chars(digits, digits + sizeof(digits), n);
+        out += ':';
+        out.append(digits, result.ptr);
+        out += "\r\n";
+    }
+
+    static void appendNull(std::string& out) {
+        out += "$-1\r\n";
+    }
+
+private:
+    static Parsed needMore() { return {}; }
+
+    static Parsed protocolError(std::string reason) {
+        Parsed r;
         r.status = ParseStatus::Error;
         r.error = std::move(reason);
+        return r;
+    }
+
+    static Parsed ok(size_t argc, size_t consumed) {
+        Parsed r;
+        r.status = ParseStatus::Ok;
+        r.argc = argc;
+        r.consumed = consumed;
         return r;
     }
 
@@ -149,7 +246,7 @@ private:
     }
 
     // Parse a RESP array: *N\r\n followed by N bulk strings
-    static ParseResult parseResp(std::string_view buffer) {
+    static Parsed parseRespInto(std::string_view buffer, std::vector<std::string>& args) {
         // Step 1: Read array header  *N\r\n
         long long count = 0;
         size_t pos = 0;
@@ -159,18 +256,13 @@ private:
             return protocolError("invalid multibulk length");
         }
         if(count <= 0) {   // "*0" or "*-1": nothing to run; Redis ignores these too
-            ParseResult r;
-            r.status = ParseStatus::Ok;
-            r.consumed = pos;
-            return r;
+            return ok(0, pos);
         }
 
-        // Step 2: Read N bulk strings  $len\r\ndata\r\n
-        // Only their positions are recorded here. The strings are copied once the
-        // whole command has arrived, so a command that arrives in many pieces is
-        // not copied again on every attempt.
-        std::vector<std::pair<size_t, size_t>> spans;   // (start, length) of each argument
-        spans.reserve(static_cast<size_t>(std::min(count, 16LL)));
+        // Step 2: check that all N bulk strings ($len\r\ndata\r\n) have arrived
+        // and are well formed, without copying anything: a command that arrives
+        // in many pieces is checked again on each attempt, but copied once.
+        const size_t first = pos;
         for(long long i = 0; i < count; i++) {
             if(pos >= buffer.size()) return needMore();
             if(buffer[pos] != '$') {
@@ -191,23 +283,26 @@ private:
             if(buffer[pos + length] != '\r' || buffer[pos + length + 1] != '\n') {
                 return protocolError("bulk string not followed by CRLF");
             }
-            spans.emplace_back(pos, length);
             pos += length + 2;   // skip data + \r\n
         }
 
-        ParseResult r;
-        r.status = ParseStatus::Ok;
-        r.consumed = pos;
-        r.args.reserve(spans.size());
-        for(auto [start, length] : spans) {
-            r.args.emplace_back(buffer.substr(start, length));
+        // Step 3: copy the arguments, reading the same headers again (now known
+        // to be good) instead of keeping their positions in a vector
+        size_t argc = static_cast<size_t>(count);
+        if(args.size() < argc) args.resize(argc);
+        size_t at = first;
+        for(size_t i = 0; i < argc; i++) {
+            long long length = 0;
+            readHeader(buffer, at, length, at);
+            args[i].assign(buffer.data() + at, static_cast<size_t>(length));
+            at += static_cast<size_t>(length) + 2;
         }
-        return r;
+        return ok(argc, pos);
     }
 
     // Parse an inline command: "PING\r\n" or "SET key value\r\n"
     // Supports both \r\n and \n line endings (for telnet compatibility)
-    static ParseResult parseInline(std::string_view buffer) {
+    static Parsed parseInlineInto(std::string_view buffer, std::vector<std::string>& args) {
         // Look for the newline only as far as the longest allowed line ("\r\n"
         // included), so a client can't make the server buffer an endless line.
         size_t window = std::min(buffer.size(), kMaxInlineLength + 2);
@@ -223,16 +318,17 @@ private:
         std::string_view line = buffer.substr(0, length);
 
         // Split by whitespace
-        ParseResult r;
-        r.status = ParseStatus::Ok;
-        r.consumed = nl + 1;
+        size_t argc = 0;
         size_t i = 0;
         while(i < line.size()) {
             while(i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) i++;
             size_t start = i;
             while(i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) i++;
-            if(i > start) r.args.emplace_back(line.substr(start, i - start));
+            if(i > start) {
+                if(args.size() == argc) args.emplace_back();
+                args[argc++].assign(line.data() + start, i - start);
+            }
         }
-        return r;
+        return ok(argc, nl + 1);
     }
 };

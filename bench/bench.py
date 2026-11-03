@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--clients", type=int, default=50, help="connections (-c)")
     p.add_argument("--pipelines", default="1,16", help="pipeline depths (-P)")
     p.add_argument("--aof", default="on,off", help="AOF settings to measure")
+    p.add_argument("--appendfsync", default="no", choices=["always", "everysec", "no"],
+                   help="when both servers sync the AOF to disk (default no)")
     p.add_argument("--server-cpu", default="2", help="CPU list for the server (taskset)")
     # redis-benchmark does about as much work per request as the server (one read and
     # one write system call), so one client thread can run out of CPU first. Two give
@@ -115,9 +117,10 @@ def measure(args, binaries, run, server, aof, pipeline):
         port = bl.free_port()
         if server == "mini":
             # Twice the keyspace, so SET never evicts.
-            argv = bl.mini_redis_argv(binaries["mini"], port, workdir, aof, 2 * args.keyspace)
+            argv = bl.mini_redis_argv(binaries["mini"], port, workdir, aof, 2 * args.keyspace,
+                                      args.appendfsync)
         else:
-            argv = bl.redis_argv(binaries["redis"], port, workdir, aof)
+            argv = bl.redis_argv(binaries["redis"], port, workdir, aof, args.appendfsync)
         with bl.Server(argv, workdir, port, cpus=args.server_cpu) as srv:
             srv.wait_ready()
             for test in ("set", "get"):
@@ -188,7 +191,8 @@ def markdown(summary, args, env_rows, commands):
            f"- **Pinning:** server on CPU {args.server_cpu}, redis-benchmark on CPU "
            f"{args.client_cpus} ({args.client_threads} thread"
            f"{'s' if args.client_threads > 1 else ''}).",
-           f"- **Runs:** {args.runs} per row, interleaved. The row shows the run with the "
+           f"- **Runs:** {args.runs} per row, interleaved, with the server measured first "
+           "alternating from run to run. The row shows the run with the "
            "median throughput; *spread* is (max - min) / median over all runs.",
            "- **Server CPU:** 100% = one core fully busy. *In kernel* is the share of that "
            "CPU time spent in system calls (`stime` / (`utime` + `stime`)).",
@@ -249,22 +253,28 @@ def main():
     example = Path("<tmp>")
     if "mini" in args.servers:
         commands.append(show(bl.pinned(args.server_cpu, bl.mini_redis_argv(
-            "build-bench/mini_redis_server", "<port>", example, True, 2 * args.keyspace))))
+            "build-bench/mini_redis_server", "<port>", example, True, 2 * args.keyspace,
+            args.appendfsync))))
     if "redis" in args.servers:
         commands.append(show(bl.pinned(args.server_cpu, bl.redis_argv(
-            "redis-server", "<port>", example, True))))
+            "redis-server", "<port>", example, True, args.appendfsync))))
     commands.append(show(bl.pinned(args.client_cpus, [
         "redis-benchmark", "-h", "127.0.0.1", "-p", "<port>", "-t", "<set|get>",
         "-n", "<requests>", "-r", str(args.keyspace), "-c", str(args.clients),
         "-P", "<pipeline>", "--csv"] + (["--threads", str(args.client_threads)]
                                         if args.client_threads > 1 else []))))
 
-    cases = [(aof, p, s) for aof in args.aof for p in args.pipelines for s in args.servers]
     rows = []
     with open(runs_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
         for run in range(1, args.runs + 1):
+            # Which server goes first alternates from run to run: anything that
+            # drifts within a run (a CPU's boost budget running out, say) must
+            # not always favour the same one. (Until Phase 4, Mini-Redis always
+            # went first.)
+            servers = args.servers if run % 2 else list(reversed(args.servers))
+            cases = [(aof, p, s) for aof in args.aof for p in args.pipelines for s in servers]
             for aof, pipeline, server in cases:
                 new = measure(args, binaries, run, server, aof, pipeline)
                 for r in new:

@@ -4,9 +4,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <list>
 #include <set>
 #include <deque>
@@ -31,7 +33,10 @@ enum class DataType { STRING, LIST, SET, HASH };
 // which still means the same after a restart; the monotonic clock doesn't.
 using ExpiryTime = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
 
-class InMemoryStorage : public StorageInterface {
+// final: nothing derives from it, so a call through an InMemoryStorage& (as
+// every command makes) is a direct call instead of one through the vtable.
+// It still can't be inlined, as the methods are in InMemoryStorage.cpp.
+class InMemoryStorage final : public StorageInterface {
     public:
         // Throws std::invalid_argument if capacity is 0
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
@@ -40,6 +45,13 @@ class InMemoryStorage : public StorageInterface {
         Result set(const std::string& key, const std::string& value) override;
         Result set(const std::string& key, const std::string& value, int ttlSeconds) override;
         Result get(const std::string& key) override;
+
+        // GET without copying the value: calls use(value) with the stored string
+        // while holding the lock (so `use` must not call back into this object),
+        // and marks the key used, as get() does. The server writes the reply
+        // straight from the stored value into the client's output buffer.
+        template<typename Use>
+        Result readString(const std::string& key, Use&& use);
 
         // Key operations
         Result del(const std::string& key) override;
@@ -94,6 +106,10 @@ class InMemoryStorage : public StorageInterface {
         //   DELs. Once loading is done, keys beyond the capacity are evicted.
         void setLoading(bool loading);
 
+        // Buckets in the key table. It is sized for the capacity at
+        // construction, so this doesn't change as keys are added (tests check it).
+        size_t bucketCount() const;
+
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;
@@ -112,7 +128,7 @@ class InMemoryStorage : public StorageInterface {
         void eraseEntry(DataMap::iterator it);
 
         // LRU helpers
-        void touchLRU(const std::string& key);
+        void touchLRU(CacheEntry& entry);               // marks it most recently used
         void evictLRU();                                // removes and logs the LRU key
         void makeRoomForNewKey();                       // expired keys first, then LRU
 
@@ -137,8 +153,14 @@ class InMemoryStorage : public StorageInterface {
         // If key exists with wrong type, returns error. If expired, removes and creates new.
         CacheEntry* getOrCreateEntry(const std::string& key, DataType expected);
 
-        // AOF logging helper — serializes parts as RESP and logs to AOF file
-        void logAOF(const std::vector<std::string>& parts);
+        // Log one command to the AOF as a RESP array: `parts`, or `head` followed
+        // by `tail` (values, or field/value pairs). Built straight into the AOF's
+        // buffer, and not at all without an AOF or while loading.
+        void logAOF(std::initializer_list<std::string_view> parts);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::vector<std::string>& tail);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::vector<std::pair<std::string, std::string>>& pairs);
 
         DataMap data_;
         std::list<std::string> lru_list_;
@@ -163,3 +185,18 @@ class InMemoryStorage : public StorageInterface {
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
         bool loading_ = false;              // replaying the AOF (see setLoading)
 };
+
+template<typename Use>
+Result InMemoryStorage::readString(const std::string& key, Use&& use) {
+    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the LRU order changes
+    auto it = data_.find(key);
+    if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    if(isExpired(it->second)) {
+        expireKey(key);
+        return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    }
+    if(getDataType(it->second) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
+    touchLRU(it->second);
+    use(std::get<std::string>(it->second.value));
+    return Result::ok();
+}

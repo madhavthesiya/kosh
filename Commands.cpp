@@ -8,8 +8,6 @@
 
 namespace {
 
-using Args = std::vector<std::string>;
-
 std::string toUpper(std::string_view s) {
     std::string upper(s);
     // std::toupper needs an unsigned char value: passing a plain char that is
@@ -19,17 +17,18 @@ std::string toUpper(std::string_view s) {
     return upper;
 }
 
-std::string ok() { return RespParser::simpleString("OK"); }
+// Every handler appends its reply to `out`, the client's output buffer, so a
+// reply is built in place: no temporary string per reply, and GET copies the
+// value once, from the table straight into the buffer.
 
-std::string wrongType() {
-    return RespParser::error("WRONGTYPE Operation against a key holding the wrong kind of value");
-}
+void ok(std::string& out) { RespParser::appendSimpleString(out, "OK"); }
 
 // Redis's error replies, word for word
-std::string notAnInteger() { return RespParser::error("ERR value is not an integer or out of range"); }
-std::string syntaxError() { return RespParser::error("ERR syntax error"); }
+constexpr const char* kWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
+constexpr const char* kNotAnInteger = "ERR value is not an integer or out of range";
+constexpr const char* kSyntaxError = "ERR syntax error";
 std::string invalidExpireTime(const char* command) {
-    return RespParser::error(std::string("ERR invalid expire time in '") + command + "' command");
+    return std::string("ERR invalid expire time in '") + command + "' command";
 }
 
 bool equalsIgnoreCase(std::string_view a, std::string_view b) {
@@ -55,11 +54,11 @@ int clampToInt(int64_t value) {
 // `seconds`: the number is in seconds (EX, EXAT, SETEX), not milliseconds.
 // `relative`: it counts from now (EX, PX, SETEX), not from the Unix epoch.
 // As in Redis, it must be a positive integer, and the absolute time must fit
-// in 64 bits. Returns an error reply, or an empty string if it is valid.
+// in 64 bits. Returns an error message, or an empty string if it is valid.
 std::string parseExpiry(const std::string& text, bool seconds, bool relative,
                         const char* command, int64_t& unix_time_ms) {
     int64_t value;
-    if(!parseInt64(text, value)) return notAnInteger();
+    if(!parseInt64(text, value)) return kNotAnInteger;
     if(value <= 0) return invalidExpireTime(command);
     if(seconds) {
         if(value > INT64_MAX / 1000) return invalidExpireTime(command);
@@ -76,26 +75,27 @@ std::string parseExpiry(const std::string& text, bool seconds, bool relative,
 
 // ---- Connection and server ----
 
-std::string cmdPing(CommandContext&, const Args&) { return RespParser::simpleString("PONG"); }
+void cmdPing(CommandContext&, const Args&, std::string& out) {
+    RespParser::appendSimpleString(out, "PONG");
+}
 
-std::string cmdQuit(CommandContext& ctx, const Args&) {
+void cmdQuit(CommandContext& ctx, const Args&, std::string& out) {
     ctx.close_connection = true;
-    return ok();
+    ok(out);
 }
 
 // redis-cli and redis-benchmark send these at startup
-std::string cmdCommand(CommandContext&, const Args&) { return RespParser::emptyArray(); }
-std::string cmdClient(CommandContext&, const Args&) { return ok(); }
+void cmdCommand(CommandContext&, const Args&, std::string& out) { RespParser::appendLength(out, '*', 0); }
+void cmdClient(CommandContext&, const Args&, std::string& out) { ok(out); }
 
-std::string cmdConfig(CommandContext&, const Args& args) {
-    if(equalsIgnoreCase(args[1], "GET")) return RespParser::emptyArray();
-    return RespParser::error("ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
+void cmdConfig(CommandContext&, const Args& args, std::string& out) {
+    if(equalsIgnoreCase(args[1], "GET")) return RespParser::appendLength(out, '*', 0);
+    RespParser::appendError(out, "ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
 }
 
-std::string cmdInfo(CommandContext& ctx, const Args&) {
-    return RespParser::bulkString("# Server\r\nmini_redis_version:2.0\r\n"
-                                  "# Clients\r\nconnected_clients:"
-                                  + std::to_string(ctx.clients) + "\r\n");
+void cmdInfo(CommandContext& ctx, const Args&, std::string& out) {
+    RespParser::appendBulk(out, "# Server\r\nmini_redis_version:2.0\r\n"
+                                "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n");
 }
 
 // ---- Strings ----
@@ -104,7 +104,7 @@ std::string cmdInfo(CommandContext& ctx, const Args&) {
 // The AOF records every SET with a TTL as PXAT. Redis's other options (NX, XX,
 // GET, KEEPTTL) aren't supported and are a syntax error: ignoring NX would
 // let "SET lock me NX" take a lock that someone else holds.
-std::string cmdSet(CommandContext& ctx, const Args& args) {
+void cmdSet(CommandContext& ctx, const Args& args, std::string& out) {
     // As Redis does: check the options' syntax first, then the number
     const std::string* option = nullptr;
     const std::string* number = nullptr;
@@ -112,190 +112,197 @@ std::string cmdSet(CommandContext& ctx, const Args& args) {
         bool known = equalsIgnoreCase(args[i], "EX") || equalsIgnoreCase(args[i], "PX") ||
                      equalsIgnoreCase(args[i], "EXAT") || equalsIgnoreCase(args[i], "PXAT");
         // Each option needs a value, and only one expiry may be given
-        if(!known || option || i + 1 == args.size()) return syntaxError();
+        if(!known || option || i + 1 == args.size()) return RespParser::appendError(out, kSyntaxError);
         option = &args[i];
         number = &args[i + 1];
     }
     if(!option) {
         auto r = ctx.storage.set(args[1], args[2]);
-        return r.success ? ok() : RespParser::error("ERR set failed");
+        return r.success ? ok(out) : RespParser::appendError(out, "ERR set failed");
     }
     bool seconds = equalsIgnoreCase(*option, "EX") || equalsIgnoreCase(*option, "EXAT");
     bool relative = equalsIgnoreCase(*option, "EX") || equalsIgnoreCase(*option, "PX");
     int64_t at;
     std::string error = parseExpiry(*number, seconds, relative, "set", at);
-    if(!error.empty()) return error;
+    if(!error.empty()) return RespParser::appendError(out, error);
     auto r = ctx.storage.setExpiringAt(args[1], args[2], at);
-    return r.success ? ok() : RespParser::error("ERR set failed");
+    r.success ? ok(out) : RespParser::appendError(out, "ERR set failed");
 }
 
-std::string cmdGet(CommandContext& ctx, const Args& args) {
-    auto r = ctx.storage.get(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
+// The value goes from the table straight into the reply, copied once
+void cmdGet(CommandContext& ctx, const Args& args, std::string& out) {
+    auto r = ctx.storage.readString(args[1], [&out](const std::string& value) {
+        RespParser::appendBulk(out, value);
+    });
+    if(r.error == ErrorCode::WRONG_TYPE) RespParser::appendError(out, kWrongType);
+    else if(!r.success) RespParser::appendNull(out);
 }
 
-std::string cmdSetex(CommandContext& ctx, const Args& args) {
+void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
     int64_t at;
     std::string error = parseExpiry(args[2], true, true, "setex", at);
-    if(!error.empty()) return error;
+    if(!error.empty()) return RespParser::appendError(out, error);
     auto r = ctx.storage.setExpiringAt(args[1], args[3], at);
-    return r.success ? ok() : RespParser::error("ERR setex failed");
+    r.success ? ok(out) : RespParser::appendError(out, "ERR setex failed");
 }
 
 // ---- Keys ----
 
-std::string cmdDel(CommandContext& ctx, const Args& args) {
-    return RespParser::integer(ctx.storage.del(args[1]).success ? 1 : 0);
+void cmdDel(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendInteger(out, ctx.storage.del(args[1]).success ? 1 : 0);
 }
 
-std::string cmdExists(CommandContext& ctx, const Args& args) {
-    return RespParser::integer(ctx.storage.exists(args[1]).success ? 1 : 0);
+void cmdExists(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendInteger(out, ctx.storage.exists(args[1]).success ? 1 : 0);
 }
 
-std::string cmdType(CommandContext& ctx, const Args& args) {
-    return RespParser::simpleString(ctx.storage.type(args[1]).value);
+void cmdType(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendSimpleString(out, ctx.storage.type(args[1]).value);
 }
 
 // Unlike SET, a TTL of 0 or less is allowed: the key expires at once (Redis
 // deletes it). Only a time that doesn't fit in 64 bits is an error.
-std::string cmdExpire(CommandContext& ctx, const Args& args) {
+void cmdExpire(CommandContext& ctx, const Args& args, std::string& out) {
     int64_t seconds;
-    if(!parseInt64(args[2], seconds)) return notAnInteger();
+    if(!parseInt64(args[2], seconds)) return RespParser::appendError(out, kNotAnInteger);
     int64_t now = InMemoryStorage::unixTimeMs();
     if(seconds > (INT64_MAX - now) / 1000 || seconds < INT64_MIN / 1000) {
-        return invalidExpireTime("expire");
+        return RespParser::appendError(out, invalidExpireTime("expire"));
     }
-    return RespParser::integer(ctx.storage.expireAt(args[1], now + seconds * 1000).success ? 1 : 0);
+    RespParser::appendInteger(out, ctx.storage.expireAt(args[1], now + seconds * 1000).success ? 1 : 0);
 }
 
 // The AOF records every expiry as PEXPIREAT: an absolute Unix time in milliseconds
-std::string cmdPexpireat(CommandContext& ctx, const Args& args) {
+void cmdPexpireat(CommandContext& ctx, const Args& args, std::string& out) {
     int64_t at;
-    if(!parseInt64(args[2], at)) return notAnInteger();
-    return RespParser::integer(ctx.storage.expireAt(args[1], at).success ? 1 : 0);
+    if(!parseInt64(args[2], at)) return RespParser::appendError(out, kNotAnInteger);
+    RespParser::appendInteger(out, ctx.storage.expireAt(args[1], at).success ? 1 : 0);
 }
 
-std::string cmdTtl(CommandContext& ctx, const Args& args) {
+void cmdTtl(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.ttl(args[1]);
-    if(!r.success) return RespParser::integer(-2);
+    if(!r.success) return RespParser::appendInteger(out, -2);
     // 64-bit: an expiry set with PEXPIREAT can be further away than INT_MAX
     // seconds, and std::stoi would throw out of the event loop
-    return RespParser::integer(std::stoll(r.value));
+    RespParser::appendInteger(out, std::stoll(r.value));
 }
 
 // ---- Lists ----
 
-std::string cmdPush(CommandContext& ctx, const Args& args, bool left) {
+void cmdPush(CommandContext& ctx, const Args& args, std::string& out, bool left) {
     std::vector<std::string> values(args.begin() + 2, args.end());
     auto r = left ? ctx.storage.lpush(args[1], values) : ctx.storage.rpush(args[1], values);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
-std::string cmdLpush(CommandContext& ctx, const Args& args) { return cmdPush(ctx, args, true); }
-std::string cmdRpush(CommandContext& ctx, const Args& args) { return cmdPush(ctx, args, false); }
+void cmdLpush(CommandContext& ctx, const Args& args, std::string& out) { cmdPush(ctx, args, out, true); }
+void cmdRpush(CommandContext& ctx, const Args& args, std::string& out) { cmdPush(ctx, args, out, false); }
 
-std::string cmdPop(CommandContext& ctx, const Args& args, bool left) {
+void cmdPop(CommandContext& ctx, const Args& args, std::string& out, bool left) {
     auto r = left ? ctx.storage.lpop(args[1]) : ctx.storage.rpop(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
 }
-std::string cmdLpop(CommandContext& ctx, const Args& args) { return cmdPop(ctx, args, true); }
-std::string cmdRpop(CommandContext& ctx, const Args& args) { return cmdPop(ctx, args, false); }
+void cmdLpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, true); }
+void cmdRpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, false); }
 
-std::string cmdLrange(CommandContext& ctx, const Args& args) {
+void cmdLrange(CommandContext& ctx, const Args& args, std::string& out) {
     int64_t start, stop;
-    if(!parseInt64(args[2], start) || !parseInt64(args[3], stop)) return notAnInteger();
+    if(!parseInt64(args[2], start) || !parseInt64(args[3], stop)) {
+        return RespParser::appendError(out, kNotAnInteger);
+    }
     auto r = ctx.storage.lrange(args[1], clampToInt(start), clampToInt(stop));
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::array(r.values);
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendArray(out, r.values);
 }
 
-std::string cmdLlen(CommandContext& ctx, const Args& args) {
+void cmdLlen(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.llen(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
 // ---- Sets ----
 
-std::string cmdSadd(CommandContext& ctx, const Args& args) {
+void cmdSadd(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.sadd(args[1], std::vector<std::string>(args.begin() + 2, args.end()));
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
-std::string cmdSrem(CommandContext& ctx, const Args& args) {
+void cmdSrem(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.srem(args[1], std::vector<std::string>(args.begin() + 2, args.end()));
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
-std::string cmdSmembers(CommandContext& ctx, const Args& args) {
+void cmdSmembers(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.smembers(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::array(r.values);
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendArray(out, r.values);
 }
 
-std::string cmdSismember(CommandContext& ctx, const Args& args) {
+void cmdSismember(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.sismember(args[1], args[2]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
-std::string cmdScard(CommandContext& ctx, const Args& args) {
+void cmdScard(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.scard(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
 // ---- Hashes ----
 
-std::string cmdHset(CommandContext& ctx, const Args& args) {
+void cmdHset(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.size() % 2 != 0) {      // field without a value
-        return RespParser::error("ERR wrong number of arguments for 'hset' command");
+        return RespParser::appendError(out, "ERR wrong number of arguments for 'hset' command");
     }
     std::vector<std::pair<std::string, std::string>> fields;
     for(size_t i = 2; i < args.size(); i += 2) fields.emplace_back(args[i], args[i + 1]);
     auto r = ctx.storage.hset(args[1], fields);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
-std::string cmdHget(CommandContext& ctx, const Args& args) {
+void cmdHget(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hget(args[1], args[2]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return r.success ? RespParser::bulkString(r.value) : RespParser::nullBulk();
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
 }
 
-std::string cmdHdel(CommandContext& ctx, const Args& args) {
+void cmdHdel(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hdel(args[1], std::vector<std::string>(args.begin() + 2, args.end()));
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
-std::string cmdHgetall(CommandContext& ctx, const Args& args) {
+void cmdHgetall(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hgetall(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::array(r.values);
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendArray(out, r.values);
 }
 
-std::string cmdHlen(CommandContext& ctx, const Args& args) {
+void cmdHlen(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hlen(args[1]);
-    if(r.error == ErrorCode::WRONG_TYPE) return wrongType();
-    return RespParser::integer(std::stoi(r.value));
+    if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
+    RespParser::appendInteger(out, std::stoi(r.value));
 }
 
 // ---- Persistence ----
 // There is no SAVE: the AOF is the server's only persistence. (SAVE used to
 // write string keys to dump.rdb, which nothing loaded.)
 
-std::string cmdRewriteAof(CommandContext& ctx, const Args&) {
-    if(!ctx.aof) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
-    if(!ctx.aof->rewrite(ctx.storage.dumpState())) {
-        return RespParser::error("ERR AOF rewrite failed: " + ctx.aof->lastError());
+void cmdRewriteAof(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.aof) {
+        return RespParser::appendError(out, "ERR AOF is disabled (start the server with --appendonly yes)");
     }
-    return ok();
+    if(!ctx.aof->rewrite(ctx.storage.dumpState())) {
+        return RespParser::appendError(out, "ERR AOF rewrite failed: " + ctx.aof->lastError());
+    }
+    ok(out);
 }
 
 const Command kCommands[] = {
@@ -382,24 +389,35 @@ bool arityMatches(const Command& cmd, size_t argc) {
     return argc >= static_cast<size_t>(-cmd.arity);
 }
 
-std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args) {
-    if(args.empty()) return RespParser::error("ERR empty command");
+void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
+    if(args.empty()) return RespParser::appendError(out, "ERR empty command");
     const Command* cmd = lookupCommand(args[0]);
     if(!cmd) {
         // Quote at most 128 bytes of the name, as Redis does
-        return RespParser::error("ERR unknown command '" + args[0].substr(0, 128) + "'");
+        return RespParser::appendError(out, "ERR unknown command '" + args[0].substr(0, 128) + "'");
     }
     if(!arityMatches(*cmd, args.size())) {
-        return RespParser::error(std::string("ERR wrong number of arguments for '")
-                                 + cmd->name + "' command");
+        return RespParser::appendError(out, std::string("ERR wrong number of arguments for '")
+                                            + cmd->name + "' command");
     }
     // While the AOF can't be written (a full disk), refuse writes, as Redis
     // does: their records couldn't be saved. Reads still work. Each attempt
     // retries first, so writes resume as soon as the file takes data again.
     if((cmd->flags & kCmdWrite) && ctx.aof && !ctx.aof->flushPending()) {
-        return RespParser::error("MISCONF Errors writing to the AOF file: " + ctx.aof->lastWriteError());
+        return RespParser::appendError(out, "MISCONF Errors writing to the AOF file: " +
+                                            ctx.aof->lastWriteError());
     }
-    return cmd->handler(ctx, args);
+    cmd->handler(ctx, args, out);
+}
+
+void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out) {
+    executeCommand(ctx, Args(args), out);
+}
+
+std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& args) {
+    std::string reply;
+    executeCommand(ctx, Args(args), reply);
+    return reply;
 }
 
 // Runs every complete command in the AOF through the command table. While
@@ -409,6 +427,8 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
     const std::string buffer = aof.readRaw();
     CommandContext ctx{storage};
     LoadingGuard loading(storage);
+    std::string discarded;      // replies: nobody reads them
+    std::vector<std::string> scratch;   // every record is parsed into these strings
 
     auto damaged = [&](size_t at, const std::string& reason) {
         result.ok = false;
@@ -423,7 +443,7 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
     // buffer moved the whole rest of the file every time: quadratic in its size.
     size_t pos = 0;
     while(pos < buffer.size()) {
-        auto parsed = RespParser::parse(std::string_view(buffer).substr(pos));
+        auto parsed = RespParser::parseInto(std::string_view(buffer).substr(pos), scratch);
         if(parsed.status == RespParser::ParseStatus::NeedMore) {
             // The file ends partway through a record: the server stopped while
             // writing it. Cut it off, or new records would be appended after it
@@ -441,14 +461,15 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
         }
         if(parsed.status == RespParser::ParseStatus::Error) return damaged(pos, parsed.error);
 
-        const auto& args = parsed.args;
+        Args args(scratch.data(), parsed.argc);
         if(!args.empty()) {
             // Only write commands are logged, so anything else means the file is damaged
             const Command* cmd = lookupCommand(args[0]);
             if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
                 return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
             }
-            cmd->handler(ctx, args);
+            discarded.clear();
+            cmd->handler(ctx, args, discarded);
             result.commands++;
         }
         pos += parsed.consumed;

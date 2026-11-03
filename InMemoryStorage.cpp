@@ -36,6 +36,10 @@ int64_t toUnixTimeMs(ExpiryTime expiry) {
     return addSaturating(InMemoryStorage::unixTimeMs(), remaining);
 }
 
+// The hash table is sized at construction for up to this many keys: 4,355,707
+// buckets with libstdc++, about 35 MB at 8 bytes each. See the constructor.
+constexpr size_t kPresizedKeys = size_t{1} << 22;
+
 }  // namespace
 
 int64_t InMemoryStorage::unixTimeMs() {
@@ -50,14 +54,49 @@ InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
+
+    // Size the hash table for the capacity now, so it never rehashes while
+    // serving. std::unordered_map grows all at once, moving every key: the
+    // SET that added the 85,230th key took about 20 ms (bench/insert_latency),
+    // and the single-threaded server makes every client wait that long. The
+    // cost is the bucket array, 8 bytes per key of capacity, allocated up
+    // front. It is capped, so a huge --maxkeys meant as "unlimited" doesn't
+    // allocate gigabytes; past the cap the table grows by rehashing, as
+    // before. (Redis instead rehashes incrementally, a few buckets at a time.)
+    data_.reserve(std::min(capacity_, kPresizedKeys));
 }
 
-// Centralized AOF logging — serializes command parts as RESP and writes to AOF.
-// RESP format is binary-safe: values with spaces, newlines etc. are length-prefixed.
-void InMemoryStorage::logAOF(const std::vector<std::string>& parts) {
-    if(aof_ && !loading_) {
-        aof_->log(RespParser::array(parts));
-    }
+// AOF logging. Each record is a RESP array (binary-safe: values with spaces or
+// newlines are length-prefixed), serialized straight into the AOF's buffer.
+// This used to build a vector<string> of copies (twice for the key, through an
+// initializer_list) and then a string of the record, before even checking for
+// an AOF: 3 allocations per SET with the AOF off, 6 with it on.
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> parts) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) { RespParser::appendArray(out, parts); });
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::vector<std::string>& tail) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) {
+        RespParser::appendLength(out, '*', head.size() + tail.size());
+        for(std::string_view part : head) RespParser::appendBulk(out, part);
+        for(const auto& part : tail) RespParser::appendBulk(out, part);
+    });
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::vector<std::pair<std::string, std::string>>& pairs) {
+    if(!aof_ || loading_) return;
+    aof_->logWith([&](std::string& out) {
+        RespParser::appendLength(out, '*', head.size() + 2 * pairs.size());
+        for(std::string_view part : head) RespParser::appendBulk(out, part);
+        for(const auto& [first, second] : pairs) {
+            RespParser::appendBulk(out, first);
+            RespParser::appendBulk(out, second);
+        }
+    });
 }
 
 // ==================== Type Helpers ====================
@@ -105,7 +144,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         } else if(getDataType(it->second) != expected) {
             return nullptr;     // type mismatch
         } else {
-            touchLRU(key);
+            touchLRU(it->second);
             return &it->second; // existing entry of correct type
         }
     }
@@ -194,20 +233,12 @@ Result InMemoryStorage::ttl(const std::string& key){
 
 // ==================== String Operations ====================
 
+// A copy of the value, through readString() (which the server uses directly)
 Result InMemoryStorage::get(const std::string& key){
-    std::unique_lock lock(mutex_);
-    auto it = data_.find(key);
-    if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(it->second)) {
-        expireKey(key);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    }
-    // Type check: GET only works on strings
-    if(getDataType(it->second) != DataType::STRING) {
-        return Result::fail(ErrorCode::WRONG_TYPE);
-    }
-    touchLRU(key);
-    return Result::ok(std::get<std::string>(it->second.value));
+    std::string value;
+    Result r = readString(key, [&value](const std::string& stored) { value = stored; });
+    if(r.success) r.value = std::move(value);
+    return r;
 }
 
 Result InMemoryStorage::set(const std::string& key, const std::string& value){
@@ -243,7 +274,7 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
             setExpiry(it, expiry);
-            touchLRU(key);
+            touchLRU(it->second);
             return Result::ok();
         }
     }
@@ -267,9 +298,7 @@ Result InMemoryStorage::lpush(const std::string& key, const std::vector<std::str
     for(const auto& v : values) {
         list.push_front(v);
     }
-    std::vector<std::string> parts = {"LPUSH", key};
-    parts.insert(parts.end(), values.begin(), values.end());
-    logAOF(parts);
+    logAOF({"LPUSH", key}, values);
     return Result::ok(static_cast<int>(list.size()));
 }
 
@@ -281,9 +310,7 @@ Result InMemoryStorage::rpush(const std::string& key, const std::vector<std::str
     for(const auto& v : values) {
         list.push_back(v);
     }
-    std::vector<std::string> parts = {"RPUSH", key};
-    parts.insert(parts.end(), values.begin(), values.end());
-    logAOF(parts);
+    logAOF({"RPUSH", key}, values);
     return Result::ok(static_cast<int>(list.size()));
 }
 
@@ -302,7 +329,7 @@ Result InMemoryStorage::lpop(const std::string& key){
     list.pop_front();
     // Auto-delete empty lists (same as real Redis)
     if(list.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     logAOF({"LPOP", key});
     return Result::ok(val);
 }
@@ -321,7 +348,7 @@ Result InMemoryStorage::rpop(const std::string& key){
     std::string val = list.back();
     list.pop_back();
     if(list.empty()) removeKey(key);
-    else touchLRU(key);
+    else touchLRU(*entry);
     logAOF({"RPOP", key});
     return Result::ok(val);
 }
@@ -369,9 +396,7 @@ Result InMemoryStorage::sadd(const std::string& key, const std::vector<std::stri
     for(const auto& m : members) {
         if(set.insert(m).second) added++;
     }
-    std::vector<std::string> parts = {"SADD", key};
-    parts.insert(parts.end(), members.begin(), members.end());
-    logAOF(parts);
+    logAOF({"SADD", key}, members);
     return Result::ok(added);
 }
 
@@ -390,10 +415,8 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(set.erase(m));
     }
     if(set.empty()) removeKey(key);
-    else touchLRU(key);
-    std::vector<std::string> parts = {"SREM", key};
-    parts.insert(parts.end(), members.begin(), members.end());
-    logAOF(parts);
+    else touchLRU(*entry);
+    logAOF({"SREM", key}, members);
     return Result::ok(removed);
 }
 
@@ -434,14 +457,11 @@ Result InMemoryStorage::hset(const std::string& key, const std::vector<std::pair
     if(!entry) return Result::fail(ErrorCode::WRONG_TYPE);
     auto& hash = std::get<std::unordered_map<std::string,std::string>>(entry->value);
     int added = 0;
-    std::vector<std::string> parts = {"HSET", key};
     for(const auto& [field, val] : fields) {
         auto [it, inserted] = hash.insert_or_assign(field, val);
         if(inserted) added++;
-        parts.push_back(field);
-        parts.push_back(val);
     }
-    logAOF(parts);
+    logAOF({"HSET", key}, fields);
     return Result::ok(added);
 }
 
@@ -472,10 +492,8 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(hash.erase(f));
     }
     if(hash.empty()) removeKey(key);
-    else touchLRU(key);
-    std::vector<std::string> parts = {"HDEL", key};
-    parts.insert(parts.end(), fields.begin(), fields.end());
-    logAOF(parts);
+    else touchLRU(*entry);
+    logAOF({"HDEL", key}, fields);
     return Result::ok(removed);
 }
 
@@ -621,11 +639,14 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
 
 // ==================== LRU Helpers ====================
 
-void InMemoryStorage::touchLRU(const std::string& key){
-    auto& entry = data_[key]; 
-    lru_list_.erase(entry.lru_it);
-    lru_list_.push_front(key);
-    entry.lru_it = lru_list_.begin();
+// splice() relinks the entry's existing list node at the front: O(1), no
+// allocation, no copy of the key, and entry.lru_it stays valid. It used to
+// look the key up again (data_[key]), erase the node and push a new one: a
+// second hash lookup, a free and two allocations (the node, and the key,
+// which at 16 bytes is one too long for the small-string buffer) on every
+// GET and every SET of an existing key.
+void InMemoryStorage::touchLRU(CacheEntry& entry){
+    lru_list_.splice(lru_list_.begin(), lru_list_, entry.lru_it);
 }
 
 // Evictions and expirations are removals the server decides on its own, so
@@ -670,6 +691,11 @@ void InMemoryStorage::setLoading(bool loading){
     if(!loading_) {
         while(data_.size() > capacity_) evictLRU();
     }
+}
+
+size_t InMemoryStorage::bucketCount() const{
+    std::shared_lock lock(mutex_);
+    return data_.bucket_count();
 }
 
 bool InMemoryStorage::isExpired(const CacheEntry& entry) const{
