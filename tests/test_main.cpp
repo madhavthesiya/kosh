@@ -8,6 +8,9 @@
 #include <map>
 #include <random>
 #include <algorithm>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #ifndef _WIN32
 #include <csignal>
 #include <sys/resource.h>
@@ -15,6 +18,7 @@
 #include <unistd.h>
 #endif
 #include "../Poller.h"
+#include "../KeyTable.h"
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -169,6 +173,124 @@ TEST(test_table_presize_is_capped) {
     ASSERT_TRUE(s.bucketCount() < (size_t{1} << 23));
     s.set("k", "v");
     ASSERT_EQ(s.get("k").value, "v");
+}
+
+// ==================== Key Table ====================
+
+struct TableEntry {
+    std::string key;
+};
+struct TableKeyOf {
+    static std::string_view key(const TableEntry& e) { return e.key; }
+};
+// Every key hashes alike: one bucket, a chain of children, and tags that
+// always match, so every lookup has to compare keys
+struct SameHash {
+    size_t operator()(std::string_view) const { return 42; }
+};
+
+TEST(test_keytable_basics) {
+    KeyTable<TableEntry, TableKeyOf> t;
+    ASSERT_TRUE(t.find("a") == nullptr);
+    TableEntry a{"a"}, b{"b"};
+    ASSERT_FALSE(t.erase(&a));                  // an empty table: nothing to erase
+    t.insert(&a);
+    t.insert(&b);
+    ASSERT_EQ(t.size(), size_t{2});
+    ASSERT_TRUE(t.find("a") == &a);
+    ASSERT_TRUE(t.find("b") == &b);
+    ASSERT_TRUE(t.find("c") == nullptr);
+    ASSERT_TRUE(t.erase(&a));
+    ASSERT_FALSE(t.erase(&a));
+    ASSERT_TRUE(t.find("a") == nullptr);
+    ASSERT_EQ(t.size(), size_t{1});
+}
+
+TEST(test_keytable_one_long_chain) {
+    KeyTable<TableEntry, TableKeyOf, SameHash> t;
+    std::vector<TableEntry> entries(100);
+    for(int i = 0; i < 100; i++) {
+        entries[i].key = "k" + std::to_string(i);
+        t.insert(&entries[i]);
+    }
+    ASSERT_TRUE(t.childBuckets() > 0);
+    for(int i = 0; i < 100; i++) ASSERT_TRUE(t.find(entries[i].key) == &entries[i]);
+    ASSERT_TRUE(t.find("missing") == nullptr);
+    // Every other key: empties child buckets in the middle of the chain
+    for(int i = 0; i < 100; i += 2) ASSERT_TRUE(t.erase(&entries[i]));
+    for(int i = 0; i < 100; i++) ASSERT_EQ(t.find(entries[i].key) == &entries[i], i % 2 == 1);
+    for(int i = 1; i < 100; i += 2) ASSERT_TRUE(t.erase(&entries[i]));
+    ASSERT_EQ(t.size(), size_t{0});
+    ASSERT_EQ(t.childBuckets(), size_t{0});     // every emptied child bucket was freed
+}
+
+TEST(test_keytable_matches_unordered_map) {
+    // Random inserts, erases and lookups over 50,000 keys, through many
+    // rehashes, checked against std::unordered_map after every operation.
+    // forEach must visit every entry exactly once, mid-rehash included.
+    KeyTable<TableEntry, TableKeyOf> t;
+    std::unordered_map<std::string, TableEntry*> ref;
+    std::vector<std::unique_ptr<TableEntry>> pool;     // owns the entries
+    std::mt19937 rng(7);
+    int checked_mid_rehash = 0;
+    for(int op = 0; op < 200000; op++) {
+        std::string k = "key:" + std::to_string(rng() % 50000);
+        unsigned dice = rng() % 100;
+        auto it = ref.find(k);
+        if(dice < 50) {
+            if(it == ref.end()) {
+                pool.push_back(std::make_unique<TableEntry>(TableEntry{k}));
+                t.insert(pool.back().get());
+                ref[k] = pool.back().get();
+            }
+        } else if(dice < 75) {
+            if(it != ref.end()) {
+                ASSERT_TRUE(t.erase(it->second));
+                ref.erase(it);
+            }
+        } else {
+            ASSERT_TRUE(t.find(k) == (it == ref.end() ? nullptr : it->second));
+        }
+        ASSERT_EQ(t.size(), ref.size());
+        if(op % 5000 == 0 || (t.rehashing() && checked_mid_rehash < 20)) {
+            if(t.rehashing()) checked_mid_rehash++;
+            std::unordered_set<const TableEntry*> seen;
+            bool all_known = true;
+            t.forEach([&](TableEntry& e) {
+                auto r = ref.find(e.key);
+                all_known = all_known && r != ref.end() && r->second == &e;
+                ASSERT_TRUE(seen.insert(&e).second);        // never twice
+            });
+            ASSERT_TRUE(all_known);
+            ASSERT_EQ(seen.size(), ref.size());
+        }
+    }
+    ASSERT_TRUE(checked_mid_rehash > 0);
+    for(const auto& [k, e] : ref) ASSERT_TRUE(t.find(k) == e);
+}
+
+TEST(test_keytable_rehash_is_incremental) {
+    // Once a rehash starts, each insert moves at most one bucket chain (or
+    // passes up to 10 empty buckets), so the rehash ends within as many
+    // inserts as the old table had buckets: no insert moves them all.
+    KeyTable<TableEntry, TableKeyOf> t;
+    std::vector<std::unique_ptr<TableEntry>> pool;
+    int n = 0;
+    auto add = [&] {
+        pool.push_back(std::make_unique<TableEntry>(TableEntry{"k" + std::to_string(n++)}));
+        t.insert(pool.back().get());
+    };
+    for(int growths = 0; growths < 5; growths++) {
+        while(!t.rehashing()) add();
+        size_t old_buckets = t.bucketCount() / 3;    // the old table, and the new one twice its size
+        size_t inserts = 0;
+        while(t.rehashing()) {
+            add();
+            inserts++;
+            ASSERT_TRUE(inserts <= old_buckets);
+        }
+    }
+    for(const auto& e : pool) ASSERT_TRUE(t.find(e->key) == e.get());
 }
 
 // ==================== SIEVE Eviction ====================
@@ -2138,6 +2260,12 @@ int main() {
     RUN_TEST(test_capacity_zero_is_rejected);
     RUN_TEST(test_table_sized_for_capacity);
     RUN_TEST(test_table_presize_is_capped);
+
+    std::cout << "\n[Key Table]\n";
+    RUN_TEST(test_keytable_basics);
+    RUN_TEST(test_keytable_one_long_chain);
+    RUN_TEST(test_keytable_matches_unordered_map);
+    RUN_TEST(test_keytable_rehash_is_incremental);
 
     std::cout << "\n[SIEVE Eviction]\n";
     RUN_TEST(test_sieve_evicts_first_unvisited_key);

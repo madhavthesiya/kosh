@@ -24,6 +24,7 @@
 // in the same binary, at the same moment.
 
 #include "../InMemoryStorage.h"
+#include "../KeyTable.h"
 
 #include <algorithm>
 #include <chrono>
@@ -162,6 +163,25 @@ struct FakeEntry {
     char bytes[112];
 };
 
+// An entry as KeyTable holds them: a fixed part, then the key's bytes, in one
+// allocation (one block per key, where std::unordered_map needs a node and,
+// for a 16-byte key, a heap copy of the key)
+struct InlineEntry {
+    char fixed[72];
+    uint32_t key_len;
+    std::string_view key() const { return {reinterpret_cast<const char*>(this + 1), key_len}; }
+    static InlineEntry* create(std::string_view key) {
+        void* block = ::operator new(sizeof(InlineEntry) + key.size());
+        auto* e = new (block) InlineEntry{};
+        e->key_len = static_cast<uint32_t>(key.size());
+        std::memcpy(e + 1, key.data(), key.size());
+        return e;
+    }
+};
+struct InlineKeyOf {
+    static std::string_view key(const InlineEntry& e) { return e.key(); }
+};
+
 double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     size_t m = v.size() / 2;
@@ -233,28 +253,31 @@ bool parseArgs(int argc, char** argv, Options& opt) {
 }
 
 // The rows of one table size, for one key distribution: one per eviction
-// policy. find() doesn't depend on the policy, so only the first row has it.
+// policy. The plain tables don't depend on the policy, so only the first row
+// has them.
 struct Row {
     size_t keys;
     const char* policy;
     double engine_mb;
-    std::vector<double> get, get_one, set, find, find_one;
+    std::vector<double> get, get_one, set, find, find_one, kfind, kfind_one;
 };
 
 void printTable(const char* title, const std::vector<Row>& rows) {
     std::printf("\n## %s\n\n", title);
     std::printf("ns per lookup, median of the repeats (min-max).\n\n");
     std::printf("| Keys | Eviction | Engine memory | GET | GET, one at a time | SET of an existing key | "
-                "find() in std::unordered_map | find(), one at a time |\n");
-    std::printf("|---:|---|---:|---:|---:|---:|---:|---:|\n");
+                "find() in std::unordered_map | find(), one at a time | find() in KeyTable | "
+                "KeyTable, one at a time |\n");
+    std::printf("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    auto cell = [](const std::vector<double>& v) { return v.empty() ? std::string("-") : summary(v); };
     for(const Row& r : rows) {
         char mem[32];
         if(r.engine_mb >= 0) std::snprintf(mem, sizeof(mem), "%.1f MB", r.engine_mb);
         else std::snprintf(mem, sizeof(mem), "-");
-        std::printf("| %zu | %s | %s | %s | %s | %s | %s | %s |\n", r.keys, r.policy, mem,
+        std::printf("| %zu | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", r.keys, r.policy, mem,
                     summary(r.get).c_str(), summary(r.get_one).c_str(), summary(r.set).c_str(),
-                    r.find.empty() ? "-" : summary(r.find).c_str(),
-                    r.find_one.empty() ? "-" : summary(r.find_one).c_str());
+                    cell(r.find).c_str(), cell(r.find_one).c_str(),
+                    cell(r.kfind).c_str(), cell(r.kfind_one).c_str());
     }
 }
 
@@ -299,10 +322,23 @@ int main(int argc, char** argv) {
         table.reserve(n);
         for(uint32_t id : order) table.emplace(keyString(id), FakeEntry{});
 
+        // And in a KeyTable, the entries allocated in the same order
+        KeyTable<InlineEntry, InlineKeyOf> ktable;
+        std::vector<InlineEntry*> kentries;
+        kentries.reserve(n);
+        for(uint32_t id : order) {
+            kentries.push_back(InlineEntry::create(keyString(id)));
+            ktable.insert(kentries.back());
+        }
+
         const std::string value = "xxx";
         auto find = [&table](const std::string& key) {
             auto it = table.find(key);
             return it == table.end() ? size_t{0} : static_cast<size_t>(static_cast<unsigned char>(it->second.bytes[0]));
+        };
+        auto kfind = [&ktable](const std::string& key) {
+            InlineEntry* e = ktable.find(key);
+            return e ? static_cast<size_t>(static_cast<unsigned char>(e->fixed[0])) : size_t{0};
         };
 
         for(int dist = 0; dist < 2; dist++) {
@@ -313,7 +349,7 @@ int main(int argc, char** argv) {
 
             std::vector<Row> rows;
             for(size_t p = 0; p < engines.size(); p++) {
-                rows.push_back(Row{n, policyName(opt.policies[p]), engine_mb[p], {}, {}, {}, {}, {}});
+                rows.push_back(Row{n, policyName(opt.policies[p]), engine_mb[p], {}, {}, {}, {}, {}, {}, {}});
             }
             // One repeat's measurements: GET both ways and SET for each
             // engine, and find() both ways
@@ -335,6 +371,8 @@ int main(int argc, char** argv) {
             }
             tasks.push_back([&] { rows[0].find.push_back(nsPerLookup(keys, false, find)); });
             tasks.push_back([&] { rows[0].find_one.push_back(nsPerLookup(keys, true, find)); });
+            tasks.push_back([&] { rows[0].kfind.push_back(nsPerLookup(keys, false, kfind)); });
+            tasks.push_back([&] { rows[0].kfind_one.push_back(nsPerLookup(keys, true, kfind)); });
 
             // Warm up (fault in the pages, fill the caches and TLB), then
             // drop what the warm-up measured
@@ -345,6 +383,8 @@ int main(int argc, char** argv) {
                 row.set.clear();
                 row.find.clear();
                 row.find_one.clear();
+                row.kfind.clear();
+                row.kfind_one.clear();
             }
 
             std::vector<size_t> order_of_tasks(tasks.size());
@@ -363,6 +403,10 @@ int main(int argc, char** argv) {
 
             // The harness alone: copying each key, with no lookup
             if(harness_ns == 0) harness_ns = nsPerLookup(keys, false, [](const std::string& k) { return k.size(); });
+        }
+        for(InlineEntry* e : kentries) {
+            e->~InlineEntry();
+            ::operator delete(e);
         }
         std::fprintf(stderr, "done: %zu keys\n", n);
     }
