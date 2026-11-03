@@ -98,6 +98,14 @@ add_executable(insert_latency
 )
 target_link_libraries(insert_latency Threads::Threads)
 
+# Times lookups in the storage engine as the table outgrows the caches (see bench/README.md)
+add_executable(lookup_latency
+    bench/lookup_latency.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(lookup_latency Threads::Threads)
+
 # Counts heap allocations per request, layer by layer (see bench/README.md)
 add_executable(alloc_count
     bench/alloc_count.cpp

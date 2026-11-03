@@ -10,6 +10,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
 | [`insert_latency.cpp`](insert_latency.cpp) | How long one insert of a new key can take in the storage engine, and every rehash of the hash table (no network) | stdout |
+| [`lookup_latency.cpp`](lookup_latency.cpp) | ns per GET and SET in the storage engine, and per `find()` in a plain `std::unordered_map`, for tables of 1,000 to 4,000,000 keys, with uniform and Zipf keys; lookups independent (as in a pipeline) and one at a time (full latency). The knee where the table outgrows the cache shows the cost of memory latency without hardware counters (no network) | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -31,6 +32,7 @@ python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
 ./build/memory_layout > bench/results/<name>/memory-layout.md
 cmake --build build --target insert_latency && taskset -c 2 ./build/insert_latency 100000 5
+cmake --build build --target lookup_latency && taskset -c 2 ./build/lookup_latency   # about 3 minutes
 cmake --build build --target alloc_count && ./build/alloc_count
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
