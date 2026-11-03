@@ -95,13 +95,20 @@ def read_traces(path):
     return traces
 
 
-def read_expected(path):
-    """{(trace, fraction): misses} from eviction_sim's Markdown table"""
+def read_expected(path, policy):
+    """{(trace, fraction): misses} from eviction_sim's Markdown table, for
+    the rows of one policy, finding the columns by their headers"""
     expected = {}
+    columns = {}
     for line in open(path):
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) >= 6 and re.fullmatch(r"\d+", cells[5] or ""):
-            expected[(cells[0], float(cells[3]))] = int(cells[5])
+        if "Misses" in cells:
+            columns = {name: i for i, name in enumerate(cells)}
+        elif columns and len(cells) == len(columns) and re.fullmatch(r"\d+", cells[columns["Misses"]]):
+            if "Eviction" in columns and cells[columns["Eviction"]] != policy:
+                continue
+            expected[(cells[columns["Trace"]], float(cells[columns["Capacity"]]))] = \
+                int(cells[columns["Misses"]])
     return expected
 
 
@@ -136,7 +143,7 @@ def main():
     args = p.parse_args()
 
     fractions = [float(c) for c in args.capacities.split(",")]
-    expected = read_expected(args.expect) if args.expect else None
+    expected = read_expected(args.expect, args.policy) if args.expect else None
     mismatches = checked = 0
     print("| Trace | Capacity | Keys | Misses (reference) | Misses (engine) |")
     print("|---|---:|---:|---:|---:|")

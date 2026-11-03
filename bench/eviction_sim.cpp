@@ -50,7 +50,12 @@ struct Options {
     int key_column = 2;
     std::string dump_trace;
     std::vector<std::string> traces;
+    std::vector<EvictionPolicy> policies{EvictionPolicy::LRU};
 };
+
+const char* policyName(EvictionPolicy p) {
+    return p == EvictionPolicy::SIEVE ? "sieve" : "lru";
+}
 
 struct Trace {
     std::string name;
@@ -159,8 +164,8 @@ struct SimResult {
     double ns_per_request;
 };
 
-SimResult simulate(const Trace& t, size_t capacity) {
-    InMemoryStorage storage(capacity, nullptr);
+SimResult simulate(const Trace& t, size_t capacity, EvictionPolicy policy) {
+    InMemoryStorage storage(capacity, nullptr, policy);
     std::string key;
     key.reserve(16);
     const std::string value = "x";
@@ -198,6 +203,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if(a == "--universe" && v)   { opt.universe = std::strtoull(v, nullptr, 10); i++; }
         else if(a == "--key-column" && v) { opt.key_column = std::atoi(v); i++; }
         else if(a == "--dump-trace" && v) { opt.dump_trace = v; i++; }
+        else if(a == "--eviction" && v) {
+            std::string e = v;
+            opt.policies.clear();
+            if(e == "lru" || e == "both") opt.policies.push_back(EvictionPolicy::LRU);
+            if(e == "sieve" || e == "both") opt.policies.push_back(EvictionPolicy::SIEVE);
+            if(opt.policies.empty()) return false;
+            i++;
+        }
         else if(a.rfind("--", 0) == 0) return false;
         else opt.traces.push_back(a);
     }
@@ -214,7 +227,7 @@ int main(int argc, char** argv) {
     Options opt;
     if(!parseArgs(argc, argv, opt)) {
         std::fprintf(stderr, "usage: %s [--capacities 0.001,0.01,0.1] [--requests N] [--universe N]\n"
-                             "       [--key-column N] [--dump-trace PATH] TRACE...\n"
+                             "       [--key-column N] [--dump-trace PATH] [--eviction lru|sieve|both] TRACE...\n"
                              "TRACE: zipf:ALPHA | zipfscan:ALPHA | csv:PATH\n", argv[0]);
         return 2;
     }
@@ -223,8 +236,8 @@ int main(int argc, char** argv) {
     std::printf("Each request is a GET, and a miss is followed by a SET of the key. Capacity "
                 "in keys, as a fraction of the trace's distinct keys. Synthetic traces: %zu "
                 "requests over %zu keys.\n\n", opt.requests, opt.universe);
-    std::printf("| Trace | Requests | Distinct keys | Capacity | Keys | Misses | Miss ratio | ns per request |\n");
-    std::printf("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    std::printf("| Trace | Eviction | Requests | Distinct keys | Capacity | Keys | Misses | Miss ratio | ns per request |\n");
+    std::printf("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
 
     // A default-constructed ofstream converts to true, so test the option,
     // not the stream, to decide whether to write the trace
@@ -256,12 +269,14 @@ int main(int argc, char** argv) {
         }
         for(double fraction : opt.capacities) {
             size_t capacity = std::max<size_t>(1, static_cast<size_t>(fraction * static_cast<double>(t.distinct)));
-            SimResult r = simulate(t, capacity);
-            std::printf("| %s | %zu | %zu | %g | %zu | %zu | %.4f | %.0f |\n", t.name.c_str(),
-                        t.ids.size(), t.distinct, fraction, r.capacity, r.misses,
-                        static_cast<double>(r.misses) / static_cast<double>(t.ids.size()),
-                        r.ns_per_request);
-            std::fflush(stdout);
+            for(EvictionPolicy policy : opt.policies) {
+                SimResult r = simulate(t, capacity, policy);
+                std::printf("| %s | %s | %zu | %zu | %g | %zu | %zu | %.4f | %.0f |\n", t.name.c_str(),
+                            policyName(policy), t.ids.size(), t.distinct, fraction, r.capacity,
+                            r.misses, static_cast<double>(r.misses) / static_cast<double>(t.ids.size()),
+                            r.ns_per_request);
+                std::fflush(stdout);
+            }
         }
     }
     if(dumping && !dump.flush()) {

@@ -14,6 +14,7 @@
 struct ServerConfig {
     int port = 6379;
     size_t maxKeys = 10000;
+    EvictionPolicy eviction = EvictionPolicy::LRU;
     bool appendOnly = true;
     std::string appendFilename = "appendonly.aof";
     // Redis's default: a power cut loses at most about a second of writes
@@ -25,7 +26,9 @@ struct ServerConfig {
 static void printUsage(std::ostream& out) {
     out << "Usage: mini_redis_server [options]\n"
            "  --port <1-65535>         TCP port to listen on (default 6379)\n"
-           "  --maxkeys <n>            Keys to hold before LRU eviction (default 10000)\n"
+           "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
+           "  --eviction <lru|sieve>   Which key a full server evicts: the least recently\n"
+           "                           used, or SIEVE's choice (NSDI 2024) (default lru)\n"
            "  --appendonly <yes|no>    Log writes to the AOF and replay it at startup (default yes)\n"
            "  --appendfilename <path>  AOF file (default appendonly.aof)\n"
            "  --appendfsync <always|everysec|no>\n"
@@ -57,8 +60,8 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         std::string option = argv[i];
         if(option == "--help" || option == "-h") return ParseResult::Help;
 
-        if(option != "--port" && option != "--maxkeys" && option != "--appendonly" &&
-           option != "--appendfilename" && option != "--appendfsync" &&
+        if(option != "--port" && option != "--maxkeys" && option != "--eviction" &&
+           option != "--appendonly" && option != "--appendfilename" && option != "--appendfsync" &&
            option != "--maxclients" && option != "--poller") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
             return ParseResult::Error;
@@ -75,6 +78,10 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         } else if(option == "--maxkeys") {
             // 0 is rejected: eviction assumes at least one key fits
             ok = parseNumber<size_t>(value, 1, SIZE_MAX, config.maxKeys);
+        } else if(option == "--eviction") {
+            if(value == "lru") config.eviction = EvictionPolicy::LRU;
+            else if(value == "sieve") config.eviction = EvictionPolicy::SIEVE;
+            else ok = false;
         } else if(option == "--appendonly") {
             ok = (value == "yes" || value == "no");
             if(ok) config.appendOnly = (value == "yes");
@@ -122,7 +129,7 @@ int main(int argc, char* argv[]) {
     }
     AOFLogger* aofLogger = aof ? &*aof : nullptr;
 
-    InMemoryStorage storage(config.maxKeys, aofLogger);
+    InMemoryStorage storage(config.maxKeys, aofLogger, config.eviction);
 
     // Restore state from previous session
     if(aofLogger) {
@@ -143,7 +150,9 @@ int main(int argc, char* argv[]) {
 
     const char* fsync_name = config.appendFsync == AOFLogger::FsyncPolicy::Always ? "always"
                            : config.appendFsync == AOFLogger::FsyncPolicy::EverySecond ? "everysec" : "no";
-    std::cout << "Max keys: " << config.maxKeys << " | AOF: "
+    std::cout << "Max keys: " << config.maxKeys
+              << " (eviction: " << (config.eviction == EvictionPolicy::SIEVE ? "sieve" : "lru") << ")"
+              << " | AOF: "
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
     Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);

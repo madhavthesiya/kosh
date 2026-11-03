@@ -17,7 +17,11 @@
 //
 // Build: cmake --build build-bench --target lookup_latency
 // Run:   taskset -c 2 ./build-bench/lookup_latency [--sizes 1000,100000] [--ops N]
-//            [--repeats R] [--dist uniform|zipf|both] [--alpha A]
+//            [--repeats R] [--dist uniform|zipf|both] [--alpha A] [--eviction lru|sieve|both]
+//
+// With --eviction both, one engine per policy holds the same keys, and the
+// measurements of both are interleaved within each repeat, so they compare
+// in the same binary, at the same moment.
 
 #include "../InMemoryStorage.h"
 
@@ -27,6 +31,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -67,7 +73,12 @@ struct Options {
     bool uniform = true;
     bool zipf = true;
     double alpha = 0.99;    // YCSB's default Zipf constant
+    std::vector<EvictionPolicy> policies{EvictionPolicy::LRU};
 };
+
+const char* policyName(EvictionPolicy p) {
+    return p == EvictionPolicy::SIEVE ? "sieve" : "lru";
+}
 
 // Key ids, uniform over [0, n)
 std::vector<uint32_t> uniformIds(size_t n, size_t ops, uint64_t seed) {
@@ -201,9 +212,17 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.uniform = (d == "uniform" || d == "both");
             opt.zipf = (d == "zipf" || d == "both");
             i++;
+        } else if(a == "--eviction" && v) {
+            std::string e = v;
+            opt.policies.clear();
+            if(e == "lru" || e == "both") opt.policies.push_back(EvictionPolicy::LRU);
+            if(e == "sieve" || e == "both") opt.policies.push_back(EvictionPolicy::SIEVE);
+            if(opt.policies.empty()) return false;
+            i++;
         } else {
             std::fprintf(stderr, "usage: %s [--sizes 1000,100000] [--ops N] [--repeats R] "
-                                 "[--dist uniform|zipf|both] [--alpha A]\n", argv[0]);
+                                 "[--dist uniform|zipf|both] [--alpha A] [--eviction lru|sieve|both]\n",
+                         argv[0]);
             return false;
         }
     }
@@ -213,9 +232,11 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     return opt.ops > 0 && opt.repeats > 0 && (opt.uniform || opt.zipf) && !opt.sizes.empty();
 }
 
-// The rows of one table size, for one key distribution
+// The rows of one table size, for one key distribution: one per eviction
+// policy. find() doesn't depend on the policy, so only the first row has it.
 struct Row {
     size_t keys;
+    const char* policy;
     double engine_mb;
     std::vector<double> get, get_one, set, find, find_one;
 };
@@ -223,16 +244,17 @@ struct Row {
 void printTable(const char* title, const std::vector<Row>& rows) {
     std::printf("\n## %s\n\n", title);
     std::printf("ns per lookup, median of the repeats (min-max).\n\n");
-    std::printf("| Keys | Engine memory | GET | GET, one at a time | SET of an existing key | "
+    std::printf("| Keys | Eviction | Engine memory | GET | GET, one at a time | SET of an existing key | "
                 "find() in std::unordered_map | find(), one at a time |\n");
-    std::printf("|---:|---:|---:|---:|---:|---:|---:|\n");
+    std::printf("|---:|---|---:|---:|---:|---:|---:|---:|\n");
     for(const Row& r : rows) {
         char mem[32];
         if(r.engine_mb >= 0) std::snprintf(mem, sizeof(mem), "%.1f MB", r.engine_mb);
         else std::snprintf(mem, sizeof(mem), "-");
-        std::printf("| %zu | %s | %s | %s | %s | %s | %s |\n", r.keys, mem,
+        std::printf("| %zu | %s | %s | %s | %s | %s | %s | %s |\n", r.keys, r.policy, mem,
                     summary(r.get).c_str(), summary(r.get_one).c_str(), summary(r.set).c_str(),
-                    summary(r.find).c_str(), summary(r.find_one).c_str());
+                    r.find.empty() ? "-" : summary(r.find).c_str(),
+                    r.find_one.empty() ? "-" : summary(r.find_one).c_str());
     }
 }
 
@@ -256,30 +278,28 @@ int main(int argc, char** argv) {
         std::iota(order.begin(), order.end(), 0);
         std::shuffle(order.begin(), order.end(), std::mt19937_64(n));
 
-        double engine_mb = -1;
+        // One engine per eviction policy, filled the same way
+        std::vector<std::unique_ptr<InMemoryStorage>> engines;
+        std::vector<double> engine_mb;
+        for(EvictionPolicy policy : opt.policies) {
 #ifdef HAVE_MALLINFO2
-        size_t before = heapInUse();
+            size_t before = heapInUse();
 #endif
-        InMemoryStorage storage(n, nullptr);
-        for(uint32_t id : order) storage.set(keyString(id), "xxx");
+            engines.push_back(std::make_unique<InMemoryStorage>(n, nullptr, policy));
+            for(uint32_t id : order) engines.back()->set(keyString(id), "xxx");
 #ifdef HAVE_MALLINFO2
-        engine_mb = static_cast<double>(heapInUse() - before) / 1e6;
+            engine_mb.push_back(static_cast<double>(heapInUse() - before) / 1e6);
+#else
+            engine_mb.push_back(-1);
 #endif
+        }
 
         // The same keys in a plain table, sized up front like the engine's
         std::unordered_map<std::string, FakeEntry> table;
         table.reserve(n);
         for(uint32_t id : order) table.emplace(keyString(id), FakeEntry{});
 
-        auto get = [&storage](const std::string& key) {
-            size_t len = 0;
-            storage.readString(key, [&len](const std::string& v) { len = v.size(); });
-            return len;
-        };
         const std::string value = "xxx";
-        auto set = [&storage, &value](const std::string& key) {
-            return static_cast<size_t>(storage.set(key, value).success);
-        };
         auto find = [&table](const std::string& key) {
             auto it = table.find(key);
             return it == table.end() ? size_t{0} : static_cast<size_t>(static_cast<unsigned char>(it->second.bytes[0]));
@@ -291,26 +311,55 @@ int main(int argc, char** argv) {
             auto ids = dist == 0 ? uniformIds(n, opt.ops, seed) : zipfIds(n, opt.ops, opt.alpha, seed);
             auto keys = formatKeys(ids);
 
-            // Warm up: fault in the pages and fill the caches and TLB
-            nsPerLookup(keys, false, get);
-            nsPerLookup(keys, false, find);
-
-            Row row{n, engine_mb, {}, {}, {}, {}, {}};
-            for(int r = 0; r < opt.repeats; r++) {
-                // A different order of the five measurements each repeat, so
-                // none is always the one that runs after the same neighbour
-                int first = r % 5;
-                for(int k = 0; k < 5; k++) {
-                    switch((first + k) % 5) {
-                        case 0: row.get.push_back(nsPerLookup(keys, false, get)); break;
-                        case 1: row.get_one.push_back(nsPerLookup(keys, true, get)); break;
-                        case 2: row.set.push_back(nsPerLookup(keys, false, set)); break;
-                        case 3: row.find.push_back(nsPerLookup(keys, false, find)); break;
-                        case 4: row.find_one.push_back(nsPerLookup(keys, true, find)); break;
-                    }
-                }
+            std::vector<Row> rows;
+            for(size_t p = 0; p < engines.size(); p++) {
+                rows.push_back(Row{n, policyName(opt.policies[p]), engine_mb[p], {}, {}, {}, {}, {}});
             }
-            (dist == 0 ? uniform_rows : zipf_rows).push_back(std::move(row));
+            // One repeat's measurements: GET both ways and SET for each
+            // engine, and find() both ways
+            std::vector<std::function<void()>> tasks;
+            for(size_t p = 0; p < engines.size(); p++) {
+                InMemoryStorage* e = engines[p].get();
+                Row* row = &rows[p];
+                auto get = [e](const std::string& key) {
+                    size_t len = 0;
+                    e->readString(key, [&len](const std::string& v) { len = v.size(); });
+                    return len;
+                };
+                auto set = [e, &value](const std::string& key) {
+                    return static_cast<size_t>(e->set(key, value).success);
+                };
+                tasks.push_back([&keys, row, get] { row->get.push_back(nsPerLookup(keys, false, get)); });
+                tasks.push_back([&keys, row, get] { row->get_one.push_back(nsPerLookup(keys, true, get)); });
+                tasks.push_back([&keys, row, set] { row->set.push_back(nsPerLookup(keys, false, set)); });
+            }
+            tasks.push_back([&] { rows[0].find.push_back(nsPerLookup(keys, false, find)); });
+            tasks.push_back([&] { rows[0].find_one.push_back(nsPerLookup(keys, true, find)); });
+
+            // Warm up (fault in the pages, fill the caches and TLB), then
+            // drop what the warm-up measured
+            for(auto& task : tasks) task();
+            for(Row& row : rows) {
+                row.get.clear();
+                row.get_one.clear();
+                row.set.clear();
+                row.find.clear();
+                row.find_one.clear();
+            }
+
+            std::vector<size_t> order_of_tasks(tasks.size());
+            std::iota(order_of_tasks.begin(), order_of_tasks.end(), 0);
+            for(int r = 0; r < opt.repeats; r++) {
+                // Rotate the order each repeat, and reverse it every other
+                // one: rotation alone keeps neighbours in the same order, so
+                // a drifting machine would favour the same one of each pair
+                std::vector<size_t> now = order_of_tasks;
+                std::rotate(now.begin(), now.begin() + static_cast<std::ptrdiff_t>(r % now.size()), now.end());
+                if(r % 2) std::reverse(now.begin(), now.end());
+                for(size_t t : now) tasks[t]();
+            }
+            auto& out = dist == 0 ? uniform_rows : zipf_rows;
+            for(Row& row : rows) out.push_back(std::move(row));
 
             // The harness alone: copying each key, with no lookup
             if(harness_ns == 0) harness_ns = nsPerLookup(keys, false, [](const std::string& k) { return k.size(); });

@@ -171,6 +171,173 @@ TEST(test_table_presize_is_capped) {
     ASSERT_EQ(s.get("k").value, "v");
 }
 
+// ==================== SIEVE Eviction ====================
+
+TEST(test_sieve_evicts_first_unvisited_key) {
+    // A B C, then A is read; D needs room. The hand starts at the oldest (A),
+    // finds it visited, clears the bit and moves on to B, which goes.
+    InMemoryStorage s(3, nullptr, EvictionPolicy::SIEVE);
+    s.set("A", "1");
+    s.set("B", "2");
+    s.set("C", "3");
+    s.get("A");
+    s.set("D", "4");
+    ASSERT_TRUE(s.exists("A").success);
+    ASSERT_FALSE(s.exists("B").success);
+    ASSERT_TRUE(s.exists("C").success);
+    ASSERT_TRUE(s.exists("D").success);
+}
+
+TEST(test_sieve_differs_from_lru) {
+    // Both keys read, B then A. LRU evicts B, the less recently used. SIEVE's
+    // hand clears A (the oldest), then B, wraps round and evicts A: a hit
+    // never moves a key, so the oldest goes although it was read last.
+    for(EvictionPolicy policy : {EvictionPolicy::LRU, EvictionPolicy::SIEVE}) {
+        InMemoryStorage s(2, nullptr, policy);
+        s.set("A", "1");
+        s.set("B", "2");
+        s.get("B");
+        s.get("A");
+        s.set("C", "3");
+        bool sieve = policy == EvictionPolicy::SIEVE;
+        ASSERT_EQ(s.exists("A").success, !sieve);
+        ASSERT_EQ(s.exists("B").success, sieve);
+        ASSERT_TRUE(s.exists("C").success);
+    }
+}
+
+TEST(test_sieve_hand_moves_off_a_deleted_key) {
+    // A B C, a read of A, then D: the hand clears A, evicts B and stops on C.
+    // Deleting C must move the hand on, to D: left on the erased node it
+    // would dangle (ASan reports that), and sent back to the oldest it would
+    // evict A next instead of D.
+    InMemoryStorage s(3, nullptr, EvictionPolicy::SIEVE);
+    s.set("A", "1");
+    s.set("B", "2");
+    s.set("C", "3");
+    s.get("A");
+    s.set("D", "4");            // evicts B; the hand is on C
+    ASSERT_FALSE(s.exists("B").success);
+    s.del("C");                 // the hand moves to D
+    s.set("E", "5");            // there's room: A, D, E
+    s.set("F", "6");            // full: the hand is on D, unvisited, so D goes
+    ASSERT_FALSE(s.exists("D").success);
+    ASSERT_TRUE(s.exists("A").success);
+    ASSERT_TRUE(s.exists("E").success);
+    ASSERT_TRUE(s.exists("F").success);
+}
+
+// Which keys a cache holds under each policy, written differently from the
+// engine on purpose: a vector with the oldest key first and SIEVE's hand as
+// an index, where the engine uses list iterators. Slow (every step is a
+// linear search), and fine for a few dozen keys.
+struct EvictionModel {
+    EvictionPolicy policy;
+    size_t capacity;
+    std::vector<std::string> queue;         // oldest first, newest last
+    std::map<std::string, bool> visited;    // the keys held, and their bits
+    long hand = -1;                         // index into queue; -1: start from the oldest
+
+    bool has(const std::string& k) const { return visited.count(k) > 0; }
+    size_t indexOf(const std::string& k) const {
+        return static_cast<size_t>(std::find(queue.begin(), queue.end(), k) - queue.begin());
+    }
+    void hit(const std::string& k) {
+        if(policy == EvictionPolicy::SIEVE) {
+            visited[k] = true;
+        } else {                                // LRU: to the newest end
+            queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(indexOf(k)));
+            queue.push_back(k);
+        }
+    }
+    // Later entries shift down one. A hand on a later key follows it; a hand
+    // on the removed key stays at i, which now holds the next newer key, or
+    // nothing if the newest was removed.
+    void remove(size_t i) {
+        if(hand > static_cast<long>(i)) hand--;
+        visited.erase(queue[i]);
+        queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
+        if(hand == static_cast<long>(queue.size())) hand = -1;
+    }
+    void evict() {
+        size_t i = 0;                           // LRU: the oldest
+        if(policy == EvictionPolicy::SIEVE) {
+            i = hand >= 0 ? static_cast<size_t>(hand) : 0;
+            while(visited[queue[i]]) {
+                visited[queue[i]] = false;
+                i = (i + 1) % queue.size();     // towards the newest, wrapping round
+            }
+            hand = static_cast<long>(i);
+        }
+        remove(i);
+    }
+    void set(const std::string& k) {
+        if(has(k)) return hit(k);
+        if(queue.size() >= capacity) evict();
+        queue.push_back(k);
+        visited[k] = false;
+    }
+    bool get(const std::string& k) {
+        if(!has(k)) return false;
+        hit(k);
+        return true;
+    }
+    void del(const std::string& k) {
+        if(has(k)) remove(indexOf(k));
+    }
+};
+
+TEST(test_eviction_matches_a_model) {
+    // Random GETs, SETs and DELs of 30 keys in room for 8, under each policy.
+    // After every operation, every key must be present in the engine exactly
+    // when it is in the model. EXISTS doesn't count as a use, so checking
+    // doesn't change what is evicted.
+    for(EvictionPolicy policy : {EvictionPolicy::LRU, EvictionPolicy::SIEVE}) {
+        InMemoryStorage s(8, nullptr, policy);
+        EvictionModel model{policy, 8, {}, {}, -1};
+        std::mt19937 rng(policy == EvictionPolicy::SIEVE ? 2 : 1);
+        for(int op = 0; op < 50000; op++) {
+            std::string k = "k" + std::to_string(rng() % 30);
+            unsigned dice = rng() % 100;
+            if(dice < 45) {
+                ASSERT_EQ(s.get(k).success, model.get(k));
+            } else if(dice < 90) {
+                s.set(k, "v");
+                model.set(k);
+            } else {
+                s.del(k);
+                model.del(k);
+            }
+            for(int j = 0; j < 30; j++) {
+                std::string key = "k" + std::to_string(j);
+                if(s.exists(key).success != model.has(key)) {
+                    throw std::runtime_error(std::string(policy == EvictionPolicy::SIEVE ? "SIEVE" : "LRU") +
+                                             ", operation " + std::to_string(op) + ": " + key +
+                                             " is held by one of engine and model only");
+                }
+            }
+        }
+    }
+}
+
+TEST(test_load_file_with_a_key_twice) {
+    // A key listed twice used to leave its first queue node behind with no
+    // entry; evicting that node erased data_.end(), undefined behaviour.
+    const std::string filename = "test_key_twice.dat";
+    {
+        std::ofstream out(filename);
+        out << "S|a=1\nS|a=2\nS|b=3\n";
+    }
+    InMemoryStorage s(2);
+    ASSERT_TRUE(s.loadFromFile(filename).success);
+    ASSERT_EQ(s.get("a").value, "2");
+    s.set("c", "4");            // evicts, through every node in the queue
+    s.set("d", "5");
+    s.set("e", "6");
+    ASSERT_TRUE(s.exists("e").success);
+    std::remove(filename.c_str());
+}
+
 // ==================== TTL Expiration ====================
 
 TEST(test_ttl_expiration) {
@@ -1971,6 +2138,13 @@ int main() {
     RUN_TEST(test_capacity_zero_is_rejected);
     RUN_TEST(test_table_sized_for_capacity);
     RUN_TEST(test_table_presize_is_capped);
+
+    std::cout << "\n[SIEVE Eviction]\n";
+    RUN_TEST(test_sieve_evicts_first_unvisited_key);
+    RUN_TEST(test_sieve_differs_from_lru);
+    RUN_TEST(test_sieve_hand_moves_off_a_deleted_key);
+    RUN_TEST(test_eviction_matches_a_model);
+    RUN_TEST(test_load_file_with_a_key_twice);
 
     std::cout << "\n[TTL Expiration]\n";
     RUN_TEST(test_ttl_expiration);

@@ -1,5 +1,6 @@
 #include "InMemoryStorage.h"
 #include "RespParser.h"
+#include <cassert>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -49,8 +50,8 @@ int64_t InMemoryStorage::unixTimeMs() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof)
-    : capacity_(capacity), aof_(aof) {
+InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof, EvictionPolicy policy)
+    : policy_(policy), hand_(queue_.end()), capacity_(capacity), aof_(aof) {
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
@@ -144,13 +145,12 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         } else if(getDataType(it->second) != expected) {
             return nullptr;     // type mismatch
         } else {
-            touchLRU(it->second);
+            markUsed(it->second);
             return &it->second; // existing entry of correct type
         }
     }
     // Create new entry
     makeRoomForNewKey();
-    lru_list_.push_front(key);
     CacheEntry entry;
     switch(expected) {
         case DataType::STRING: entry.value = std::string(); break;
@@ -159,8 +159,7 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
         case DataType::HASH:   entry.value = std::unordered_map<std::string,std::string>(); break;
     }
     entry.has_expiry = false;
-    entry.lru_it = lru_list_.begin();
-    return &data_.emplace(key, std::move(entry)).first->second;
+    return &insertEntry(key, std::move(entry))->second;
 }
 
 // ==================== Key Operations ====================
@@ -274,17 +273,15 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
             // Overwrite: replace value with string regardless of current type
             it->second.value = value;
             setExpiry(it, expiry);
-            touchLRU(it->second);
+            markUsed(it->second);
             return Result::ok();
         }
     }
     makeRoomForNewKey();
-    lru_list_.push_front(key);
     CacheEntry entry;
     entry.value = value;    // stores as std::string in the variant
     entry.has_expiry = false;
-    entry.lru_it = lru_list_.begin();
-    setExpiry(data_.emplace(key, std::move(entry)).first, expiry);
+    setExpiry(insertEntry(key, std::move(entry)), expiry);
     return Result::ok();
 }
 
@@ -329,7 +326,7 @@ Result InMemoryStorage::lpop(const std::string& key){
     list.pop_front();
     // Auto-delete empty lists (same as real Redis)
     if(list.empty()) removeKey(key);
-    else touchLRU(*entry);
+    else markUsed(*entry);
     logAOF({"LPOP", key});
     return Result::ok(val);
 }
@@ -348,7 +345,7 @@ Result InMemoryStorage::rpop(const std::string& key){
     std::string val = list.back();
     list.pop_back();
     if(list.empty()) removeKey(key);
-    else touchLRU(*entry);
+    else markUsed(*entry);
     logAOF({"RPOP", key});
     return Result::ok(val);
 }
@@ -415,7 +412,7 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(set.erase(m));
     }
     if(set.empty()) removeKey(key);
-    else touchLRU(*entry);
+    else markUsed(*entry);
     logAOF({"SREM", key}, members);
     return Result::ok(removed);
 }
@@ -492,7 +489,7 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
         removed += static_cast<int>(hash.erase(f));
     }
     if(hash.empty()) removeKey(key);
-    else touchLRU(*entry);
+    else markUsed(*entry);
     logAOF({"HDEL", key}, fields);
     return Result::ok(removed);
 }
@@ -543,7 +540,8 @@ Result InMemoryStorage::loadFromFile(const std::string& filename){
     std::ifstream in(filename);
     if(!in.is_open()) return Result::fail(ErrorCode::FILE_ERROR);
     data_.clear();
-    lru_list_.clear();
+    queue_.clear();
+    hand_ = queue_.end();
     expiry_index_.clear();
 
     std::string line;
@@ -562,17 +560,22 @@ Result InMemoryStorage::loadFromFile(const std::string& filename){
                 value = line.substr(pos + 1);
             }
         }
-        if(!key.empty()) {
-            lru_list_.push_back(key);
+        if(key.empty()) continue;
+        // A key listed twice: the later value wins. This used to replace the
+        // entry and leave the first queue node behind, keyless; evicting that
+        // node later erased the live key's entry, then data_.end().
+        auto it = data_.find(key);
+        if(it != data_.end()) {
+            it->second.value = value;
+        } else {
             CacheEntry entry;
             entry.value = value;
             entry.has_expiry = false;
-            entry.lru_it = std::prev(lru_list_.end());
-            data_[key] = std::move(entry);
+            insertEntry(key, std::move(entry), /*newest=*/false);   // file order: first line newest
         }
     }
     in.close();
-    while(data_.size() > capacity_) evictLRU();
+    while(data_.size() > capacity_) evictOne();
     return Result::ok();
 }
 
@@ -637,26 +640,63 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
     return commands;
 }
 
-// ==================== LRU Helpers ====================
+// ==================== Eviction ====================
 
-// splice() relinks the entry's existing list node at the front: O(1), no
-// allocation, no copy of the key, and entry.lru_it stays valid. It used to
-// look the key up again (data_[key]), erase the node and push a new one: a
-// second hash lookup, a free and two allocations (the node, and the key,
-// which at 16 bytes is one too long for the small-string buffer) on every
-// GET and every SET of an existing key.
-void InMemoryStorage::touchLRU(CacheEntry& entry){
-    lru_list_.splice(lru_list_.begin(), lru_list_, entry.lru_it);
+// The queue node goes in first, so if adding the entry throws (out of
+// memory), removing the node leaves both exactly as they were.
+InMemoryStorage::DataMap::iterator InMemoryStorage::insertEntry(const std::string& key,
+                                                               CacheEntry entry, bool newest){
+    Queue::iterator node = queue_.insert(newest ? queue_.begin() : queue_.end(), QueueNode{key, nullptr});
+    std::pair<DataMap::iterator, bool> added;
+    try {
+        added = data_.emplace(key, std::move(entry));
+    } catch(...) {
+        queue_.erase(node);
+        throw;
+    }
+    assert(added.second && "insertEntry: the key is already stored");
+    added.first->second.queue_it = node;
+    node->entry = &added.first->second;
+    return added.first;
+}
+
+// A hit.
+// - LRU: splice() relinks the key's node at the front: O(1), no allocation.
+//   But it writes the node and both its neighbours, which a big table rarely
+//   has in the cache: the profile's 10.8% of GET at pipeline 16.
+// - SIEVE: sets the key's visited bit, in the entry the lookup has just
+//   read, so a hit touches no other memory.
+void InMemoryStorage::markUsed(CacheEntry& entry){
+    if(policy_ == EvictionPolicy::SIEVE) entry.visited = true;
+    else queue_.splice(queue_.begin(), queue_, entry.queue_it);
+}
+
+// SIEVE's choice (Zhang et al., NSDI 2024). The hand walks from the oldest
+// key towards the newest, wrapping round, and clears every visited bit it
+// passes; the first key whose bit is already clear is evicted. The keys it
+// passes keep their places (CLOCK would move them to the front), so new keys
+// that aren't used again leave soon, and popular ones settle near the oldest
+// end. Each step clears a bit that a hit set, so a walk is short on average.
+// The hand is left on the victim; eraseEntry() moves it on.
+InMemoryStorage::Queue::iterator InMemoryStorage::sieveVictim(){
+    Queue::iterator obj = hand_ != queue_.end() ? hand_ : std::prev(queue_.end());
+    while(obj->entry->visited) {
+        obj->entry->visited = false;
+        obj = obj == queue_.begin() ? std::prev(queue_.end()) : std::prev(obj);
+    }
+    hand_ = obj;
+    return obj;
 }
 
 // Evictions and expirations are removals the server decides on its own, so
 // each is logged as a DEL, as Redis does. Replay can't repeat these decisions:
-// GETs aren't logged, so its LRU order differs, and it expires nothing until
-// loading is done (see setLoading). Without the DELs, a restart could bring
-// back keys the server had dropped and lose others it still had.
+// GETs aren't logged, so its eviction order differs, and it expires nothing
+// until loading is done (see setLoading). Without the DELs, a restart could
+// bring back keys the server had dropped and lose others it still had.
 
-void InMemoryStorage::evictLRU(){
-    std::string key = lru_list_.back();     // a copy: erasing removes the original
+void InMemoryStorage::evictOne(){
+    Queue::iterator victim = policy_ == EvictionPolicy::SIEVE ? sieveVictim() : std::prev(queue_.end());
+    std::string key = victim->key;     // a copy: erasing removes the original
     eraseEntry(data_.find(key));
     logAOF({"DEL", key});
 }
@@ -670,7 +710,7 @@ void InMemoryStorage::expireKey(const std::string& key){
 // server's evictions from their DEL records instead of choosing its own.
 void InMemoryStorage::makeRoomForNewKey(){
     if(loading_ || data_.size() < capacity_) return;    // no clock read on the common path
-    // Expired keys go before any live key, wherever they are in the LRU order.
+    // Expired keys go before any live key, wherever they are in the queue.
     // Only as many as are needed: each insert does a bounded amount of work.
     ExpiryTime now = steadyNowMs();
     while(data_.size() >= capacity_ && !expiry_index_.empty() &&
@@ -678,7 +718,7 @@ void InMemoryStorage::makeRoomForNewKey(){
         std::string key = *expiry_index_.begin()->second;   // a copy, as above
         expireKey(key);
     }
-    while(data_.size() >= capacity_) evictLRU();
+    while(data_.size() >= capacity_) evictOne();
 }
 
 void InMemoryStorage::setLoading(bool loading){
@@ -689,7 +729,7 @@ void InMemoryStorage::setLoading(bool loading){
     // key and then rebuild it from its later records alone, a wrong value
     // rather than a missing one, so evict only once everything is loaded.
     if(!loading_) {
-        while(data_.size() > capacity_) evictLRU();
+        while(data_.size() > capacity_) evictOne();
     }
 }
 
@@ -721,6 +761,13 @@ void InMemoryStorage::setExpiry(DataMap::iterator it, std::optional<ExpiryTime> 
 void InMemoryStorage::eraseEntry(DataMap::iterator it){
     // Out of the index first: it points at the key that erase() destroys
     if(it->second.has_expiry) expiry_index_.erase({it->second.expiry_time, &it->first});
-    lru_list_.erase(it->second.lru_it);
+    // Every removal comes through here (eviction, DEL, expiry, an emptied
+    // list), so this is the one place SIEVE's hand needs fixing: off the
+    // removed key, to its neighbour towards the newest, or back to the start
+    // (the oldest) if it was the newest. After an eviction that is exactly
+    // where the paper leaves the hand.
+    Queue::iterator node = it->second.queue_it;
+    if(node == hand_) hand_ = node == queue_.begin() ? queue_.end() : std::prev(node);
+    queue_.erase(node);
     data_.erase(it);
 }

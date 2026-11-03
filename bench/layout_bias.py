@@ -50,15 +50,19 @@ def parse_args():
 
 
 def get_ns(output):
-    """{keys: GET ns} from lookup_latency's uniform table"""
+    """{keys: GET ns} from lookup_latency's uniform table, finding the
+    columns by their headers"""
     result = {}
     in_uniform = False
+    columns = {}
     for line in output.splitlines():
         if line.startswith("## "):
             in_uniform = line.startswith("## Uniform")
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if in_uniform and len(cells) >= 3 and re.fullmatch(r"\d+", cells[0]):
-            result[int(cells[0])] = float(cells[2].split()[0])
+        if cells and cells[0] == "Keys":
+            columns = {name: i for i, name in enumerate(cells)}
+        elif in_uniform and columns and re.fullmatch(r"\d+", cells[0]):
+            result[int(cells[0])] = float(cells[columns["GET"]].split()[0])
     return result
 
 
