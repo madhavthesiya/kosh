@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
-#include <list>
 #include <set>
 #include <deque>
 #include <optional>
@@ -121,29 +120,30 @@ class InMemoryStorage final : public StorageInterface {
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;
 
-        // Every key has a node in the eviction queue, newest at the front.
-        // The node points back at the key's entry, so SIEVE's hand can read
-        // the visited bits without a hash lookup per step. The pointer stays
-        // valid: unordered_map never moves its elements, even to rehash.
-        struct CacheEntry;
-        struct QueueNode {
-            std::string key;
-            CacheEntry* entry;
-        };
-        using Queue = std::list<QueueNode>;
-
+        // The eviction queue runs through the entries themselves (an
+        // intrusive list), newest at the front: no node of its own to
+        // allocate, and no second copy of the key. The links, and each
+        // entry's pointer to its own key, stay valid: unordered_map never
+        // moves its elements, even to rehash.
         struct CacheEntry {
             ValueType value;        // std::variant — holds String, List, Set, or Hash
             bool has_expiry;
             bool visited = false;   // SIEVE: used since the hand last passed it
             ExpiryTime expiry_time;
-            Queue::iterator queue_it;
+            CacheEntry* newer = nullptr;        // towards the front of the queue
+            CacheEntry* older = nullptr;        // towards the back
+            const std::string* key = nullptr;   // this entry's key in data_
         };
         using DataMap = std::unordered_map<std::string, CacheEntry>;
 
-        // Adds a key that isn't in data_ yet, with its queue node: at the
-        // front (the newest), or at the back when `newest` is false
+        // Adds a key that isn't in data_ yet, and links it into the queue: at
+        // the front (the newest), or at the back when `newest` is false
         DataMap::iterator insertEntry(const std::string& key, CacheEntry entry, bool newest = true);
+
+        // The queue's links
+        void linkNewest(CacheEntry& entry);
+        void linkOldest(CacheEntry& entry);
+        void unlink(CacheEntry& entry);
 
         // Every change to an entry's expiry and every removal goes through
         // these, so the expiry index stays in step with data_
@@ -153,7 +153,7 @@ class InMemoryStorage final : public StorageInterface {
         // Eviction helpers
         void markUsed(CacheEntry& entry);               // a hit, for the eviction policy
         void evictOne();                                // removes and logs the policy's choice
-        Queue::iterator sieveVictim();                  // SIEVE's choice; leaves the hand on it
+        CacheEntry* sieveVictim();                      // SIEVE's choice; leaves the hand on it
         void makeRoomForNewKey();                       // expired keys first, then evictOne()
 
         // Expiry helpers
@@ -187,11 +187,12 @@ class InMemoryStorage final : public StorageInterface {
                     const std::vector<std::pair<std::string, std::string>>& pairs);
 
         DataMap data_;
-        Queue queue_;
+        CacheEntry* newest_ = nullptr;      // the front of the queue
+        CacheEntry* oldest_ = nullptr;      // the back
         EvictionPolicy policy_;
-        // SIEVE's hand: the next key it looks at, or queue_.end() to start
-        // from the oldest. Never points at a removed key (see eraseEntry).
-        Queue::iterator hand_;
+        // SIEVE's hand: the next entry it looks at, or nullptr to start from
+        // the oldest. Never points at a removed key (see eraseEntry).
+        CacheEntry* hand_ = nullptr;
 
         // Keys with a TTL, soonest expiry first, so expired keys are found
         // without a scan when room is needed. The pointer is to the key inside
@@ -216,7 +217,7 @@ class InMemoryStorage final : public StorageInterface {
 
 template<typename Use>
 Result InMemoryStorage::readString(const std::string& key, Use&& use) {
-    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the LRU order changes
+    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the hit is recorded
     auto it = data_.find(key);
     if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(isExpired(it->second)) {

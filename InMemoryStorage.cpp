@@ -51,7 +51,7 @@ int64_t InMemoryStorage::unixTimeMs() {
 }
 
 InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof, EvictionPolicy policy)
-    : policy_(policy), hand_(queue_.end()), capacity_(capacity), aof_(aof) {
+    : policy_(policy), capacity_(capacity), aof_(aof) {
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
@@ -540,8 +540,7 @@ Result InMemoryStorage::loadFromFile(const std::string& filename){
     std::ifstream in(filename);
     if(!in.is_open()) return Result::fail(ErrorCode::FILE_ERROR);
     data_.clear();
-    queue_.clear();
-    hand_ = queue_.end();
+    newest_ = oldest_ = hand_ = nullptr;
     expiry_index_.clear();
 
     std::string line;
@@ -642,33 +641,56 @@ std::vector<std::string> InMemoryStorage::dumpState() const {
 
 // ==================== Eviction ====================
 
-// The queue node goes in first, so if adding the entry throws (out of
-// memory), removing the node leaves both exactly as they were.
+// Adding to data_ is the only step that can throw (out of memory); linking
+// can't, so a failed insert leaves everything as it was.
 InMemoryStorage::DataMap::iterator InMemoryStorage::insertEntry(const std::string& key,
                                                                CacheEntry entry, bool newest){
-    Queue::iterator node = queue_.insert(newest ? queue_.begin() : queue_.end(), QueueNode{key, nullptr});
-    std::pair<DataMap::iterator, bool> added;
-    try {
-        added = data_.emplace(key, std::move(entry));
-    } catch(...) {
-        queue_.erase(node);
-        throw;
-    }
-    assert(added.second && "insertEntry: the key is already stored");
-    added.first->second.queue_it = node;
-    node->entry = &added.first->second;
-    return added.first;
+    auto [it, inserted] = data_.emplace(key, std::move(entry));
+    assert(inserted && "insertEntry: the key is already stored");
+    (void)inserted;
+    it->second.key = &it->first;
+    if(newest) linkNewest(it->second);
+    else linkOldest(it->second);
+    return it;
+}
+
+void InMemoryStorage::linkNewest(CacheEntry& entry){
+    entry.newer = nullptr;
+    entry.older = newest_;
+    if(newest_) newest_->newer = &entry;
+    else oldest_ = &entry;
+    newest_ = &entry;
+}
+
+void InMemoryStorage::linkOldest(CacheEntry& entry){
+    entry.older = nullptr;
+    entry.newer = oldest_;
+    if(oldest_) oldest_->older = &entry;
+    else newest_ = &entry;
+    oldest_ = &entry;
+}
+
+void InMemoryStorage::unlink(CacheEntry& entry){
+    if(entry.newer) entry.newer->older = entry.older;
+    else newest_ = entry.older;
+    if(entry.older) entry.older->newer = entry.newer;
+    else oldest_ = entry.newer;
+    entry.newer = entry.older = nullptr;
 }
 
 // A hit.
-// - LRU: splice() relinks the key's node at the front: O(1), no allocation.
-//   But it writes the node and both its neighbours, which a big table rarely
-//   has in the cache: the profile's 10.8% of GET at pipeline 16.
-// - SIEVE: sets the key's visited bit, in the entry the lookup has just
+// - LRU: relinks the entry at the front. O(1) and no allocation, but it
+//   writes the entry's two neighbours and the old front, which a big table
+//   rarely has in the cache: the profile's 10.8% of GET at pipeline 16.
+// - SIEVE: sets the entry's visited bit, in the entry the lookup has just
 //   read, so a hit touches no other memory.
 void InMemoryStorage::markUsed(CacheEntry& entry){
-    if(policy_ == EvictionPolicy::SIEVE) entry.visited = true;
-    else queue_.splice(queue_.begin(), queue_, entry.queue_it);
+    if(policy_ == EvictionPolicy::SIEVE) {
+        entry.visited = true;
+    } else if(&entry != newest_) {
+        unlink(entry);
+        linkNewest(entry);
+    }
 }
 
 // SIEVE's choice (Zhang et al., NSDI 2024). The hand walks from the oldest
@@ -678,11 +700,11 @@ void InMemoryStorage::markUsed(CacheEntry& entry){
 // that aren't used again leave soon, and popular ones settle near the oldest
 // end. Each step clears a bit that a hit set, so a walk is short on average.
 // The hand is left on the victim; eraseEntry() moves it on.
-InMemoryStorage::Queue::iterator InMemoryStorage::sieveVictim(){
-    Queue::iterator obj = hand_ != queue_.end() ? hand_ : std::prev(queue_.end());
-    while(obj->entry->visited) {
-        obj->entry->visited = false;
-        obj = obj == queue_.begin() ? std::prev(queue_.end()) : std::prev(obj);
+InMemoryStorage::CacheEntry* InMemoryStorage::sieveVictim(){
+    CacheEntry* obj = hand_ ? hand_ : oldest_;
+    while(obj->visited) {
+        obj->visited = false;
+        obj = obj->newer ? obj->newer : oldest_;
     }
     hand_ = obj;
     return obj;
@@ -695,8 +717,8 @@ InMemoryStorage::Queue::iterator InMemoryStorage::sieveVictim(){
 // bring back keys the server had dropped and lose others it still had.
 
 void InMemoryStorage::evictOne(){
-    Queue::iterator victim = policy_ == EvictionPolicy::SIEVE ? sieveVictim() : std::prev(queue_.end());
-    std::string key = victim->key;     // a copy: erasing removes the original
+    CacheEntry* victim = policy_ == EvictionPolicy::SIEVE ? sieveVictim() : oldest_;
+    std::string key = *victim->key;    // a copy: erasing removes the original
     eraseEntry(data_.find(key));
     logAOF({"DEL", key});
 }
@@ -766,8 +788,8 @@ void InMemoryStorage::eraseEntry(DataMap::iterator it){
     // removed key, to its neighbour towards the newest, or back to the start
     // (the oldest) if it was the newest. After an eviction that is exactly
     // where the paper leaves the hand.
-    Queue::iterator node = it->second.queue_it;
-    if(node == hand_) hand_ = node == queue_.begin() ? queue_.end() : std::prev(node);
-    queue_.erase(node);
+    CacheEntry& entry = it->second;
+    if(&entry == hand_) hand_ = entry.newer;    // nullptr if it was the newest
+    unlink(entry);
     data_.erase(it);
 }
