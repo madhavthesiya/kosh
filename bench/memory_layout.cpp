@@ -31,9 +31,9 @@ struct MemoryLayoutReport {
         row("`std::unordered_map<std::string, std::string>` (Hash)",
             sizeof(std::unordered_map<std::string, std::string>));
         row("`ValueType` (`std::variant`: a string, or a pointer to a list, set or hash)", sizeof(ValueType));
-        row("`CacheEntry` (value, expiry, eviction queue links, key pointer)", sizeof(Entry));
-        row("Map element `std::pair<const std::string, CacheEntry>`",
-            sizeof(std::pair<const std::string, Entry>));
+        row("`CacheEntry` (value, expiry, eviction queue links, key length, flags); the key's "
+            "bytes follow it in the same allocation", sizeof(Entry));
+        row("`KeyTable` bucket (one cache line: metadata, 7 tags, 7 entry pointers)", 64);
         std::printf("\nStrings up to %zu characters are stored inside the `std::string` "
                     "object (small-string optimisation); longer ones allocate.\n",
                     std::string().capacity());
