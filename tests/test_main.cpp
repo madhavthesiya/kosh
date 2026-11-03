@@ -293,6 +293,29 @@ TEST(test_keytable_rehash_is_incremental) {
     for(const auto& e : pool) ASSERT_TRUE(t.find(e->key) == e.get());
 }
 
+TEST(test_keytable_big_table_given_back) {
+    // From 1 MB (16,384 buckets), tables are mapped from the OS, and a rehash
+    // gives the moved part of the old one back as it goes. Halfway through
+    // the rehash out of the 1 MB table, every entry must still be found, and
+    // forEach must visit each one once.
+    KeyTable<TableEntry, TableKeyOf> t;
+    std::vector<std::unique_ptr<TableEntry>> pool;
+    size_t since_start = 0;
+    bool checked = false;
+    for(int i = 0; i < 160000 && !checked; i++) {
+        pool.push_back(std::make_unique<TableEntry>(TableEntry{"key:" + std::to_string(i)}));
+        t.insert(pool.back().get());
+        if(!(t.rehashing() && t.bucketCount() == 3 * 16384)) continue;
+        if(++since_start < 8192) continue;
+        for(const auto& e : pool) ASSERT_TRUE(t.find(e->key) == e.get());
+        std::unordered_set<const TableEntry*> seen;
+        t.forEach([&](TableEntry& e) { ASSERT_TRUE(seen.insert(&e).second); });
+        ASSERT_EQ(seen.size(), pool.size());
+        checked = true;
+    }
+    ASSERT_TRUE(checked);
+}
+
 // ==================== SIEVE Eviction ====================
 
 TEST(test_sieve_evicts_first_unvisited_key) {
@@ -2266,6 +2289,7 @@ int main() {
     RUN_TEST(test_keytable_one_long_chain);
     RUN_TEST(test_keytable_matches_unordered_map);
     RUN_TEST(test_keytable_rehash_is_incremental);
+    RUN_TEST(test_keytable_big_table_given_back);
 
     std::cout << "\n[SIEVE Eviction]\n";
     RUN_TEST(test_sieve_evicts_first_unvisited_key);

@@ -101,7 +101,11 @@ int main(int argc, char** argv) {
         InMemoryStorage storage(2 * n, nullptr);    // room for all: no eviction
         std::vector<double> times;
         std::vector<Slow> slow;
+        // Both reserved: a vector doubling in the middle of the run (8 MB at
+        // 524,288 entries) disturbs the allocator and the caches between two
+        // timed inserts
         times.reserve(n);
+        slow.reserve(n);
         for(size_t i = 0; i < n; i++) {
             auto start = Clock::now();
             storage.set(keys[i], "xxx");
