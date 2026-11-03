@@ -710,10 +710,11 @@ class CommandLineTest(ServerTestCase):
     def test_eviction_option_picks_the_policy(self):
         # Both keys read, b then a, and c needs room. LRU evicts b, the less
         # recently used; SIEVE evicts a, the oldest: a hit doesn't move a key.
-        for policy, evicted, kept in (("lru", "b", "a"), ("sieve", "a", "b")):
+        # Without --eviction, the server uses SIEVE.
+        for policy, evicted, kept in (("lru", "b", "a"), ("sieve", "a", "b"), (None, "a", "b")):
             with self.subTest(policy=policy):
-                server = self.start_server("--appendonly", "no", "--maxkeys", "2",
-                                           "--eviction", policy)
+                flags = ("--eviction", policy) if policy else ()
+                server = self.start_server("--appendonly", "no", "--maxkeys", "2", *flags)
                 with Client(server.port) as c:
                     c.call("SET", "a", "1")
                     c.call("SET", "b", "1")

@@ -14,7 +14,9 @@
 struct ServerConfig {
     int port = 6379;
     size_t maxKeys = 10000;
-    EvictionPolicy eviction = EvictionPolicy::LRU;
+    // SIEVE: fewer misses than LRU on every trace measured, and a hit
+    // writes nothing outside the entry (bench/results/after-memory-fixes)
+    EvictionPolicy eviction = EvictionPolicy::SIEVE;
     bool appendOnly = true;
     std::string appendFilename = "appendonly.aof";
     // Redis's default: a power cut loses at most about a second of writes
@@ -27,8 +29,8 @@ static void printUsage(std::ostream& out) {
     out << "Usage: mini_redis_server [options]\n"
            "  --port <1-65535>         TCP port to listen on (default 6379)\n"
            "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
-           "  --eviction <lru|sieve>   Which key a full server evicts: the least recently\n"
-           "                           used, or SIEVE's choice (NSDI 2024) (default lru)\n"
+           "  --eviction <sieve|lru>   Which key a full server evicts: SIEVE's choice\n"
+           "                           (NSDI 2024), or the least recently used (default sieve)\n"
            "  --appendonly <yes|no>    Log writes to the AOF and replay it at startup (default yes)\n"
            "  --appendfilename <path>  AOF file (default appendonly.aof)\n"
            "  --appendfsync <always|everysec|no>\n"
