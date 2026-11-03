@@ -11,7 +11,9 @@ For each pair of neighbouring versions, the report gives the median of the
 per-round ratios, their range, how many rounds went each way, and a sign
 test: the chance of at least that many rounds agreeing if the change made no
 difference. A change is reported as real only when the rounds agree. With 5
-rounds that all agree, p = 0.0625; with 6, p = 0.031.
+rounds that all agree, p = 0.0625; with 6, p = 0.031. The sign test says
+whether a change is real; a 95% confidence interval for the ratio says how
+large it is.
 
 Numbers from different sessions are not comparable on a noisy machine; this
 puts every version in the same session, which is what a before/after claim
@@ -89,14 +91,41 @@ def sign_test_p(ratios):
     return min(1.0, 2 * tail)
 
 
+# Two-sided 95% critical values of Student's t, by degrees of freedom. Above
+# 30, the value for 30 is used, which is slightly too wide (safe).
+T_975 = [None, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+         2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+         2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]
+
+
+def ratio_ci(ratios):
+    """95% confidence interval for the typical ratio (the geometric mean),
+    from a t-interval on the logs of the per-round ratios. It assumes those
+    logs are roughly normal. A bootstrap needs no such assumption, but with
+    5 rounds it can't be wider than the values seen and comes out too narrow.
+    Returns (low, high), or None with fewer than 2 rounds."""
+    n = len(ratios)
+    if n < 2:
+        return None
+    logs = [math.log(r) for r in ratios]
+    half = T_975[min(n - 1, 30)] * statistics.stdev(logs) / math.sqrt(n)
+    mean = statistics.fmean(logs)
+    return math.exp(mean - half), math.exp(mean + half)
+
+
 def paired_cell(runs, aof, pipeline, test, before, after):
     """Median ratio after/before over the rounds both were measured in, with
-    its range, the rounds that went up, and the sign test."""
+    its range, the rounds that went up, the sign test, and a 95% confidence
+    interval for the ratio."""
     a, b = runs[(aof, pipeline, test, before)], runs[(aof, pipeline, test, after)]
     ratios = [b[r]["rps"] / a[r]["rps"] for r in sorted(a.keys() & b.keys())]
     up = sum(x > 1 for x in ratios)
-    return (f"{statistics.median(ratios):.3f}x [{min(ratios):.3f}, {max(ratios):.3f}] "
+    cell = (f"{statistics.median(ratios):.3f}x [{min(ratios):.3f}, {max(ratios):.3f}] "
             f"{up}/{len(ratios)} p={sign_test_p(ratios):.2f}")
+    ci = ratio_ci(ratios)
+    if ci:
+        cell += f", CI {ci[0]:.2f}-{ci[1]:.2f}"
+    return cell
 
 
 def main():
@@ -200,8 +229,10 @@ def main():
     lines += ["", "## Paired comparison", "",
               "Each cell compares two versions round by round: the median of the per-round "
               "ratios of requests/s, [lowest, highest] ratio, the rounds in which the second "
-              "version was faster, and the two-sided sign-test p-value. Treat a change as real "
-              "only when the rounds agree (a small p).", "",
+              "version was faster, the two-sided sign-test p-value, and a 95% confidence "
+              "interval for the ratio (a t-interval on the logs of the per-round ratios). "
+              "Treat a change as real only when the rounds agree (a small p) and the interval "
+              "leaves out 1.00; the interval then says how large the change is.", "",
               "| AOF | Pipeline | Test | " + " | ".join(f"{b} / {a}" for a, b in pairs) + " |",
               "|---|---:|---|" + "---|" * len(pairs)]
     for aof, pipeline, test in tests:
