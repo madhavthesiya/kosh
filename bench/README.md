@@ -13,6 +13,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`lookup_latency.cpp`](lookup_latency.cpp) | ns per GET and SET in the storage engine, and per `find()` in a plain `std::unordered_map`, for tables of 1,000 to 4,000,000 keys, with uniform and Zipf keys; lookups independent (as in a pipeline) and one at a time (full latency). The knee where the table outgrows the cache shows the cost of memory latency without hardware counters (no network) | stdout |
 | [`eviction_sim.cpp`](eviction_sim.cpp) | Miss ratio of the engine's eviction on cache traces (Zipf, Zipf with scans, or a CSV such as Twitter's), at capacities given as fractions of the trace's distinct keys. Each request is a GET; a miss SETs the key (no network) | stdout |
 | [`eviction_reference.py`](eviction_reference.py) | Replays the requests `eviction_sim --dump-trace` ran through a textbook implementation of each policy; `--expect` fails unless every miss count is exactly the engine's | stdout |
+| [`memory_compare.py`](memory_compare.py) | Memory per key, Mini-Redis against real Redis for the same keys: growth of resident memory (RSS), with Mini-Redis also under jemalloc to separate the allocator from the data layout | `memory.md` |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -37,12 +38,15 @@ cmake --build build --target insert_latency && taskset -c 2 ./build/insert_laten
 cmake --build build --target lookup_latency && taskset -c 2 ./build/lookup_latency   # about 3 minutes
 
 # Eviction: the miss ratio on traces, then an exact check against a textbook policy.
-# Twitter's trace (CC-BY 4.0) as libCacheSim ships it: 1,000,000 requests, 143,543 keys.
+# Twitter's trace (CC-BY 4.0) as libCacheSim ships it: 1,000,000 requests, 143,542 keys.
 curl -sSfLo ~/traces/twitter_cluster52.csv --create-dirs \
     https://raw.githubusercontent.com/cacheMon/libCacheSim/develop/data/twitter_cluster52.csv
 cmake --build build --target eviction_sim
 ./build/eviction_sim --dump-trace /tmp/trace.txt zipf:0.99 zipfscan:0.99 csv:$HOME/traces/twitter_cluster52.csv > sim.md
 python3 bench/eviction_reference.py /tmp/trace.txt --expect sim.md
+
+# Memory per key against real Redis (1,000,000 keys, 3 runs; about 2 minutes)
+python3 bench/memory_compare.py --out bench/results/<name>/memory.md
 cmake --build build --target alloc_count && ./build/alloc_count
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:

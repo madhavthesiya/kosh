@@ -173,7 +173,8 @@ class Server:
     """A server process for one measurement. Output goes to a log file, not a
     pipe: a pipe nobody reads fills up and blocks the server."""
 
-    def __init__(self, argv, workdir, port, cpus=None):
+    def __init__(self, argv, workdir, port, cpus=None, env=None):
+        """`env`: extra environment variables for the server (e.g. LD_PRELOAD)."""
         self.port = port
         self.argv = pinned(cpus, argv)
         self.log_path = Path(workdir) / "server-output.log"
@@ -181,7 +182,8 @@ class Server:
         self.started = time.monotonic()
         # taskset execs the server, so this PID is the server's own.
         self.proc = subprocess.Popen(self.argv, cwd=workdir, stdout=self._log,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT,
+                                     env={**os.environ, **env} if env else None)
 
     def __enter__(self):
         return self
