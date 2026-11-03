@@ -123,9 +123,16 @@ def main():
             versions.append((label, tree, git("log", "-1", "--format=%h %s", commit), flags))
 
         for round_ in range(1, args.rounds + 1):
-            # Rotate the order each round, so no version is always measured first
+            # Rotate the order each round, so no version is always measured
+            # first, and reverse it every other round. Rotation alone keeps
+            # neighbours in the same order in all but one round (Phase 4's run
+            # measured "final" right before "epoll" in all 5), so anything that
+            # drifts within a round favoured the same one of each compared pair.
             shift = (round_ - 1) % len(versions)
-            for order, (label, tree, _, flags) in enumerate(versions[shift:] + versions[:shift], 1):
+            ordered = versions[shift:] + versions[:shift]
+            if round_ % 2 == 0:
+                ordered.reverse()
+            for order, (label, tree, _, flags) in enumerate(ordered, 1):
                 out = work / f"{label}-r{round_}"
                 result = subprocess.run(
                     [sys.executable, str(tree / "bench" / "bench.py"),
@@ -168,7 +175,8 @@ def main():
              f"- **Method:** each commit's own `bench.py --servers mini --pipelines "
              f"{args.pipelines} --aof {args.aof} --runs 1 --requests {args.requests} "
              f"--pipelined-requests {args.pipelined_requests}`. {args.rounds} rounds; each "
-             "round measures every commit, in an order that rotates from round to round.",
+             "round measures every commit, in an order that rotates from round to round and "
+             "is reversed every other round.",
              f"- **Raw numbers:** every run is in [`{runs_csv.name}`]({runs_csv.name})."]
     lines += [f"- **Note:** {n}" for n in notes]
     lines += ["", "| Version | Commit |", "|---|---|"]

@@ -47,9 +47,13 @@ INCLUSIVE = [
     ("send()", {"__send", "__libc_send", "send"}),
     ("write(), the AOF", {"__GI___libc_write", "__libc_write", "write"}),
     ("recv()", {"__libc_recv", "__recv", "recv"}),
-    ("select()", {"__select", "___select", "select"}),
+    ("Waiting: select() or epoll_wait()", {"__select", "___select", "select", "epoll_wait",
+                                           "__epoll_wait", "__GI_epoll_wait", "epoll_pwait"}),
     ("All AOF logging (InMemoryStorage::logAOF)", {"InMemoryStorage::logAOF"}),
-    ("RESP parsing", {"RespParser::parse", "RespParser::parseResp", "RespParser::parseInline"}),
+    # parse() before Phase 4; parseInto() and its helpers since
+    ("RESP parsing", {"RespParser::parse", "RespParser::parseResp", "RespParser::parseInline",
+                      "RespParser::parseInto", "RespParser::parseRespInto",
+                      "RespParser::parseInlineInto"}),
 ]
 
 

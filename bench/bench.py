@@ -191,7 +191,8 @@ def markdown(summary, args, env_rows, commands):
            f"- **Pinning:** server on CPU {args.server_cpu}, redis-benchmark on CPU "
            f"{args.client_cpus} ({args.client_threads} thread"
            f"{'s' if args.client_threads > 1 else ''}).",
-           f"- **Runs:** {args.runs} per row, interleaved. The row shows the run with the "
+           f"- **Runs:** {args.runs} per row, interleaved, with the server measured first "
+           "alternating from run to run. The row shows the run with the "
            "median throughput; *spread* is (max - min) / median over all runs.",
            "- **Server CPU:** 100% = one core fully busy. *In kernel* is the share of that "
            "CPU time spent in system calls (`stime` / (`utime` + `stime`)).",
@@ -263,12 +264,17 @@ def main():
         "-P", "<pipeline>", "--csv"] + (["--threads", str(args.client_threads)]
                                         if args.client_threads > 1 else []))))
 
-    cases = [(aof, p, s) for aof in args.aof for p in args.pipelines for s in args.servers]
     rows = []
     with open(runs_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
         for run in range(1, args.runs + 1):
+            # Which server goes first alternates from run to run: anything that
+            # drifts within a run (a CPU's boost budget running out, say) must
+            # not always favour the same one. (Until Phase 4, Mini-Redis always
+            # went first.)
+            servers = args.servers if run % 2 else list(reversed(args.servers))
+            cases = [(aof, p, s) for aof in args.aof for p in args.pipelines for s in servers]
             for aof, pipeline, server in cases:
                 new = measure(args, binaries, run, server, aof, pipeline)
                 for r in new:
