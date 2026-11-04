@@ -743,6 +743,95 @@ class NetworkAccessTest(ServerTestCase):
             self.assertEqual(c.call("PING"), b"PONG")
         self.assertIn("WARNING: protected mode is off and no password is set", server.output())
 
+    def test_with_a_password_other_machines_may_authenticate(self):
+        # Protected mode is for servers with no password; with one, AUTH decides
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0", "--requirepass", "s3cret")
+        with Client(server.port, host=self.network_address()) as c:
+            with self.assertRaisesRegex(RespError, "^NOAUTH"):
+                c.call("PING")
+            self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertEqual(c.call("PING"), b"PONG")
+
+
+NOAUTH = "^NOAUTH Authentication required.$"
+WRONGPASS = "^WRONGPASS invalid username-password pair or user is disabled.$"
+
+
+class AuthTest(ServerTestCase):
+    """--requirepass and AUTH over real connections."""
+
+    def test_every_connection_must_authenticate(self):
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        with Client(server.port) as c:
+            with self.assertRaisesRegex(RespError, NOAUTH):
+                c.call("SET", "k", "v")
+            with self.assertRaisesRegex(RespError, WRONGPASS):
+                c.call("AUTH", "wrong")
+            self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertEqual(c.call("SET", "k", "v"), b"OK")
+        with Client(server.port) as c:    # a new connection starts over
+            with self.assertRaisesRegex(RespError, NOAUTH):
+                c.call("GET", "k")
+            self.assertEqual(c.call("AUTH", "default", "s3cret"), b"OK")
+            self.assertEqual(c.call("GET", "k"), b"v")
+
+    def test_auth_and_commands_in_one_pipeline(self):
+        # The limits lift for the commands right behind AUTH in the same read
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        many = [f"v{i}" for i in range(20)]
+        with Client(server.port) as c:
+            c.sock.sendall(Client.encode(["AUTH", "s3cret"]) + Client.encode(["RPUSH", "l", *many])
+                           + Client.encode(["GET", "missing"]))
+            self.assertEqual(c.read_reply(), b"OK")
+            self.assertEqual(c.read_reply(), 20)
+            self.assertIsNone(c.read_reply())
+
+    def test_unauthenticated_clients_get_small_limits(self):
+        # Refused at the header, before any data, and disconnected (Redis's replies)
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        self.assertEqual(exchange_raw(server.port, b"*11\r\n"),
+                         b"-ERR Protocol error: unauthenticated multibulk length\r\n")
+        self.assertEqual(exchange_raw(server.port, b"*2\r\n$4\r\nAUTH\r\n$16385\r\n"),
+                         b"-ERR Protocol error: unauthenticated bulk length\r\n")
+        with Client(server.port) as c:    # after AUTH, the usual limits
+            c.call("AUTH", "s3cret")
+            self.assertEqual(c.call("SET", "big", "x" * 100000), b"OK")
+
+    def test_password_from_a_file(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "password")
+            with open(path, "w", newline="") as f:
+                f.write("s3cret\r\n")     # one line ending is not part of the password
+            server = self.start_server("--appendonly", "no", "--requirepass-file", path)
+            with Client(server.port) as c:
+                with self.assertRaisesRegex(RespError, WRONGPASS):
+                    c.call("AUTH", "s3cret\r\n")
+                self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertIn("this machine only, with the password", server.output())
+            self.assertNotIn("process list", server.output())
+
+    def test_password_given_directly_warns(self):
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        self.assertIn("can read --requirepass in the process list", server.output())
+
+    def test_password_is_never_written_down(self):
+        # Neither in the log nor in the AOF: AUTH changes no data, so it isn't logged
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server("--requirepass", "s3cret", workdir=workdir)
+            with Client(server.port) as c:
+                c.call("AUTH", "s3cret")
+                c.call("SET", "k", "v")
+                with self.assertRaises(RespError):
+                    c.call("AUTH", "s3cret-wrong")
+            server.stop()     # writes out what the AOF still buffers
+            with open(os.path.join(workdir, "appendonly.aof"), "rb") as f:
+                aof = f.read()
+            with open(os.path.join(workdir, "server.log"), "rb") as f:
+                log = f.read()
+        self.assertIn(b"SET", aof)
+        self.assertNotIn(b"s3cret", aof)
+        self.assertNotIn(b"s3cret", log)
+
 
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
@@ -766,12 +855,32 @@ class CommandLineTest(ServerTestCase):
             ("--bind", "localhost"), ("--bind", "1.2.3"), ("--bind", "256.0.0.1"),
             ("--bind", "::1"), ("--bind", ""), ("--bind",),
             ("--protected-mode", "on"), ("--protected-mode",),
+            ("--requirepass", ""), ("--requirepass", "p" * 513), ("--requirepass", "two\nlines"),
+            ("--requirepass",), ("--requirepass-file", os.path.join("no", "such", "file")),
+            ("--requirepass-file",),
         ]
         for args in cases:
             with self.subTest(args=args):
                 result = self.run_server(*args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertTrue(result.stderr, "expected an error message on stderr")
+
+    def test_a_rejected_password_is_not_printed(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "password")
+            for content in ("first line\nsecond line\n", "\n", "q" * 600):
+                with self.subTest(content=content[:20]):
+                    with open(path, "w", newline="") as f:
+                        f.write(content)
+                    result = self.run_server("--requirepass-file", path)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(b"Invalid --requirepass-file: ", result.stderr)
+                    for secret in (b"first line", b"qqqq"):
+                        self.assertNotIn(secret, result.stderr)
+        result = self.run_server("--requirepass", "p" * 513)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"longer than 512 bytes", result.stderr)
+        self.assertNotIn(b"pppp", result.stderr)
 
     def test_failing_to_listen_says_why(self):
         # The reason is the system's own (glibc's wording), so a wrong error

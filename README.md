@@ -527,6 +527,7 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 | Command | Description |
 |---------|-------------|
 | `PING` | Returns PONG |
+| `AUTH` | `AUTH password` or `AUTH default password`: authenticates the connection when the server has a password (see [Who can connect](#run-the-server)). A wrong one gets `-WRONGPASS` and changes nothing. |
 | `INFO` | Server info (version, connected clients) |
 | `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
@@ -589,11 +590,12 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 41 tests that start the real server binary on a free port and speak RESP over TCP.
+- 49 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
   - the log reaching its file while the server runs, as under systemd or Docker;
   - who can connect: loopback only by default, `--bind`, and protected mode, tested by connecting from this machine's own network address as a client on another machine would;
+  - passwords: `NOAUTH` until `AUTH`, `AUTH` in a pipeline, the limits before `AUTH`, `--requirepass-file`, and the password never reaching the log, the AOF or an error message;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
@@ -628,11 +630,12 @@ kosh/
 ├── .gitignore
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
 │                             #   memory (and against Redis), allocations per request, insert and
-│                             #   lookup latency, eviction miss ratios, layout bias, idle clients
+│                             #   lookup latency, eviction miss ratios, layout bias, idle clients,
+│                             #   password check timing
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 107 unit tests
+    ├── test_main.cpp              # 112 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary
@@ -675,6 +678,8 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | `--port <1-65535>` | 6379 | TCP port to listen on |
 | `--bind <ipv4>` | 127.0.0.1 | Address to listen on; `0.0.0.0` listens on every interface |
 | `--protected-mode <yes\|no>` | yes | With no password set, refuse clients on other machines |
+| `--requirepass-file <path>` | none | Clients must `AUTH` with the password in this file (one line, at most 512 bytes) before anything else |
+| `--requirepass <password>` | none | The same, given directly; other users on the machine can read it in the process list, so prefer the file |
 | `--maxkeys <n>` | 10000 | Keys to hold before evicting one |
 | `--eviction <sieve\|lru>` | sieve | Which key a full server evicts: SIEVE's choice, or the least recently used |
 | `--appendonly <yes\|no>` | yes | Log writes to the AOF and replay it at startup |
@@ -684,6 +689,10 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | `--poller <epoll\|select>` | epoll on Linux, else select | How the event loop waits for sockets (`select()` serves about 1,000 clients) |
 
 **Who can connect.** By default Kosh listens on 127.0.0.1, so only programs on the same machine can reach it. `--bind 0.0.0.0` listens on every interface. Even then, while no password is set, protected mode (as in Redis) answers clients on other machines with `-DENIED` and disconnects them; `--protected-mode no` turns it off, for a network you trust. Redis started without a config file listens on every interface and relies on protected mode alone; Kosh makes the network an explicit choice.
+
+**Passwords.** With `--requirepass-file` (or `--requirepass`), a client gets `-NOAUTH` for everything but `AUTH` and `QUIT` until it sends `AUTH <password>` (or `AUTH default <password>`). The replies are Redis's, byte for byte, which matters to client libraries that match on them. Two details guard against a client that doesn't have the password:
+- Until it authenticates, a client's commands may have at most 10 arguments of 16 KB each, Redis's limits since 6.2.6. Without them, a client without the password could still make the server buffer up to 1 GB for it on each connection.
+- The password check takes the same time however much of a guess is right, so response times can't reveal the password byte by byte. `std::string`'s `==` stops at the first difference; [`bench/auth_compare.cpp`](bench/auth_compare.cpp) measures both.
 
 ### Benchmark
 

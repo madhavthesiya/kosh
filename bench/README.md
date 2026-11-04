@@ -15,6 +15,7 @@ Scripts that produce every performance number quoted for Kosh. Each one builds t
 | [`eviction_reference.py`](eviction_reference.py) | Replays the requests `eviction_sim --dump-trace` ran through a textbook implementation of each policy; `--expect` fails unless every miss count is exactly the engine's | stdout |
 | [`memory_compare.py`](memory_compare.py) | Memory per key, Kosh against real Redis for the same keys: growth of resident memory (RSS), with Kosh also under jemalloc to separate the allocator from the data layout | `memory.md` |
 | [`layout_bias.py`](layout_bias.py) | How much `lookup_latency` moves from code and stack layout alone: every link order of its objects, each under several environment sizes, in shuffled order. The spread (with run-to-run noise) is the floor a microbenchmark gain must clear | stdout |
+| [`auth_compare.cpp`](auth_compare.cpp) | ns per password check by where the guess goes wrong (first byte, middle, last byte, right, too short), for `std::string`'s `==`, a loop that stops at the first difference, and the `constantTimeEquals` that `AUTH` uses: whether timing reveals how much of a guess is right | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -52,6 +53,10 @@ python3 bench/memory_compare.py --out bench/results/<name>/memory.md
 # The layout-and-noise floor for lookup_latency's numbers (about 10 minutes)
 python3 bench/layout_bias.py > bench/results/<name>/layout-bias.md
 cmake --build build --target alloc_count && ./build/alloc_count
+
+# Password check timing, a typical length and the longest (about a minute)
+cmake --build build --target auth_compare && taskset -c 2 ./build/auth_compare --length 32
+taskset -c 2 ./build/auth_compare --length 512 --calls 50000
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
 sudo apt install linux-tools-generic

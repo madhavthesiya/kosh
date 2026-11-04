@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
 #include "Commands.h"
@@ -18,6 +19,8 @@ struct ServerConfig {
     // otherwise, and relies on protected mode alone.)
     std::string bindAddress = "127.0.0.1";
     bool protectedMode = true;
+    std::optional<std::string> password;    // none: clients needn't AUTH
+    bool passwordInArgs = false;            // from --requirepass, which ps shows
     size_t maxKeys = 10000;
     // SIEVE: fewer misses than LRU on every trace measured, and a hit
     // writes nothing outside the entry (bench/results/after-memory-fixes)
@@ -38,6 +41,11 @@ static void printUsage(std::ostream& out) {
            "  --protected-mode <yes|no>\n"
            "                           With no password set, refuse clients on other\n"
            "                           machines (default yes)\n"
+           "  --requirepass-file <path>\n"
+           "                           Clients must AUTH with the password in this file\n"
+           "                           (one line, at most 512 bytes) before anything else\n"
+           "  --requirepass <password> The same, given directly; other users on this machine\n"
+           "                           can read it in the process list, so prefer the file\n"
            "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
            "  --eviction <sieve|lru>   Which key a full server evicts: SIEVE's choice\n"
            "                           (NSDI 2024), or the least recently used (default sieve)\n"
@@ -65,6 +73,34 @@ static bool parseNumber(const std::string& text, T min, T max, T& out) {
     return true;
 }
 
+// The password in a file: its content minus one line ending. Reads at most a
+// little more than the longest password, so a wrong path to a huge file
+// can't take long. Returns why it can't be used, or "" if it can.
+static std::string readPasswordFile(const std::string& path, std::string& password) {
+    std::ifstream file(path, std::ios::binary);
+    if(!file) return "cannot open '" + path + "'";
+    std::string content(kMaxPasswordLength + 3, '\0');
+    file.read(&content[0], static_cast<std::streamsize>(content.size()));
+    if(file.bad()) return "cannot read '" + path + "'";
+    content.resize(static_cast<size_t>(file.gcount()));
+    if(!content.empty() && content.back() == '\n') content.pop_back();
+    if(!content.empty() && content.back() == '\r') content.pop_back();
+    password = std::move(content);
+    return "";
+}
+
+// Why a password can't be used, or "" if it can. The messages never quote it.
+static std::string passwordProblem(const std::string& password) {
+    if(password.empty()) return "the password is empty, which would protect nothing";
+    if(password.size() > kMaxPasswordLength) {
+        return "the password is longer than " + std::to_string(kMaxPasswordLength) + " bytes";
+    }
+    if(password.find_first_of("\r\n") != std::string::npos) {
+        return "the password must be one line";
+    }
+    return "";
+}
+
 enum class ParseResult { Run, Help, Error };
 
 static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
@@ -73,6 +109,7 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         if(option == "--help" || option == "-h") return ParseResult::Help;
 
         if(option != "--port" && option != "--bind" && option != "--protected-mode" &&
+           option != "--requirepass" && option != "--requirepass-file" &&
            option != "--maxkeys" && option != "--eviction" &&
            option != "--appendonly" && option != "--appendfilename" && option != "--appendfsync" &&
            option != "--maxclients" && option != "--poller") {
@@ -96,6 +133,18 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         } else if(option == "--protected-mode") {
             ok = (value == "yes" || value == "no");
             if(ok) config.protectedMode = (value == "yes");
+        } else if(option == "--requirepass" || option == "--requirepass-file") {
+            // Not the generic message below, which would print the password
+            std::string password = value;
+            std::string problem;
+            if(option == "--requirepass-file") problem = readPasswordFile(value, password);
+            if(problem.empty()) problem = passwordProblem(password);
+            if(!problem.empty()) {
+                std::cerr << "Invalid " << option << ": " << problem << "\n";
+                return ParseResult::Error;
+            }
+            config.password = std::move(password);
+            config.passwordInArgs = (option == "--requirepass");
         } else if(option == "--maxkeys") {
             // 0 is rejected: eviction assumes at least one key fits
             ok = parseNumber<size_t>(value, 1, SIZE_MAX, config.maxKeys);
@@ -193,6 +242,13 @@ int main(int argc, char* argv[]) {
     Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);
     server.setBindAddress(config.bindAddress);
     server.setProtectedMode(config.protectedMode);
+    if(config.password) {
+        server.setPassword(*config.password);
+        if(config.passwordInArgs) {
+            std::cerr << "Warning: other users on this machine can read --requirepass in the "
+                         "process list; --requirepass-file keeps the password out of it\n";
+        }
+    }
     if(!server.start()) return 1;   // start() said why
 
     // Serve until a stop signal (exit code 0), or until the AOF fails for good

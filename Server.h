@@ -2,6 +2,7 @@
 #include "Socket.h"     // first: on Windows it must set FD_SETSIZE before winsock2.h is included
 #include "Poller.h"
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -29,6 +30,9 @@ public:
     // Protected mode, as Redis's (on by default): with no password set, a
     // client that isn't on this machine gets -DENIED and is disconnected.
     void setProtectedMode(bool on) { protected_mode_ = on; }
+    // A password (at most kMaxPasswordLength bytes): every client must AUTH
+    // before any other command, and protected mode no longer applies
+    void setPassword(std::string password) { password_ = std::move(password); }
 
     bool start();       // Create socket, bind, listen
     void run();         // Event loop — handles multiple clients concurrently
@@ -50,6 +54,7 @@ private:
         bool want_read = true;           // what the poller is currently asked to report
         bool want_write = false;
         bool queued = false;             // in to_serve_ for this pass of the loop
+        bool authenticated = false;      // AUTH succeeded, or no password is set
     };
 
     enum class SendStatus { Done, Blocked, Failed };
@@ -95,6 +100,7 @@ private:
     int port_;
     std::string bind_address_ = "127.0.0.1";
     bool protected_mode_ = true;
+    std::optional<std::string> password_;
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
     bool running_ = false;

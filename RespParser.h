@@ -55,6 +55,15 @@ public:
     // header line without "\r\n" is an error, not something to wait for.
     static constexpr size_t kMaxHeaderLength = 32;
 
+    // Until a client has given the password, its commands may have at most 10
+    // arguments of at most 16 KB, more than AUTH needs. Without these limits a
+    // client that doesn't know the password could still make the server
+    // buffer up to the 1 GB query limit for it, on every connection. Redis has
+    // the same two limits (added in 6.2.6, the release that fixed
+    // CVE-2021-32675, a denial of service from many-element requests).
+    static constexpr size_t kMaxUnauthenticatedArgs = 10;
+    static constexpr size_t kMaxUnauthenticatedBulk = 16 * 1024;
+
     // What parseInto() found; the arguments themselves are in the caller's vector
     struct Parsed {
         ParseStatus status = ParseStatus::NeedMore;
@@ -72,21 +81,26 @@ public:
     // too long for the small-string buffer: 3 allocations for "GET <16-byte
     // key>".) Arguments are copied only once the whole command has arrived, so
     // a command that arrives in many pieces isn't copied again each time.
-    static Parsed parseInto(std::string_view buffer, std::vector<std::string>& args) {
+    //
+    // `authenticated`: false while the client still owes the password, which
+    // applies the kMaxUnauthenticated* limits, checked as each header arrives.
+    // (An inline command is at most 64 KB either way.)
+    static Parsed parseInto(std::string_view buffer, std::vector<std::string>& args,
+                            bool authenticated = true) {
         if(buffer.empty()) return needMore();
 
         // RESP commands start with '*' (array). Anything else is inline.
         if(buffer[0] == '*') {
-            return parseRespInto(buffer, args);
+            return parseRespInto(buffer, args, authenticated);
         }
         return parseInlineInto(buffer, args);
     }
 
     // The same, with the arguments in a vector of their own (exactly argc of
     // them): for tests and tools, where an allocation doesn't matter.
-    static ParseResult parse(std::string_view buffer) {
+    static ParseResult parse(std::string_view buffer, bool authenticated = true) {
         std::vector<std::string> args;
-        Parsed parsed = parseInto(buffer, args);
+        Parsed parsed = parseInto(buffer, args, authenticated);
         ParseResult r;
         r.status = parsed.status;
         r.consumed = parsed.consumed;
@@ -246,7 +260,8 @@ private:
     }
 
     // Parse a RESP array: *N\r\n followed by N bulk strings
-    static Parsed parseRespInto(std::string_view buffer, std::vector<std::string>& args) {
+    static Parsed parseRespInto(std::string_view buffer, std::vector<std::string>& args,
+                                bool authenticated) {
         // Step 1: Read array header  *N\r\n
         long long count = 0;
         size_t pos = 0;
@@ -254,6 +269,9 @@ private:
         if(header == ParseStatus::NeedMore) return needMore();
         if(header == ParseStatus::Error || count > INT_MAX) {
             return protocolError("invalid multibulk length");
+        }
+        if(!authenticated && count > static_cast<long long>(kMaxUnauthenticatedArgs)) {
+            return protocolError("unauthenticated multibulk length");
         }
         if(count <= 0) {   // "*0" or "*-1": nothing to run; Redis ignores these too
             return ok(0, pos);
@@ -275,6 +293,9 @@ private:
             if(header == ParseStatus::Error || len < 0 ||
                static_cast<unsigned long long>(len) > kMaxBulkLength) {
                 return protocolError("invalid bulk length");
+            }
+            if(!authenticated && static_cast<unsigned long long>(len) > kMaxUnauthenticatedBulk) {
+                return protocolError("unauthenticated bulk length");
             }
 
             // Check we have enough data: len bytes + \r\n

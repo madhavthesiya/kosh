@@ -38,8 +38,9 @@ const char kServerFull[] = "-ERR max number of clients reached\r\n";
 // Protected mode's reply, which Redis also starts with -DENIED
 const char kDenied[] =
     "-DENIED Kosh is running in protected mode: no password is set, so only clients on "
-    "this machine are served. To serve this one, start Kosh with --protected-mode no, "
-    "but only on a network you trust.\r\n";
+    "this machine are served. To serve this one, set a password with --requirepass-file "
+    "or --requirepass, or start Kosh with --protected-mode no, but only on a network "
+    "you trust.\r\n";
 
 // Sends a new client one error reply, as Redis does, then closes its socket.
 // The new socket's send buffer is empty, so the short reply fits. (A client
@@ -192,8 +193,13 @@ bool Server::start() {
     running_ = true;
     std::cout << "Kosh server listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
+    // Who can connect, and whether they need the password (never printed)
+    const char* need = password_ ? ", with the password" : "";
     if(isLoopback(addr.sin_addr)) {
-        std::cout << "Access: this machine only (--bind 0.0.0.0 listens on every interface)\n";
+        std::cout << "Access: this machine only" << need
+                  << " (--bind 0.0.0.0 listens on every interface)\n";
+    } else if(password_) {
+        std::cout << "Access: any machine that can reach port " << port_ << need << "\n";
     } else if(protected_mode_) {
         std::cout << "Access: protected mode: clients on other machines are refused, "
                      "since no password is set\n";
@@ -353,7 +359,7 @@ void Server::acceptNewClients() {
         // Protected mode, as Redis's: with no password, only clients on this
         // machine. Checked first, since it is the lasting reason: a client told
         // "server full" would only retry.
-        if(protected_mode_ && !isLoopback(client_addr.sin_addr)) {
+        if(protected_mode_ && !password_ && !isLoopback(client_addr.sin_addr)) {
             refuseClient(client, kDenied);
             std::cout << "Client refused: " << ip << " is not on this machine (protected mode)\n";
             continue;
@@ -380,8 +386,9 @@ void Server::acceptNewClients() {
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                    reinterpret_cast<const char*>(&flag), sizeof(flag));
 
-        // Register client with empty buffers, watched for readability
-        clients_[client];
+        // Register client with empty buffers, watched for readability. With a
+        // password set, it must AUTH first.
+        clients_[client].authenticated = !password_;
         poller_->add(client);
 
         std::cout << "Client connected: " << ip << ":"
@@ -499,9 +506,14 @@ void Server::runCommands(Client& client) {
     // once per command: quadratic in the number of commands in one read.
     size_t pos = 0;
     CommandContext ctx{storage_, aof_, clients_.size()};
+    ctx.password = password_ ? &*password_ : nullptr;
+    ctx.authenticated = client.authenticated;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
-        // Into args_, whose strings are reused from command to command
-        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_);
+        // Into args_, whose strings are reused from command to command. Until
+        // the client authenticates, smaller limits apply (see RespParser); an
+        // AUTH lifts them for the next command in the same read.
+        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_,
+                                            ctx.authenticated);
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
@@ -516,6 +528,7 @@ void Server::runCommands(Client& client) {
 
         // The reply goes straight into the client's buffer
         executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
+        client.authenticated = ctx.authenticated;   // AUTH may have succeeded
         releaseLargeArgs(parsed.argc);
 
         // QUIT: send its reply, then disconnect; commands after it don't run

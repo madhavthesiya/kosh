@@ -18,6 +18,11 @@ struct CommandContext {
     AOFLogger* aof = nullptr;       // nullptr when the AOF is off (BGREWRITEAOF)
     size_t clients = 0;             // connected clients (INFO)
     bool close_connection = false;  // set by QUIT: close once its reply is sent
+    // The server's password (--requirepass), or nullptr if none is set
+    const std::string* password = nullptr;
+    // Whether this client may run commands: with a password set, only once
+    // AUTH has succeeded. The server keeps it per client; AUTH sets it.
+    bool authenticated = true;
 };
 
 // A command's arguments (args[0] is its name): a view of strings the caller
@@ -51,6 +56,25 @@ struct Command {
 
 // The command changes data. Only these are logged, so only these can be replayed.
 constexpr unsigned kCmdWrite = 1u << 0;
+// The command runs before the client has authenticated (AUTH, QUIT), as
+// Redis's no-auth flag
+constexpr unsigned kCmdNoAuth = 1u << 1;
+
+// Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
+// bound, the comparison below can always take the same time.
+constexpr size_t kMaxPasswordLength = 512;
+
+// Whether `given` equals `secret`, in a time that doesn't depend on how much
+// of `given` is right. std::string's == stops at the first differing byte,
+// so its timing would tell a client how much of a guess is right, and it
+// could find the password a byte at a time. Both are compared as
+// kMaxPasswordLength zero-padded bytes, as Redis's time_independent_strcmp
+// did. Only the lengths affect the time, through the copies: the client's
+// own, and the password's, which is the same on every attempt. A `given`
+// longer than kMaxPasswordLength is rejected at once, which also depends only
+// on the client's input. bench/auth_compare.cpp measures it. `secret` must
+// be at most kMaxPasswordLength bytes.
+bool constantTimeEquals(std::string_view given, std::string_view secret);
 
 // Case-insensitive; nullptr if there is no such command
 const Command* lookupCommand(std::string_view name);
@@ -58,6 +82,8 @@ bool arityMatches(const Command& cmd, size_t argc);
 
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.
+// Checks, in Redis's order: unknown command, arity, authentication (NOAUTH),
+// then whether a write can be logged (MISCONF).
 void executeCommand(CommandContext& ctx, const Args& args, std::string& out);
 
 // The same, for arguments in a vector of their own, appending, or returning

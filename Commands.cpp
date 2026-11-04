@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <climits>
+#include <cstring>
 #include <unordered_map>
 
 namespace {
@@ -81,6 +82,28 @@ void cmdPing(CommandContext&, const Args&, std::string& out) {
 
 void cmdQuit(CommandContext& ctx, const Args&, std::string& out) {
     ctx.close_connection = true;
+    ok(out);
+}
+
+// AUTH <password>, or AUTH <username> <password>: Redis's two forms, where
+// the only user is "default" (as in Redis without ACL users). Replies are
+// Redis's, word for word. A failed AUTH changes nothing: a client that had
+// authenticated stays authenticated, as in Redis.
+void cmdAuth(CommandContext& ctx, const Args& args, std::string& out) {
+    if(args.size() > 3) return RespParser::appendError(out, kSyntaxError);
+    if(args.size() == 2 && !ctx.password) {
+        return RespParser::appendError(out, "ERR AUTH <password> called without any password "
+            "configured for the default user. Are you sure your configuration is correct?");
+    }
+    // User names are case-sensitive, as in Redis. With no password set,
+    // "default" accepts any password (Redis's nopass user).
+    bool user_ok = args.size() == 2 || args[1] == "default";
+    bool password_ok = !ctx.password || constantTimeEquals(args[args.size() - 1], *ctx.password);
+    if(!user_ok || !password_ok) {
+        return RespParser::appendError(out,
+            "WRONGPASS invalid username-password pair or user is disabled.");
+    }
+    ctx.authenticated = true;
     ok(out);
 }
 
@@ -308,7 +331,8 @@ void cmdRewriteAof(CommandContext& ctx, const Args&, std::string& out) {
 const Command kCommands[] = {
     // name           arity  flags      handler
     {"ping",            -1,  0,         cmdPing},
-    {"quit",            -1,  0,         cmdQuit},
+    {"auth",            -2,  kCmdNoAuth, cmdAuth},
+    {"quit",            -1,  kCmdNoAuth, cmdQuit},
     {"command",         -1,  0,         cmdCommand},
     {"client",          -1,  0,         cmdClient},
     {"config",          -2,  0,         cmdConfig},
@@ -384,6 +408,25 @@ const Command* lookupCommand(std::string_view name) {
     return it == index.by_name.end() ? nullptr : it->second;
 }
 
+bool constantTimeEquals(std::string_view given, std::string_view secret) {
+    if(given.size() > kMaxPasswordLength || secret.size() > kMaxPasswordLength) return false;
+    // Zero-padded copies, so the loop always runs over the same 512 bytes.
+    // (Copying takes time in proportion to the lengths: the client's own, and
+    // the password's, which is the same on every attempt.)
+    unsigned char a[kMaxPasswordLength] = {};
+    unsigned char b[kMaxPasswordLength] = {};
+    if(!given.empty()) std::memcpy(a, given.data(), given.size());
+    if(!secret.empty()) std::memcpy(b, secret.data(), secret.size());
+    // volatile, so the compiler can't stop at the first difference: the
+    // result alone would allow it
+    volatile unsigned char diff = 0;
+    for(size_t i = 0; i < kMaxPasswordLength; i++) {
+        diff = static_cast<unsigned char>(diff | (a[i] ^ b[i]));
+    }
+    // Lengths matter too: "abc" padded with zeros equals "abc\0"
+    return diff == 0 && given.size() == secret.size();
+}
+
 bool arityMatches(const Command& cmd, size_t argc) {
     if(cmd.arity >= 0) return argc == static_cast<size_t>(cmd.arity);
     return argc >= static_cast<size_t>(-cmd.arity);
@@ -399,6 +442,12 @@ void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
     if(!arityMatches(*cmd, args.size())) {
         return RespParser::appendError(out, std::string("ERR wrong number of arguments for '")
                                             + cmd->name + "' command");
+    }
+    // After the two checks above, as in Redis (checked on 7.0.15). They tell a
+    // client without the password only what is public: the command names and
+    // how many arguments each takes.
+    if(!ctx.authenticated && !(cmd->flags & kCmdNoAuth)) {
+        return RespParser::appendError(out, "NOAUTH Authentication required.");
     }
     // While the AOF can't be written (a full disk), refuse writes, as Redis
     // does: their records couldn't be saved. Reads still work. Each attempt

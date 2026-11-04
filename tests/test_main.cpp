@@ -2005,12 +2005,105 @@ TEST(test_dispatch_write_flags) {
     for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "PEXPIREAT", "LPUSH", "RPUSH",
                             "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
         ASSERT_TRUE(lookupCommand(name) && (lookupCommand(name)->flags & kCmdWrite));
+        ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
     }
     for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
                             "SISMEMBER", "SCARD", "HGET", "HGETALL", "HLEN", "PING", "INFO",
-                            "BGREWRITEAOF"}) {
+                            "BGREWRITEAOF", "AUTH", "QUIT"}) {
         ASSERT_TRUE(lookupCommand(name) && !(lookupCommand(name)->flags & kCmdWrite));
     }
+    // Only these run without the password; a data command flagged by mistake
+    // would be open to anyone who can connect
+    for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
+                            "SISMEMBER", "SCARD", "HGET", "HGETALL", "HLEN", "PING", "INFO",
+                            "BGREWRITEAOF", "COMMAND", "CLIENT", "CONFIG"}) {
+        ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
+    }
+    ASSERT_TRUE(lookupCommand("AUTH")->flags & kCmdNoAuth);
+    ASSERT_TRUE(lookupCommand("QUIT")->flags & kCmdNoAuth);
+}
+
+// ==================== Authentication ====================
+
+const std::string kNoAuth = "-NOAUTH Authentication required.\r\n";
+const std::string kWrongPass = "-WRONGPASS invalid username-password pair or user is disabled.\r\n";
+
+TEST(test_constant_time_equals) {
+    ASSERT_TRUE(constantTimeEquals("s3cret", "s3cret"));
+    ASSERT_FALSE(constantTimeEquals("x3cret", "s3cret"));    // first byte differs
+    ASSERT_FALSE(constantTimeEquals("s3cres", "s3cret"));    // last byte differs
+    ASSERT_FALSE(constantTimeEquals("s3cre", "s3cret"));     // a prefix
+    ASSERT_FALSE(constantTimeEquals("s3cret!", "s3cret"));   // longer
+    ASSERT_FALSE(constantTimeEquals("", "s3cret"));
+    // Zero padding can't make different lengths equal
+    ASSERT_FALSE(constantTimeEquals(std::string("s3cret\0", 7), "s3cret"));
+    const std::string longest(kMaxPasswordLength, 'p');
+    ASSERT_TRUE(constantTimeEquals(longest, longest));
+    ASSERT_FALSE(constantTimeEquals(longest + "p", longest));
+    std::string last_differs = longest;
+    last_differs.back() = 'q';
+    ASSERT_FALSE(constantTimeEquals(last_differs, longest));
+    // Every byte value counts, including those above 0x7f
+    ASSERT_FALSE(constantTimeEquals("\xff", "\x7f"));
+}
+
+TEST(test_auth_required_before_commands) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), kNoAuth);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), kNoAuth);
+    ASSERT_FALSE(s.exists("k").success);                 // nothing ran
+    ASSERT_EQ(executeCommand(ctx, {"CONFIG", "GET", "x"}), kNoAuth);
+    // As in Redis, unknown commands and wrong arities are reported first
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE'\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET"}), "-ERR wrong number of arguments for 'get' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH"}), "-ERR wrong number of arguments for 'auth' command\r\n");
+
+    // Wrong passwords and users, Redis's replies word for word
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "s3cre"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "s3cret!"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "nobody", "s3cret"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "DEFAULT", "s3cret"}), kWrongPass);   // case-sensitive
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "s3cret", "x"}), "-ERR syntax error\r\n");
+    ASSERT_FALSE(ctx.authenticated);
+
+    ASSERT_EQ(executeCommand(ctx, {"auth", "s3cret"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), "+OK\r\n");
+    // A failed AUTH afterwards changes nothing, as in Redis
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "k"}), "$1\r\nv\r\n");
+
+    // The form with a user name
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "s3cret"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+}
+
+TEST(test_quit_needs_no_auth) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"QUIT"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.close_connection);
+}
+
+TEST(test_auth_without_a_password) {
+    // No password: every client is authenticated, and AUTH answers as Redis does
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "x"}),
+              "-ERR AUTH <password> called without any password configured for the default "
+              "user. Are you sure your configuration is correct?\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "anything"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "nobody", "x"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
 }
 
 // ==================== Pollers ====================
@@ -2075,8 +2168,8 @@ TEST(test_poller_epoll) {
 using ParseStatus = RespParser::ParseStatus;
 
 // The reason the parser gives for rejecting `input`; fails the test if it doesn't.
-std::string protocolErrorOf(const std::string& input) {
-    auto parsed = RespParser::parse(input);
+std::string protocolErrorOf(const std::string& input, bool authenticated = true) {
+    auto parsed = RespParser::parse(input, authenticated);
     if(parsed.status != ParseStatus::Error) {
         throw std::runtime_error("expected a protocol error for: " + input.substr(0, 40));
     }
@@ -2187,6 +2280,27 @@ TEST(test_resp_rejects_oversized_input) {
     ASSERT_EQ(protocolErrorOf("*" + std::string(40, '9')), "invalid multibulk length");
     ASSERT_EQ(protocolErrorOf("*1\r\n$" + std::string(40, '9')), "invalid bulk length");
     ASSERT_EQ(protocolErrorOf(std::string(100 * 1024, 'a')), "too big inline request");
+}
+
+TEST(test_resp_unauthenticated_limits) {
+    // Before AUTH: 10 arguments of 16 KB at most, refused as soon as a header
+    // asks for more, without waiting for the data
+    std::string ten = "*10\r\n";
+    for(int i = 0; i < 10; i++) ten += "$1\r\na\r\n";
+    ASSERT_TRUE(RespParser::parse(ten, false).status == ParseStatus::Ok);
+    ASSERT_EQ(protocolErrorOf("*11\r\n", false), "unauthenticated multibulk length");
+    const std::string bulk(RespParser::kMaxUnauthenticatedBulk, 'b');
+    auto largest = RespParser::parse("*1\r\n$16384\r\n" + bulk + "\r\n", false);
+    ASSERT_TRUE(largest.status == ParseStatus::Ok);
+    ASSERT_EQ(largest.args[0], bulk);
+    ASSERT_EQ(protocolErrorOf("*1\r\n$16385\r\n", false), "unauthenticated bulk length");
+    ASSERT_EQ(protocolErrorOf("*2\r\n$4\r\nAUTH\r\n$100000\r\n", false), "unauthenticated bulk length");
+    // After AUTH, the usual limits
+    ASSERT_TRUE(RespParser::parse("*11\r\n").status == ParseStatus::NeedMore);
+    ASSERT_TRUE(RespParser::parse("*1\r\n$16385\r\n").status == ParseStatus::NeedMore);
+    // An inline command is at most 64 KB either way
+    const std::string longest(RespParser::kMaxInlineLength, 'a');
+    ASSERT_TRUE(RespParser::parse(longest + "\r\n", false).status == ParseStatus::Ok);
 }
 
 TEST(test_resp_inline_length_limit) {
@@ -2391,6 +2505,12 @@ int main() {
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
 
+    std::cout << "\n[Authentication]\n";
+    RUN_TEST(test_constant_time_equals);
+    RUN_TEST(test_auth_required_before_commands);
+    RUN_TEST(test_quit_needs_no_auth);
+    RUN_TEST(test_auth_without_a_password);
+
     std::cout << "\n[Pollers]\n";
     RUN_TEST(test_poller_select);
     RUN_TEST(test_poller_epoll);
@@ -2404,6 +2524,7 @@ int main() {
     RUN_TEST(test_resp_empty_array_is_skipped);
     RUN_TEST(test_resp_rejects_malformed_input);
     RUN_TEST(test_resp_rejects_oversized_input);
+    RUN_TEST(test_resp_unauthenticated_limits);
     RUN_TEST(test_resp_inline_length_limit);
     RUN_TEST(test_resp_every_split_point);
     RUN_TEST(test_resp_serialize);

@@ -123,6 +123,15 @@ add_executable(alloc_count
 )
 target_link_libraries(alloc_count Threads::Threads)
 
+# Times a password check by where the guess goes wrong (see bench/README.md)
+add_executable(auth_compare
+    bench/auth_compare.cpp
+    Commands.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(auth_compare Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
