@@ -94,7 +94,7 @@ void cmdConfig(CommandContext&, const Args& args, std::string& out) {
 }
 
 void cmdInfo(CommandContext& ctx, const Args&, std::string& out) {
-    RespParser::appendBulk(out, "# Server\r\nmini_redis_version:2.0\r\n"
+    RespParser::appendBulk(out, "# Server\r\nkosh_version:2.0\r\n"
                                 "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n");
 }
 

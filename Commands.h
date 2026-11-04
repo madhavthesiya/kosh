@@ -7,7 +7,7 @@
 // The command table, shared by the server and AOF replay.
 //
 // Redis runs client commands and the AOF it replays at startup through the same
-// table. Mini-Redis used to have two paths, the server's dispatch and an if-chain
+// table. Kosh used to have two paths, the server's dispatch and an if-chain
 // in replay, and they already disagreed: replay matched names case-sensitively
 // and ignored extra arguments. With one table, a command can't do one thing when
 // a client sends it and another when it is replayed.

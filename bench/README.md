@@ -1,11 +1,11 @@
 # Measurement tools
 
-Scripts that produce every performance number quoted for Mini-Redis. Each one builds the server itself, so a result always comes from a known commit and build type, and each writes its results together with the machine, compiler, flags and commit it ran on.
+Scripts that produce every performance number quoted for Kosh. Each one builds the server itself, so a result always comes from a known commit and build type, and each writes its results together with the machine, compiler, flags and commit it ran on.
 
 | Script | Measures | Output |
 |---|---|---|
-| [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
-| [`compare_commits.py`](compare_commits.py) | Mini-Redis at several commits in one session, compared round by round with a sign test and a 95% confidence interval for each ratio: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
+| [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Kosh and real Redis | `throughput.md`, `throughput-runs.csv` |
+| [`compare_commits.py`](compare_commits.py) | Kosh at several commits in one session, compared round by round with a sign test and a 95% confidence interval for each ratio: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
@@ -13,7 +13,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | [`lookup_latency.cpp`](lookup_latency.cpp) | ns per GET and SET in the storage engine, and per `find()` in a plain `std::unordered_map` and in `KeyTable`, for tables of 1,000 to 4,000,000 keys, with uniform and Zipf keys; lookups independent (as in a pipeline) and one at a time (full latency); `--eviction both` measures both policies interleaved in one process. The knee where the table outgrows the cache shows the cost of memory latency without hardware counters (no network) | stdout |
 | [`eviction_sim.cpp`](eviction_sim.cpp) | Miss ratio of the engine's eviction on cache traces (Zipf, Zipf with scans, or a CSV such as Twitter's), at capacities given as fractions of the trace's distinct keys, under `--eviction lru`, `sieve` or `both`. Each request is a GET; a miss SETs the key (no network) | stdout |
 | [`eviction_reference.py`](eviction_reference.py) | Replays the requests `eviction_sim --dump-trace` ran through a textbook implementation of each policy; `--expect` fails unless every miss count is exactly the engine's | stdout |
-| [`memory_compare.py`](memory_compare.py) | Memory per key, Mini-Redis against real Redis for the same keys: growth of resident memory (RSS), with Mini-Redis also under jemalloc to separate the allocator from the data layout | `memory.md` |
+| [`memory_compare.py`](memory_compare.py) | Memory per key, Kosh against real Redis for the same keys: growth of resident memory (RSS), with Kosh also under jemalloc to separate the allocator from the data layout | `memory.md` |
 | [`layout_bias.py`](layout_bias.py) | How much `lookup_latency` moves from code and stack layout alone: every link order of its objects, each under several environment sizes, in shuffled order. The spread (with run-to-run noise) is the floor a microbenchmark gain must clear | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
@@ -60,7 +60,7 @@ sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0   # see below
 python3 bench/cpu_profile.py  --out bench/results/<name>/profile
 
 # The select() limit: 1,100 connections against a build (and against real Redis)
-python3 bench/idle_clients.py --server-bin build-bench/mini_redis_server --connections 1100
+python3 bench/idle_clients.py --server-bin build-bench/kosh-server --connections 1100
 python3 bench/idle_clients.py --redis-server redis-server --connections 1100
 
 # A busy client among 1,000 idle ones, select() against epoll
@@ -73,14 +73,14 @@ Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1
 
 ## Method, and why
 
-- **A fresh server for every run,** in an empty temporary directory. Mini-Redis replays its AOF at startup and the file grows with every write, so reusing one would measure a different server each time.
-- **The same durability for both servers.** Mini-Redis hands each AOF record to the OS without `fsync`; Redis runs with `--appendfsync no`, which is the same guarantee. Both are also measured with AOF off. RDB snapshots and automatic AOF rewrites are off for Redis, so neither can start in the middle of a run.
+- **A fresh server for every run,** in an empty temporary directory. Kosh replays its AOF at startup and the file grows with every write, so reusing one would measure a different server each time.
+- **The same durability for both servers.** Kosh hands each AOF record to the OS without `fsync`; Redis runs with `--appendfsync no`, which is the same guarantee. Both are also measured with AOF off. RDB snapshots and automatic AOF rewrites are off for Redis, so neither can start in the middle of a run.
 - **Random keys** (`-r 100000`). Without `-r`, every request uses one key, the best case for hash lookups and CPU caches.
 - **Server and client pinned to different CPUs** with `taskset`, so they never compete for one CPU.
 - **Two `redis-benchmark` threads.** The client makes about as many system calls per request as the server, so a single client thread can run out of CPU before the server does, and the result would then measure the client.
 - **Middle of 3 runs, with the spread shown.** One run can be off for reasons unrelated to the code. The spread ((max − min) / median) says how much to trust a row: compare two versions only when the difference is clearly larger than both spreads.
 - **Runs interleaved:** every combination once, then all again. Slow drift, such as a laptop heating up and throttling, then affects all combinations alike instead of whichever ran last.
-- **The order alternates.** `bench.py` swaps which server goes first from run to run, and `compare_commits.py` reverses its order every other round. Interleaving balances slow drift, but drift *within* a run (a CPU's boost budget running out, for instance) favours whichever is measured first. Until Phase 4 the order never changed: Mini-Redis always went before Redis, and neighbouring commits kept their order in all but one round (see [after-speed-fixes](results/after-speed-fixes/README.md)).
+- **The order alternates.** `bench.py` swaps which server goes first from run to run, and `compare_commits.py` reverses its order every other round. Interleaving balances slow drift, but drift *within* a run (a CPU's boost budget running out, for instance) favours whichever is measured first. Until Phase 4 the order never changed: Kosh always went before Redis, and neighbouring commits kept their order in all but one round (see [after-speed-fixes](results/after-speed-fixes/README.md)).
 - **Commits compared in pairs, round by round** (`compare_commits.py`). Each round measures every version, in an order that rotates from round to round.
   - The ratio within a round compares two versions measured minutes apart, so drift across the session cancels out.
   - The report gives the median of those ratios, their range, and a two-sided sign test: how likely it is that the rounds would agree this much if the change made no difference.

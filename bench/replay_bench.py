@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""How long Mini-Redis takes to start from an AOF of a given size.
+"""How long Kosh takes to start from an AOF of a given size.
 
 For each size it writes an AOF of that many SET commands and times the server
-from launch until it answers PING. Mini-Redis replays the AOF before it starts
+from launch until it answers PING. Kosh replays the AOF before it starts
 listening, so that time is replay plus a fixed startup cost (the 0-command row).
 
-The generated files are byte-for-byte what Mini-Redis itself writes for
+The generated files are byte-for-byte what Kosh itself writes for
 redis-benchmark's SETs (16-byte keys, 3-byte values); every run checks this
 first against a live server. Each value encodes its command number, so a GET
 after startup proves replay reached the end of the file.
@@ -47,7 +47,7 @@ def parse_args():
                    help="stop a run after this many seconds and report '> cap'")
     p.add_argument("--server-cpu", default="2", help="CPU list for the server (taskset)")
     p.add_argument("--server", default="mini", choices=["mini", "redis"],
-                   help="time Mini-Redis (replay.md) or real Redis loading the same files "
+                   help="time Kosh (replay.md) or real Redis loading the same files "
                         "(replay-redis.md)")
     p.add_argument("--redis-server", default="redis-server")
     p.add_argument("--build-dir", type=Path, default=bl.REPO_ROOT / "build-bench")
@@ -57,7 +57,7 @@ def parse_args():
 
 
 def generate(path, commands, keyspace, seed=1):
-    """Writes `commands` SETs of random keys, as Mini-Redis logs them.
+    """Writes `commands` SETs of random keys, as Kosh logs them.
     Returns the last key written and its value."""
     rng = random.Random(seed)
     key = value = None
@@ -76,12 +76,12 @@ def generate(path, commands, keyspace, seed=1):
 
 def check_format(binary, keyspace):
     """Sends SETs to a live server and checks its AOF matches what generate() writes."""
-    with tempfile.TemporaryDirectory(prefix="mini-redis-replay-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-replay-") as workdir:
         expected = Path(workdir) / "expected.aof"
         generate(expected, 5, keyspace, seed=7)
         rng = random.Random(7)
         port = bl.free_port()
-        with bl.Server(bl.mini_redis_argv(binary, port, workdir, True, 2 * keyspace),
+        with bl.Server(bl.kosh_argv(binary, port, workdir, True, 2 * keyspace),
                        workdir, port) as srv:
             srv.wait_ready()
             for i in range(5):
@@ -100,7 +100,7 @@ def time_startup(args, binary, aof, last):
     port = bl.free_port()
     if args.server == "mini":
         workdir = aof.parent
-        argv = bl.mini_redis_argv(binary, port, workdir, True, 2 * args.keyspace)
+        argv = bl.kosh_argv(binary, port, workdir, True, 2 * args.keyspace)
     else:
         # Redis 7 converts a single-file AOF into its multi-part format when it first
         # loads it, moving the file, so each run starts from a fresh copy.
@@ -142,9 +142,9 @@ def main():
         sys.exit(f"{report_path} already exists; pick another --out or delete it")
 
     if mini:
-        args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
+        args.build_dir = bl.build(args.build_dir, ["kosh-server"])
         bl.check_optimised(args.build_dir)
-        binary = args.build_dir / "mini_redis_server"
+        binary = args.build_dir / "kosh-server"
         env_rows = bl.environment(args.build_dir)
         check_format(binary, args.keyspace)
     else:
@@ -152,7 +152,7 @@ def main():
         env_rows = bl.environment(tools=["redis-server"])
 
     results = []   # (commands, aof bytes, median seconds or None, runs)
-    with tempfile.TemporaryDirectory(prefix="mini-redis-replay-") as root:
+    with tempfile.TemporaryDirectory(prefix="kosh-replay-") as root:
         for commands in args.sizes:
             workdir = Path(root) / f"aof-{commands}"
             workdir.mkdir()
@@ -178,11 +178,11 @@ def main():
 
     base = results[0][2] if results and results[0][0] == 0 and results[0][2] else 0.0
     if mini:
-        title = "# AOF replay time: Mini-Redis"
-        timing = ("- **Time:** from launching the server to its first `PONG`. Mini-Redis "
+        title = "# AOF replay time: Kosh"
+        timing = ("- **Time:** from launching the server to its first `PONG`. Kosh "
                   "replays before it listens, so this is replay plus the fixed startup cost in "
                   "the 0-command row.")
-        server = (f"`taskset -c {args.server_cpu} build-bench/mini_redis_server --maxkeys "
+        server = (f"`taskset -c {args.server_cpu} build-bench/kosh-server --maxkeys "
                   f"{2 * args.keyspace} --appendonly yes --appendfilename <generated file>`")
     else:
         title = "# AOF load time: real Redis, same files"
@@ -195,8 +195,8 @@ def main():
     rows = [title, "", bl.environment_markdown(env_rows), "",
             f"- **AOF contents:** N `SET` commands; keys drawn at random from "
             f"{args.keyspace:,} (`key:000000012345`), 3-byte values. Byte-for-byte what "
-            "Mini-Redis writes for redis-benchmark's SETs (checked against a live Mini-Redis "
-            "when measuring Mini-Redis).",
+            "Kosh writes for redis-benchmark's SETs (checked against a live Kosh "
+            "when measuring Kosh).",
             timing + " The AOF has just been written, so it is read from the OS page cache, "
             "not disk.",
             "- **Check:** after each start, `GET` of the last key written must return its last "

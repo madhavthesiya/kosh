@@ -101,7 +101,7 @@ def check_optimised(build_dir):
 
 # ---------------------------------------------------------------- servers
 
-def mini_redis_argv(binary, port, workdir, aof, maxkeys, fsync="no"):
+def kosh_argv(binary, port, workdir, aof, maxkeys, fsync="no"):
     # `fsync` is the AOF's sync policy (always, everysec or no). The server's
     # default is everysec, as Redis's; measurements pass it explicitly, so both
     # servers always run with the same durability.
@@ -112,7 +112,7 @@ def mini_redis_argv(binary, port, workdir, aof, maxkeys, fsync="no"):
 
 
 def redis_argv(binary, port, workdir, aof, fsync="no"):
-    # The same durability as Mini-Redis (`fsync`, "no" unless asked otherwise).
+    # The same durability as Kosh (`fsync`, "no" unless asked otherwise).
     # No RDB snapshots and no automatic AOF rewrites in the middle of a run.
     return [str(binary), "--port", str(port), "--bind", "127.0.0.1", "--dir", str(workdir),
             "--save", "", "--appendonly", "yes" if aof else "no", "--appendfsync", fsync,

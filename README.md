@@ -1,4 +1,6 @@
-# Mini-Redis — Redis-Compatible In-Memory Key-Value Server in C++17
+# Kosh — Redis-Compatible In-Memory Key-Value Server in C++17
+
+*Kosh (कोश) is Sanskrit and Hindi for a treasury: a store of valuables. Formerly Mini-Redis.*
 
 A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
@@ -8,9 +10,9 @@ This is a learning project, not production software. What it does not handle yet
 
 ## Performance
 
-Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability (both with `appendfsync no`). Pipeline 16, 100,000 random keys, 50 clients, middle of 3 runs, the server measured first alternating from run to run. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the memory-latency fixes](bench/results/after-memory-fixes/README.md) (Phase 4B). Earlier stages: [after the speed fixes](bench/results/after-speed-fixes/README.md) (Phase 4), [after the correctness fixes](bench/results/after-correctness-fixes/README.md), [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
+Kosh against real Redis 7.0.15 on the same machine, in the same session, with the same durability (both with `appendfsync no`). Pipeline 16, 100,000 random keys, 50 clients, middle of 3 runs, the server measured first alternating from run to run. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the memory-latency fixes](bench/results/after-memory-fixes/README.md) (Phase 4B). Earlier stages: [after the speed fixes](bench/results/after-speed-fixes/README.md) (Phase 4), [after the correctness fixes](bench/results/after-correctness-fixes/README.md), [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
 
-| Test, pipeline 16 | Mini-Redis | Redis | Mini-Redis / Redis | CPU per request vs Redis | At Phase 4 (`v2-fast`) | At v0-baseline |
+| Test, pipeline 16 | Kosh | Redis | Kosh / Redis | CPU per request vs Redis | At Phase 4 (`v2-fast`) | At v0-baseline |
 |---|---:|---:|---:|---:|---:|---:|
 | SET, AOF on | 350,435 req/s | 254,621 req/s | **1.38×** | **0.67×** | 1.21× | 0.43× |
 | GET, AOF on | 407,664 req/s | 332,934 req/s | **1.22×** | **0.75×** | 1.10× | 0.56× |
@@ -18,8 +20,8 @@ Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, w
 | GET, AOF off | 391,665 req/s | 338,547 req/s | **1.16×** | **0.77×** | 0.95× | 0.48× |
 
 What the measurements show:
-- **Mini-Redis was faster than Redis in all 12 paired runs,** with lower CPU per request in every one (0.66–0.85×) and a lower p99 in every one (3.7–4.1 ms against 4.3–5.0, medians).
-  - CPU per request is the fairer measure here: Mini-Redis ran at 81–91% of a core, so the client and the loopback network limited its throughput too.
+- **Kosh was faster than Redis in all 12 paired runs,** with lower CPU per request in every one (0.66–0.85×) and a lower p99 in every one (3.7–4.1 ms against 4.3–5.0, medians).
+  - CPU per request is the fairer measure here: Kosh ran at 81–91% of a core, so the client and the loopback network limited its throughput too.
   - Ratios to Redis move by up to ±0.10 between sessions on this machine, so the change since Phase 4 is certain where it is larger than that: `GET`, and both tests without AOF, which were at parity.
 - **Phase 4B removed the waits on memory that kept `GET` at parity:**
   - **a hash table of its own** finds a key in half the time of `std::unordered_map` at 100,000 and 1,000,000 keys (Challenge 13);
@@ -421,7 +423,7 @@ A crash at any point leaves either the old file or the new one, whole. `strace` 
 
 ### Challenge 13: A 20 ms Freeze Every Time the Table Grew
 
-**Problem:** In every benchmark run, Mini-Redis's maximum `SET` latency (23–77 ms) was above its maximum `GET` latency (14–22 ms); Redis's `SET`s mostly stayed at 13–17 ms. One max from one run is a noisy sample, so the storage engine was measured directly instead: [`bench/insert_latency`](bench/insert_latency.cpp) times every insert of 100,000 new keys, with no network.
+**Problem:** In every benchmark run, Kosh's maximum `SET` latency (23–77 ms) was above its maximum `GET` latency (14–22 ms); Redis's `SET`s mostly stayed at 13–17 ms. One max from one run is a noisy sample, so the storage engine was measured directly instead: [`bench/insert_latency`](bench/insert_latency.cpp) times every insert of 100,000 new keys, with no network.
 
 **Cause:** `std::unordered_map` grows all at once. The insert that crosses its load factor allocates a bucket array twice the size and moves every key into it. In 5 out of 5 repeats, the slowest inserts were exactly those:
 
@@ -557,7 +559,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 **107 unit tests** (`tests/test_main.cpp`):
 
 ```
-========== Mini-Redis Test Suite ==========
+========== Kosh Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
 [LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
@@ -606,7 +608,7 @@ All four `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer. T
 ## Project Structure
 
 ```
-mini-redis/
+kosh/
 ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 ├── main.cpp                  # CLI entry point (interactive mode)
 ├── Server.h / .cpp           # TCP server — event loop, per-client buffers, RESP I/O
@@ -654,9 +656,9 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 ### Run the server
 
 ```bash
-./build/mini_redis_server                 # port 6379, 10,000 keys, AOF in ./appendonly.aof
-./build/mini_redis_server --port 6380 --maxkeys 1000000 --appendonly no
-./build/mini_redis_server --help
+./build/kosh-server                       # port 6379, 10,000 keys, AOF in ./appendonly.aof
+./build/kosh-server --port 6380 --maxkeys 1000000 --appendonly no
+./build/kosh-server --help
 
 # Connect with redis-cli (in another terminal)
 redis-cli -p 6379
@@ -677,7 +679,7 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 
 ### Benchmark
 
-The numbers in this README come from the scripts in [`bench/`](bench/). They build an optimised binary, run Mini-Redis and real Redis the same way, repeat each test 3 times, and record the machine, compiler and commit next to the results. [bench/README.md](bench/README.md) explains the method.
+The numbers in this README come from the scripts in [`bench/`](bench/). They build an optimised binary, run Kosh and real Redis the same way, repeat each test 3 times, and record the machine, compiler and commit next to the results. [bench/README.md](bench/README.md) explains the method.
 
 ```bash
 python3 bench/bench.py --out bench/results/my-run      # Linux; about 25 minutes
@@ -687,7 +689,7 @@ For a quick manual run:
 
 ```bash
 rm -f appendonly.aof                      # the AOF keeps growing across runs
-./build/mini_redis_server --maxkeys 1000000
+./build/kosh-server --maxkeys 1000000
 redis-benchmark -p 6379 -t set,get -n 1000000 -r 100000 -c 50
 ```
 
@@ -714,15 +716,15 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 ### Interactive CLI
 
 ```bash
-./build/mini_redis
+./build/kosh-cli
 ```
 
 ### Without CMake
 
 ```bash
 # Linux / macOS
-g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis_server
-g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o mini_redis
+g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-server
+g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-cli
 g++ -std=c++17 -O2 -pthread tests/test_main.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
 g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_thread_tests
 ```
@@ -775,7 +777,7 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | `BGREWRITEAOF` runs in the foreground: every client waits while the whole data set is written. | A background rewrite in a `fork()`ed child |
 | A record whose length field is damaged into a larger number looks like an incomplete last record. Startup then cuts it off with everything after it, with a warning giving the number of bytes. Nothing in the file tells the two apart; Redis has the same ambiguity. | None yet; a checksum per record would tell them apart |
 | Replay reads the whole AOF into memory before running it, so startup briefly needs memory for the file as well as the data. | Read it in fixed-size chunks |
-| The interactive CLI (`mini_redis`) still has `SAVE` and `LOAD`, in a text format that holds string keys only and isn't binary-safe. `LOAD` isn't logged to the AOF, so the next start goes back to the data from before it. | Remove them, as in the server |
+| The interactive CLI (`kosh-cli`) still has `SAVE` and `LOAD`, in a text format that holds string keys only and isn't binary-safe. `LOAD` isn't logged to the AOF, so the next start goes back to the data from before it. | Remove them, as in the server |
 
 **Commands and storage**
 

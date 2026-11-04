@@ -157,7 +157,7 @@ bool Server::start() {
 
     poller_->add(listen_socket_);
     running_ = true;
-    std::cout << "Mini-Redis server listening on port " << port_ << "\n";
+    std::cout << "Kosh server listening on port " << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
     std::cout << "I/O multiplexing: " << poller_->name();
     if(poller_->capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << poller_->capacity() << ")";

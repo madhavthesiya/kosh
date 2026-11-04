@@ -4,7 +4,7 @@
 select() rebuilds and scans the sets of every watched socket on each wakeup, so
 its cost grows with the number of connections, idle ones included; epoll returns
 only the sockets that are ready. This holds N idle connections open to
-Mini-Redis, then times one busy client (redis-benchmark -c 1, GET, no
+Kosh, then times one busy client (redis-benchmark -c 1, GET, no
 pipelining) against each poller (--poller), in interleaved rounds. It reports
 requests/s, p50 and p99 latency, and the server's CPU time per request.
 
@@ -59,9 +59,9 @@ def busy_client(args, port):
 
 
 def measure(args, binary, poller, idle):
-    with tempfile.TemporaryDirectory(prefix="mini-redis-idle-load-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-idle-load-") as workdir:
         port = bl.free_port()
-        argv = bl.mini_redis_argv(binary, port, workdir, False, 2 * args.keyspace) + ["--poller", poller]
+        argv = bl.kosh_argv(binary, port, workdir, False, 2 * args.keyspace) + ["--poller", poller]
         with bl.Server(argv, workdir, port, cpus=args.server_cpu) as srv:
             srv.wait_ready()
             sockets, opened, error, _ = open_connections(port, idle)
@@ -88,9 +88,9 @@ def main():
     if soft < want:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(want, hard), hard))
 
-    bl.build(args.build_dir, ["mini_redis_server"])
+    bl.build(args.build_dir, ["kosh-server"])
     bl.check_optimised(args.build_dir)
-    binary = args.build_dir / "mini_redis_server"
+    binary = args.build_dir / "kosh-server"
     env = bl.environment(args.build_dir, tools=["redis-benchmark", "taskset"])
 
     results = {}    # (idle, poller) -> list of runs
@@ -110,7 +110,7 @@ def main():
 
     lines = ["# One busy client among idle ones: select() against epoll", "",
              bl.environment_markdown(env), "",
-             f"- **Server:** `taskset -c {args.server_cpu} build-bench/mini_redis_server "
+             f"- **Server:** `taskset -c {args.server_cpu} build-bench/kosh-server "
              f"--appendonly no --poller <select|epoll>`, with N idle connections open "
              "(each answered one PING, then stayed silent).",
              f"- **Busy client:** `taskset -c {args.client_cpus} redis-benchmark -c 1 -t get "

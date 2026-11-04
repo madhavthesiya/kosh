@@ -26,7 +26,7 @@ struct ServerConfig {
 };
 
 static void printUsage(std::ostream& out) {
-    out << "Usage: mini_redis_server [options]\n"
+    out << "Usage: kosh-server [options]\n"
            "  --port <1-65535>         TCP port to listen on (default 6379)\n"
            "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
            "  --eviction <sieve|lru>   Which key a full server evicts: SIEVE's choice\n"

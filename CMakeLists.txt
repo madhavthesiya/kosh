@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(mini-redis LANGUAGES CXX)
+project(kosh LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -35,17 +35,17 @@ endif()
 find_package(Threads REQUIRED)
 
 # Main executable (CLI mode)
-add_executable(mini_redis
+add_executable(kosh-cli
     main.cpp
     Commands.cpp
     InMemoryStorage.cpp
     AOFLogger.cpp
     RedisLite.cpp
 )
-target_link_libraries(mini_redis Threads::Threads)
+target_link_libraries(kosh-cli Threads::Threads)
 
 # Server executable (TCP + RESP mode)
-add_executable(mini_redis_server
+add_executable(kosh-server
     server_main.cpp
     Server.cpp
     Poller.cpp
@@ -54,9 +54,9 @@ add_executable(mini_redis_server
     AOFLogger.cpp
     RedisLite.cpp
 )
-target_link_libraries(mini_redis_server Threads::Threads)
+target_link_libraries(kosh-server Threads::Threads)
 if(WIN32)
-    target_link_libraries(mini_redis_server ws2_32)
+    target_link_libraries(kosh-server ws2_32)
 endif()
 
 # Unit tests
@@ -133,14 +133,14 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME integration_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
-                     $<TARGET_FILE:mini_redis_server>)
+                     $<TARGET_FILE:kosh-server>)
     # Linux serves with epoll by default; run everything with select() as well,
     # so both pollers stay tested
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME integration_tests_select
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
-                         $<TARGET_FILE:mini_redis_server>)
-        set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "MINI_REDIS_POLLER=select")
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
     endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")

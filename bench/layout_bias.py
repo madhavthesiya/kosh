@@ -70,7 +70,7 @@ def main():
     args = parse_args()
     sizes = [int(s) for s in args.sizes.split(",")]
     env_bytes = [int(b) for b in args.env_bytes.split(",")]
-    with tempfile.TemporaryDirectory(prefix="mini-redis-layout-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kosh-layout-") as tmp:
         tmp = Path(tmp)
         objects = []
         for src in SOURCES:

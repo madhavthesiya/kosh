@@ -13,7 +13,7 @@ exact connection that fails is known. If this script starts the server itself
 status, and saves the server's output, which is where sanitizer reports go.
 
 Usage (on Linux):
-  python3 bench/idle_clients.py --server-bin build/mini_redis_server --connections 1100
+  python3 bench/idle_clients.py --server-bin build/kosh-server --connections 1100
   python3 bench/idle_clients.py --port 6379 --connections 1100
 """
 
@@ -34,7 +34,7 @@ import benchlib as bl
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     target = p.add_mutually_exclusive_group(required=True)
-    target.add_argument("--server-bin", type=Path, help="start this Mini-Redis binary")
+    target.add_argument("--server-bin", type=Path, help="start this Kosh binary")
     target.add_argument("--redis-server", help="start this real Redis binary (for comparison)")
     target.add_argument("--port", type=int, help="use a server already running on this port")
     p.add_argument("--connections", type=int, default=1100)
@@ -91,13 +91,13 @@ def main():
     if soft < want:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(want, hard), hard))
 
-    with tempfile.TemporaryDirectory(prefix="mini-redis-idle-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-idle-") as workdir:
         srv = None
         port = args.port
         if args.port is None:
             port = bl.free_port()
             if args.server_bin:
-                argv = bl.mini_redis_argv(args.server_bin, port, workdir, False, 10_000)
+                argv = bl.kosh_argv(args.server_bin, port, workdir, False, 10_000)
             else:
                 argv = bl.redis_argv(args.redis_server, port, workdir, False) + \
                        ["--maxclients", str(args.connections + 100)]
@@ -137,7 +137,7 @@ def main():
                 shutil.copyfile(srv.log_path, args.log)
                 print(f"Server output saved to {args.log}")
             else:
-                # Mini-Redis's stdout is block-buffered when it goes to a file, so a
+                # Kosh's stdout is block-buffered when it goes to a file, so a
                 # killed server can lose it; crash reports go to unbuffered stderr.
                 print("Last lines of server output:\n" + (srv.log_tail(15) or "(no output)"))
     sys.exit(0 if error is None else 1)

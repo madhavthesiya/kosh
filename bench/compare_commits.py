@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mini-Redis throughput at several commits, measured in one interleaved session.
+"""Kosh throughput at several commits, measured in one interleaved session.
 
 Each commit is checked out into its own git worktree and measured with that
-commit's own bench.py (Mini-Redis only). Every round measures every commit,
+commit's own bench.py (Kosh only). Every round measures every commit,
 so each round gives a paired comparison: the versions measured minutes apart,
 under the same conditions. The order rotates from round to round, so no
 version is always measured first.
@@ -134,7 +134,7 @@ def main():
         sys.exit(f"{args.out} already exists; pick another --out or delete it")
     runs_csv = args.out.with_name(args.out.stem + "-runs.csv")
     # Not /tmp: under WSL, systemd empties it whenever the distribution restarts.
-    work = Path.home() / ".cache" / "mini-redis-compare" / time.strftime("%Y%m%d-%H%M%S")
+    work = Path.home() / ".cache" / "kosh-compare" / time.strftime("%Y%m%d-%H%M%S")
     work.mkdir(parents=True)
 
     versions = []   # (label, worktree, commit description, request flags)

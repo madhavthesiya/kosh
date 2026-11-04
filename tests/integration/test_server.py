@@ -1,6 +1,6 @@
-"""Integration tests: run the real mini_redis_server binary and talk to it over TCP.
+"""Integration tests: run the real kosh-server binary and talk to it over TCP.
 
-Usage:  python3 tests/integration/test_server.py <path-to-mini_redis_server> [unittest args]
+Usage:  python3 tests/integration/test_server.py <path-to-kosh-server> [unittest args]
 CTest runs this automatically (see CMakeLists.txt).
 
 Standard library only, so the test suite stays dependency-free. Each test starts
@@ -42,7 +42,7 @@ def describe_exit(returncode):
 
 
 class ServerProcess:
-    """A running mini_redis_server on a free port, working in `workdir`.
+    """A running kosh-server on a free port, working in `workdir`.
     `nofile` limits its open files (POSIX): a soft limit, or (soft, hard).
     `fsize` limits the size of the files it writes, in bytes (soft limit)."""
 
@@ -63,10 +63,10 @@ class ServerProcess:
             if fsize:
                 resource.setrlimit(resource.RLIMIT_FSIZE,
                                    (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
-        # ctest runs the suite once more with MINI_REDIS_POLLER=select, so the
+        # ctest runs the suite once more with KOSH_POLLER=select, so the
         # select() path stays tested now that Linux uses epoll by default. A
         # test that names a poller itself keeps it.
-        poller = os.environ.get("MINI_REDIS_POLLER")
+        poller = os.environ.get("KOSH_POLLER")
         if poller and "--poller" not in args:
             args = (*args, "--poller", poller)
         self.proc = subprocess.Popen(
@@ -749,6 +749,6 @@ class CommandLineTest(ServerTestCase):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        sys.exit(f"usage: {sys.argv[0]} <path-to-mini_redis_server> [unittest args]")
+        sys.exit(f"usage: {sys.argv[0]} <path-to-kosh-server> [unittest args]")
     SERVER_BINARY = os.path.abspath(sys.argv.pop(1))
     unittest.main()

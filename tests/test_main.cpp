@@ -2265,7 +2265,7 @@ TEST(test_resp_serialize) {
 // ==================== Main ======================================
 
 int main() {
-    std::cout << "\n========== Mini-Redis Test Suite ==========\n\n";
+    std::cout << "\n========== Kosh Test Suite ==========\n\n";
 
     std::cout << "[Basic Operations]\n";
     RUN_TEST(test_set_and_get);

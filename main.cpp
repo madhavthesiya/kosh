@@ -45,7 +45,7 @@ void printResult(const Result& r) {
 }
 
 void printHelp() {
-    std::cout << "\n=== Mini-Redis Commands ===\n\n";
+    std::cout << "\n=== Kosh Commands ===\n\n";
     std::cout << "  String:  SET key value | GET key | SETEX key ttl value\n";
     std::cout << "  Key:     DEL key | EXISTS key | TYPE key | EXPIRE key secs | TTL key\n";
     std::cout << "  List:    LPUSH key val [...] | RPUSH key val [...] | LPOP key | RPOP key\n";
@@ -76,13 +76,13 @@ int main() {
                   << loaded.truncated_bytes << " bytes\n";
     }
 
-    std::cout << "Mini-Redis v2.0 (AOF enabled) — Type HELP for commands\n";
-    std::cout << "mini-redis> ";
+    std::cout << "Kosh v2.0 (AOF enabled) — Type HELP for commands\n";
+    std::cout << "kosh> ";
 
     while(std::getline(std::cin, line)) {
-        if(line.empty()) { std::cout << "mini-redis> "; continue; }
+        if(line.empty()) { std::cout << "kosh> "; continue; }
         auto tokens = split(line);
-        if(tokens.empty()) { std::cout << "mini-redis> "; continue; }
+        if(tokens.empty()) { std::cout << "kosh> "; continue; }
 
         std::string cmd = toUpper(tokens[0]);
 
@@ -209,7 +209,7 @@ int main() {
             std::cout << "ERROR: unknown command '" << tokens[0] << "' (type HELP for usage)\n";
         }
 
-        std::cout << "mini-redis> ";
+        std::cout << "kosh> ";
     }
     return 0;
 }
