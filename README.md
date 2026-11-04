@@ -692,7 +692,7 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 
 **Passwords.** With `--requirepass-file` (or `--requirepass`), a client gets `-NOAUTH` for everything but `AUTH` and `QUIT` until it sends `AUTH <password>` (or `AUTH default <password>`). The replies are Redis's, byte for byte, which matters to client libraries that match on them. Two details guard against a client that doesn't have the password:
 - Until it authenticates, a client's commands may have at most 10 arguments of 16 KB each, Redis's limits since 6.2.6. Without them, a client without the password could still make the server buffer up to 1 GB for it on each connection.
-- The password check takes the same time however much of a guess is right, so response times can't reveal the password byte by byte. `std::string`'s `==` stops at the first difference; [`bench/auth_compare.cpp`](bench/auth_compare.cpp) measures both.
+- The password check takes the same time however much of a guess is right, so response times can't reveal the password byte by byte. [Measured](bench/results/password-check/README.md): at most 1.03× between guesses, where a loop that stops at the first wrong byte takes 79× longer for a right 512-byte guess than for one wrong at the first byte.
 
 ### Benchmark
 
