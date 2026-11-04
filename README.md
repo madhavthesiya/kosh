@@ -793,6 +793,6 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 <div align="center">
 
 **Made by [Madhav Thesiya](https://www.linkedin.com/in/madhavthesiya/)** — If this was useful, drop a ⭐<br>
-**© 2026 Madhav Thesiya. All Rights Reserved.**
+**© 2026 Madhav Thesiya. Released under the [MIT License](LICENSE).**
 
 </div>
