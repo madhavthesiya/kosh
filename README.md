@@ -178,7 +178,7 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 | Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
 | Removals | Every key the server removes on its own, by eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The eviction order isn't rebuilt from the log: reads aren't logged. |
 | Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
-| Damaged file | An incomplete last record, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
+| Damaged file | An incomplete last record, or a transaction without its `EXEC`, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
 | Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis; a failed `everysec` sync does the same. With `always`, a failed write or sync can no longer be made good, so the server sends none of the waiting replies and stops with exit code 1, as Redis does. |
 | Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. It writes the keys oldest first, so loading the new file rebuilds the eviction order. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
 | Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file; `--appendfsync` the sync policy |
@@ -537,6 +537,19 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 
 There is no `SAVE`: the AOF is the server's only persistence. A wrong number of arguments gets Redis's `-ERR wrong number of arguments for '…' command`, and an unknown command Redis's `-ERR unknown command '…', with args beginning with: …`, byte for byte. While AOF writes are failing, write commands get `-MISCONF` (see AOF Persistence).
 
+### Transactions
+| Command | Description |
+|---------|-------------|
+| `MULTI` | Starts a transaction: until `EXEC`, each command is checked and queued (`+QUEUED`) instead of run |
+| `EXEC` | Runs the queued commands one after another and replies with an array of their replies. Nothing else runs in between. |
+| `DISCARD` | Drops the queued commands |
+
+They behave as Redis's, replies included (redis-py's `pipeline()` uses them by default):
+- **A command refused while it queues aborts the transaction.** That means an unknown command, the wrong number of arguments, or a write while the AOF is failing. `EXEC` then replies `-EXECABORT`, and nothing runs.
+- **A command that fails as it runs doesn't stop the others,** for example `WRONGTYPE`. Its error is one element of `EXEC`'s array. There is no rollback.
+- **In the AOF, a transaction that writes is logged between `MULTI` and `EXEC` records.** At startup it is applied only once its `EXEC` is read. One the server stopped writing partway is cut off, so none of it comes back, not a part of it.
+- **Not supported:** `WATCH`. `BGREWRITEAOF` is refused inside a transaction (Redis allows it), because Kosh's rewrite runs in the foreground and would split the transaction's records in the AOF.
+
 ---
 
 ## Complexity
@@ -560,7 +573,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**121 unit tests** (`tests/test_main.cpp`):
+**125 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -581,11 +594,12 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
 [Command Table]        12 tests    ✅  (arity, SET options, strict integers, error replies, PING's message, replies appended in place)
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
+[Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 121 passed, 0 failed
+Results: 125 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -595,13 +609,14 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 52 tests that start the real server binary on a free port and speak RESP over TCP.
+- 55 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
   - the log reaching its file while the server runs, as under systemd or Docker;
   - who can connect: loopback only by default, `--bind`, and protected mode, tested by connecting from this machine's own network address as a client on another machine would;
   - passwords: `NOAUTH` until `AUTH`, `AUTH` in a pipeline, the limits before `AUTH`, `--requirepass-file`, and the password never reaching the log, the AOF or an error message;
   - `HELLO` and RESP3: the protocol switches for its own connection only, `HELLO 3 AUTH` as client libraries send it, client ids and names;
+  - transactions: a pipelined `MULTI`/`EXEC` surviving a restart, a queue no other connection sees, a disconnect dropping it, an incomplete one in the AOF cut off at startup, and `EXEC` refused whole while the AOF can't be written;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
@@ -614,7 +629,7 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 **Fuzzing** (`tests/fuzz/`):
 - A fuzz target in libFuzzer's interface sends arbitrary bytes through the parser and the command table, as the server does, with and without a password set.
 - Besides crashes and sanitizer reports, it checks that the same bytes in two reads parse into exactly the same commands as in one read. Where a read happens to end must not change a command.
-- GCC has no libFuzzer, so a small driver replays the 22 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
+- GCC has no libFuzzer, so a small driver replays the 25 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
 - The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
 - Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which is planned for CI.
 
@@ -651,7 +666,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 121 unit tests
+    ├── test_main.cpp              # 125 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary
@@ -820,6 +835,8 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
+| `WATCH` (optimistic locking for transactions) is not supported: it gets "unknown command", which inside `MULTI` aborts the transaction. | A hook that sees every change to a watched key: writes, deletes, expiry and eviction |
+| `BGREWRITEAOF` is refused inside `MULTI`, which Redis allows. | A background rewrite, which would also lift this |
 | The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
 | On systems other than Linux and macOS (Windows), the key table's big arrays come from `calloc` and are freed at once, so growth can stall for longer there (Challenge 15). | Map and release them with the OS's own calls |
 

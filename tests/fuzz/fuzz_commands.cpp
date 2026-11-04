@@ -88,9 +88,16 @@ Step parseNext(const std::string& in, size_t& pos, std::vector<std::string>& arg
 Parsed runInOneRead(const std::string& data, bool password_set, Outcomes& outcomes) {
     InMemoryStorage storage(16);
     const std::string password = "fuzz-password";
+    // A connection's state, as the server gives each client: without them,
+    // MULTI and the client name would be refused, and their code not fuzzed
+    Transaction transaction;
+    std::string client_name;
     CommandContext ctx{storage};
     if(password_set) ctx.password = &password;
     ctx.authenticated = !password_set;
+    ctx.transaction = &transaction;
+    ctx.client_name = &client_name;
+    ctx.client_id = 1;
 
     Parsed result;
     std::vector<std::string> args;

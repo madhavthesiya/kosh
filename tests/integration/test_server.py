@@ -626,7 +626,10 @@ class AofWriteErrorTest(ServerTestCase):
         value = b"v" * 100
         with tempfile.TemporaryDirectory() as workdir:
             server = self.start_server(workdir=workdir, fsize=4096)
-            with Client(server.port) as c:
+            with Client(server.port) as c, Client(server.port) as t:
+                # A transaction queued while the AOF still takes writes
+                t.call("MULTI")
+                self.assertEqual(t.call("SET", "tx", "1"), b"QUEUED")
                 acknowledged, refusal = [], None
                 for i in range(100):     # about 130 bytes each: 4 KB holds about 30
                     try:
@@ -638,6 +641,21 @@ class AofWriteErrorTest(ServerTestCase):
                 self.assertIsNotNone(refusal, "every SET was acknowledged")
                 self.assertEqual(refusal, "MISCONF Errors writing to the AOF file: File too large")
                 self.assertEqual(c.call("GET", "k0"), value)     # reads still work
+
+                # As in Redis, a transaction that writes is refused whole at EXEC
+                with self.assertRaisesRegex(RespError, "^EXECABORT Transaction discarded because of: MISCONF"):
+                    t.call("EXEC")
+                # A write queued now is refused as it queues, and aborts its transaction
+                c.call("MULTI")
+                with self.assertRaisesRegex(RespError, "^MISCONF"):
+                    c.call("SET", "tx", "2")
+                with self.assertRaisesRegex(RespError, "^EXECABORT Transaction discarded because of previous"):
+                    c.call("EXEC")
+                # One that only reads still runs
+                c.call("MULTI")
+                c.call("GET", "k0")
+                self.assertEqual(c.call("EXEC"), [value])
+                self.assertIsNone(c.call("GET", "tx"))
 
                 # Room on the disk again: what was waiting is written, writes resume
                 hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
@@ -826,6 +844,53 @@ class Resp3Test(ServerTestCase):
             _, hello = b.typed("HELLO", "3", "SETNAME", "worker-2")
             self.assertEqual(hello[b"id"], ids[1])
             self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", b"worker-2"))
+
+
+class TransactionTest(ServerTestCase):
+    """MULTI/EXEC/DISCARD over real connections (redis-py's pipeline() uses them by default)."""
+
+    def test_transaction_runs_at_exec_and_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                c.sock.sendall(b"".join(Client.encode(cmd) for cmd in
+                               (["MULTI"], ["SET", "a", "1"], ["RPUSH", "l", "x", "y"], ["GET", "a"], ["EXEC"])))
+                self.assertEqual([c.read_reply() for _ in range(4)], [b"OK", b"QUEUED", b"QUEUED", b"QUEUED"])
+                self.assertEqual(c.read_reply(), [b"OK", 2, b"1"])
+            server.stop()
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertEqual(c.call("LRANGE", "l", 0, -1), [b"x", b"y"])
+
+    def test_a_transaction_is_its_connections_own(self):
+        server = self.start_server("--appendonly", "no")
+        with Client(server.port) as a, Client(server.port) as b:
+            a.call("MULTI")
+            self.assertEqual(a.call("SET", "k", "v"), b"QUEUED")
+            self.assertIsNone(b.call("GET", "k"))          # not run yet, and b isn't queuing
+            self.assertEqual(a.call("EXEC"), [b"OK"])
+            self.assertEqual(b.call("GET", "k"), b"v")
+        # A client that disconnects in the middle of one leaves nothing behind
+        with Client(server.port) as a:
+            a.call("MULTI")
+            a.call("SET", "gone", "1")
+        with Client(server.port) as b:
+            self.assertIsNone(b.call("GET", "gone"))
+
+    def test_incomplete_transaction_in_the_aof_is_cut_off_at_startup(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            before = Client.encode(["SET", "x", "1"])
+            with open(os.path.join(workdir, "appendonly.aof"), "wb") as f:
+                f.write(before + Client.encode(["MULTI"]) + Client.encode(["SET", "a", "1"]))
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                self.assertEqual(c.call("GET", "x"), b"1")
+                self.assertIsNone(c.call("GET", "a"))
+            self.assertIn("incomplete record or transaction", server.output())
+            server.stop()
+            with open(os.path.join(workdir, "appendonly.aof"), "rb") as f:
+                self.assertEqual(f.read(), before)
 
 
 NOAUTH = "^NOAUTH Authentication required.$"

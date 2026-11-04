@@ -87,6 +87,8 @@ const char* const kTokens[] = {
     "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "SADD", "SREM", "SMEMBERS", "SISMEMBER",
     "SCARD", "HSET", "HGET", "HDEL", "HGETALL", "HLEN", "INFO", "CONFIG", "CLIENT",
     "COMMAND", "BGREWRITEAOF", "*1\r\n$4\r\nPING\r\n", "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+    "MULTI", "EXEC", "DISCARD", "HELLO", "SETNAME", "GETNAME", "ID", "*1\r\n$5\r\nMULTI\r\n",
+    "*1\r\n$4\r\nEXEC\r\n", "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n",
 };
 
 std::string mutate(std::string s, const std::vector<std::string>& corpus, std::mt19937_64& rng) {

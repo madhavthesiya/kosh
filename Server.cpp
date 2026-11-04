@@ -513,6 +513,7 @@ void Server::runCommands(Client& client) {
     ctx.protocol = client.protocol;
     ctx.client_id = client.id;
     ctx.client_name = &client.name;
+    ctx.transaction = &client.transaction;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
         // Into args_, whose strings are reused from command to command. Until
         // the client authenticates, smaller limits apply (see RespParser); an

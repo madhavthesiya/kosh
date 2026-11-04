@@ -466,12 +466,61 @@ void cmdRewriteAof(CommandContext& ctx, const Args&, std::string& out) {
     ok(out);
 }
 
+// ---- Transactions ----
+// MULTI starts queuing (executeCommand queues, see there), EXEC runs the
+// queue, DISCARD drops it. Replies and errors are Redis 7.0.15's.
+
+void cmdMulti(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction) return RespParser::appendError(out, "ERR MULTI needs a client connection");
+    // A nested MULTI is an error, but it doesn't abort the transaction
+    if(ctx.transaction->active) return RespParser::appendError(out, "ERR MULTI calls can not be nested");
+    *ctx.transaction = Transaction{};
+    ctx.transaction->active = true;
+    ok(out);
+}
+
+void cmdDiscard(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction || !ctx.transaction->active) {
+        return RespParser::appendError(out, "ERR DISCARD without MULTI");
+    }
+    *ctx.transaction = Transaction{};
+    ok(out);
+}
+
+// Runs the queued commands one after another and replies with an array of
+// their replies. A command that fails as it runs (WRONGTYPE) doesn't stop
+// the others: as in Redis, there is no rollback. Nothing else can run in
+// between, since the server runs one command at a time.
+//
+// In the AOF, a transaction that may write is logged between MULTI and EXEC
+// records, and replay applies it only once it reaches the EXEC: a server that
+// stops while writing the transaction leaves none of it, not a part.
+void cmdExec(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction || !ctx.transaction->active) {
+        return RespParser::appendError(out, "ERR EXEC without MULTI");
+    }
+    if(ctx.transaction->aborted) {
+        *ctx.transaction = Transaction{};
+        return RespParser::appendError(out, "EXECABORT Transaction discarded because of previous errors.");
+    }
+    Transaction taken = std::move(*ctx.transaction);
+    *ctx.transaction = Transaction{};       // so the commands run, instead of being queued
+    bool log = taken.writes && ctx.aof;
+    if(log) ctx.aof->log("*1\r\n$5\r\nMULTI\r\n");
+    RespParser::appendLength(out, '*', taken.queued.size());
+    for(const auto& command : taken.queued) executeCommand(ctx, Args(command), out);
+    if(log) ctx.aof->log("*1\r\n$4\r\nEXEC\r\n");
+}
+
 const Command kCommands[] = {
     // name           arity  flags      handler
     {"ping",            -1,  0,         cmdPing},
     {"auth",            -2,  kCmdNoAuth, cmdAuth},
     {"hello",           -1,  kCmdNoAuth, cmdHello},
-    {"quit",            -1,  kCmdNoAuth, cmdQuit},
+    {"quit",            -1,  kCmdNoAuth | kCmdNotQueued, cmdQuit},
+    {"multi",            1,  kCmdNotQueued, cmdMulti},
+    {"exec",             1,  kCmdNotQueued, cmdExec},
+    {"discard",          1,  kCmdNotQueued, cmdDiscard},
     {"command",         -1,  0,         cmdCommand},
     {"client",          -2,  0,         cmdClient},
     {"config",          -2,  0,         cmdConfig},
@@ -507,8 +556,11 @@ const Command kCommands[] = {
     {"hgetall",          2,  0,         cmdHgetall},
     {"hlen",             2,  0,         cmdHlen},
 
-    {"bgrewriteaof",    -1,  0,         cmdRewriteAof},
-    {"aofrewrite",      -1,  0,         cmdRewriteAof},
+    // Refused inside MULTI, unlike in Redis: Kosh rewrites in the foreground,
+    // so a rewrite in the middle of EXEC would start the new file after the
+    // transaction's MULTI record, and replay would find an EXEC without one
+    {"bgrewriteaof",    -1,  kCmdNoMulti, cmdRewriteAof},
+    {"aofrewrite",      -1,  kCmdNoMulti, cmdRewriteAof},
 };
 
 struct CommandIndex {
@@ -592,24 +644,45 @@ std::string unknownCommandError(const Args& args) {
 
 void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.empty()) return RespParser::appendError(out, "ERR empty command");
+    Transaction* tx = ctx.transaction;
+    const bool in_multi = tx && tx->active;
     const Command* cmd = lookupCommand(args[0]);
-    if(!cmd) return RespParser::appendError(out, unknownCommandError(args));
+
+    // A command refused before it runs, as Redis's rejectCommand: inside
+    // MULTI it also aborts the transaction, and a refused EXEC discards it,
+    // with an EXECABORT that says why
+    auto reject = [&](const std::string& error) {
+        if(in_multi) tx->aborted = true;
+        if(cmd && cmd->handler == cmdExec) {
+            if(tx) *tx = Transaction{};
+            return RespParser::appendError(out, "EXECABORT Transaction discarded because of: " + error);
+        }
+        RespParser::appendError(out, error);
+    };
+
+    if(!cmd) return reject(unknownCommandError(args));
     if(!arityMatches(*cmd, args.size())) {
-        return RespParser::appendError(out, std::string("ERR wrong number of arguments for '")
-                                            + cmd->name + "' command");
+        return reject(std::string("ERR wrong number of arguments for '") + cmd->name + "' command");
     }
     // After the two checks above, as in Redis (checked on 7.0.15). They tell a
     // client without the password only what is public: the command names and
     // how many arguments each takes.
-    if(!ctx.authenticated && !(cmd->flags & kCmdNoAuth)) {
-        return RespParser::appendError(out, "NOAUTH Authentication required.");
-    }
+    if(!ctx.authenticated && !(cmd->flags & kCmdNoAuth)) return reject("NOAUTH Authentication required.");
+    if(in_multi && (cmd->flags & kCmdNoMulti)) return reject("ERR Command not allowed inside a transaction");
     // While the AOF can't be written (a full disk), refuse writes, as Redis
     // does: their records couldn't be saved. Reads still work. Each attempt
     // retries first, so writes resume as soon as the file takes data again.
-    if((cmd->flags & kCmdWrite) && ctx.aof && !ctx.aof->flushPending()) {
-        return RespParser::appendError(out, "MISCONF Errors writing to the AOF file: " +
-                                            ctx.aof->lastWriteError());
+    // An EXEC whose transaction writes is refused whole, as in Redis.
+    bool writes = (cmd->flags & kCmdWrite) || (cmd->handler == cmdExec && in_multi && tx->writes);
+    if(writes && ctx.aof && !ctx.aof->flushPending()) {
+        return reject("MISCONF Errors writing to the AOF file: " + ctx.aof->lastWriteError());
+    }
+
+    // Inside MULTI, queue it: it runs at EXEC
+    if(in_multi && !(cmd->flags & kCmdNotQueued)) {
+        tx->queued.emplace_back(args.begin(), args.end());
+        if(cmd->flags & kCmdWrite) tx->writes = true;
+        return RespParser::appendSimpleString(out, "QUEUED");
     }
     cmd->handler(ctx, args, out);
 }
@@ -643,40 +716,72 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
         return result;
     };
 
+    // A transaction's records, from its MULTI on: applied together at its
+    // EXEC, so one the server stopped writing partway leaves nothing behind
+    bool in_transaction = false;
+    size_t transaction_start = 0;
+    std::vector<std::vector<std::string>> transaction;
+    auto run = [&](const Command& cmd, const Args& args) {
+        discarded.clear();
+        cmd.handler(ctx, args, discarded);
+        result.commands++;
+    };
+
     // Parse from a moving position. Erasing each command from the front of the
     // buffer moved the whole rest of the file every time: quadratic in its size.
     size_t pos = 0;
+    size_t incomplete_at = buffer.size();       // where a record cut short begins
     while(pos < buffer.size()) {
         auto parsed = RespParser::parseInto(std::string_view(buffer).substr(pos), scratch);
         if(parsed.status == RespParser::ParseStatus::NeedMore) {
-            // The file ends partway through a record: the server stopped while
-            // writing it. Cut it off, or new records would be appended after it
-            // and read as its missing part at the next start (Redis also does
-            // this, with aof-load-truncated). A length damaged into a larger one
-            // looks the same and would cut more; nothing in the file tells them apart.
-            if(!aof.truncate(pos)) {
-                result.ok = false;
-                result.error = "cannot cut off the incomplete record at byte " +
-                               std::to_string(pos) + ": " + aof.lastError();
-                return result;
-            }
-            result.truncated_bytes = buffer.size() - pos;
+            incomplete_at = pos;
             break;
         }
         if(parsed.status == RespParser::ParseStatus::Error) return damaged(pos, parsed.error);
 
         Args args(scratch.data(), parsed.argc);
         if(!args.empty()) {
-            // Only write commands are logged, so anything else means the file is damaged
-            const Command* cmd = lookupCommand(args[0]);
-            if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
-                return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
+            if(args.size() == 1 && equalsIgnoreCase(args[0], "MULTI")) {
+                if(in_transaction) return damaged(pos, "MULTI inside a transaction");
+                in_transaction = true;
+                transaction_start = pos;
+                transaction.clear();
+            } else if(args.size() == 1 && equalsIgnoreCase(args[0], "EXEC")) {
+                if(!in_transaction) return damaged(pos, "EXEC without MULTI");
+                for(const auto& command : transaction) {
+                    Args queued(command);
+                    run(*lookupCommand(queued[0]), queued);
+                }
+                in_transaction = false;
+                transaction.clear();
+            } else {
+                // Only write commands are logged, so anything else means the file is damaged
+                const Command* cmd = lookupCommand(args[0]);
+                if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
+                    return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
+                }
+                if(in_transaction) transaction.emplace_back(args.begin(), args.end());
+                else run(*cmd, args);
             }
-            discarded.clear();
-            cmd->handler(ctx, args, discarded);
-            result.commands++;
         }
         pos += parsed.consumed;
+    }
+
+    // The file ends partway through a record, or a transaction without its
+    // EXEC: the server stopped while writing it. Cut it off, or new records
+    // would be appended after it and read as its missing part at the next
+    // start (Redis also does this, with aof-load-truncated). A length damaged
+    // into a larger one looks the same and would cut more; nothing in the
+    // file tells them apart.
+    size_t cut = in_transaction ? transaction_start : incomplete_at;
+    if(cut < buffer.size()) {
+        if(!aof.truncate(cut)) {
+            result.ok = false;
+            result.error = "cannot cut off the incomplete record at byte " +
+                           std::to_string(cut) + ": " + aof.lastError();
+            return result;
+        }
+        result.truncated_bytes = buffer.size() - cut;
     }
     return result;
 }

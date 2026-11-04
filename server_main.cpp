@@ -223,8 +223,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         if(loaded.truncated_bytes > 0) {
-            std::cerr << "Warning: the AOF ended with an incomplete record (the server stopped "
-                         "while writing it); cut off its " << loaded.truncated_bytes << " bytes\n";
+            std::cerr << "Warning: the AOF ended with an incomplete record or transaction (the "
+                         "server stopped while writing it); cut off its " << loaded.truncated_bytes
+                      << " bytes\n";
         }
         std::cout << "Loaded " << loaded.commands
                   << (loaded.commands == 1 ? " command" : " commands") << " from the AOF\n";

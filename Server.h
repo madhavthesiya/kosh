@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 
+#include "Commands.h"         // Transaction
 #include "InMemoryStorage.h"
 #include "RespParser.h"
 
@@ -59,6 +60,7 @@ private:
         int protocol = 2;                // RESP2 until HELLO 3
         uint64_t id = 0;                 // CLIENT ID: 1, 2, 3... in order of connection
         std::string name;                // CLIENT SETNAME; empty: none
+        Transaction transaction;         // MULTI ... EXEC
     };
 
     enum class SendStatus { Done, Blocked, Failed };

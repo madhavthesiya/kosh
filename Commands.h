@@ -13,6 +13,16 @@
 // and ignored extra arguments. With one table, a command can't do one thing when
 // a client sends it and another when it is replayed.
 
+// A client's transaction, from MULTI to EXEC or DISCARD. Commands are checked
+// and queued, then run together at EXEC: the server runs one command at a
+// time, so nothing else runs in between.
+struct Transaction {
+    bool active = false;        // after MULTI
+    bool aborted = false;       // a command was refused while queuing: EXEC refuses (EXECABORT)
+    bool writes = false;        // a queued command changes data
+    std::vector<std::vector<std::string>> queued;
+};
+
 // What a command can use besides its arguments
 struct CommandContext {
     InMemoryStorage& storage;
@@ -29,6 +39,7 @@ struct CommandContext {
     int protocol = 2;
     uint64_t client_id = 0;                 // CLIENT ID, HELLO
     std::string* client_name = nullptr;     // CLIENT SETNAME/GETNAME; nullptr: no connection
+    Transaction* transaction = nullptr;     // MULTI/EXEC; nullptr: no connection
 };
 
 // A command's arguments (args[0] is its name): a view of strings the caller
@@ -65,6 +76,12 @@ constexpr unsigned kCmdWrite = 1u << 0;
 // The command runs before the client has authenticated (AUTH, HELLO, QUIT),
 // as Redis's no-auth flag
 constexpr unsigned kCmdNoAuth = 1u << 1;
+// Inside MULTI, the command runs at once instead of being queued (MULTI,
+// EXEC, DISCARD, QUIT), as in Redis
+constexpr unsigned kCmdNotQueued = 1u << 2;
+// Refused inside MULTI, which it then aborts: "Command not allowed inside a
+// transaction", Redis's no-multi flag
+constexpr unsigned kCmdNoMulti = 1u << 3;
 
 // Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
 // bound, the comparison below can always take the same time.
@@ -89,7 +106,9 @@ bool arityMatches(const Command& cmd, size_t argc);
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.
 // Checks, in Redis's order: unknown command, arity, authentication (NOAUTH),
-// then whether a write can be logged (MISCONF).
+// a command refused inside MULTI, then whether a write can be logged
+// (MISCONF). Inside MULTI, a command that passes is queued (+QUEUED); one
+// that doesn't aborts the transaction.
 void executeCommand(CommandContext& ctx, const Args& args, std::string& out);
 
 // The same, for arguments in a vector of their own, appending, or returning

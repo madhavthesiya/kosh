@@ -2260,6 +2260,169 @@ TEST(test_auth_without_a_password) {
     ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
 }
 
+// ==================== Transactions ====================
+// Expected bytes are Redis 7.0.15's for the same commands
+
+TEST(test_transactions_queue_and_run) {
+    InMemoryStorage s(10);
+    Transaction tx;
+    CommandContext ctx{s};
+    ctx.transaction = &tx;
+    ASSERT_EQ(executeCommand(ctx, {"MULTI"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), "+QUEUED\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET", "k"}), "+QUEUED\r\n");
+    ASSERT_FALSE(s.exists("k").success);                    // nothing ran yet
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*2\r\n+OK\r\n$1\r\nv\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"multi"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"exec"}), "*0\r\n");     // empty
+    // A command that fails as it runs doesn't stop the others: no rollback
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "l", "x"});
+    executeCommand(ctx, {"LPUSH", "l", "a"});
+    executeCommand(ctx, {"GET", "l"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*3\r\n+OK\r\n-WRONGTYPE Operation against a key holding "
+                                             "the wrong kind of value\r\n$1\r\nx\r\n");
+    // DISCARD drops the queue
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "d", "1"});
+    ASSERT_EQ(executeCommand(ctx, {"DISCARD"}), "+OK\r\n");
+    ASSERT_FALSE(s.exists("d").success);
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DISCARD"}), "-ERR DISCARD without MULTI\r\n");
+    // HELLO runs at EXEC, and the replies after it in the same EXEC are RESP3
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"HELLO", "3"});
+    executeCommand(ctx, {"GET", "missing"});
+    std::string replies = executeCommand(ctx, {"EXEC"});
+    ASSERT_EQ(replies.substr(0, 8), "*2\r\n%7\r\n");
+    ASSERT_EQ(replies.substr(replies.size() - 3), "_\r\n");
+    // QUIT runs at once, even inside MULTI
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"QUIT"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.close_connection);
+}
+
+TEST(test_transactions_abort) {
+    InMemoryStorage s(10);
+    Transaction tx;
+    CommandContext ctx{s};
+    ctx.transaction = &tx;
+    const std::string execabort = "-EXECABORT Transaction discarded because of previous errors.\r\n";
+    // A command refused while queuing aborts the whole transaction
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE', with args beginning with: \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    ASSERT_FALSE(s.exists("k").success);
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");    // and it's gone
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"GET"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"MULTI", "x"}), "-ERR wrong number of arguments for 'multi' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    // Not allowed inside a transaction (in Kosh: a foreground rewrite would split it in the AOF)
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"BGREWRITEAOF"}), "-ERR Command not allowed inside a transaction\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    // A nested MULTI is an error, but doesn't abort
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"MULTI"}), "-ERR MULTI calls can not be nested\r\n");
+    executeCommand(ctx, {"PING"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*1\r\n+PONG\r\n");
+    // An EXEC refused itself discards, saying why
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC", "x"}),
+              "-EXECABORT Transaction discarded because of: ERR wrong number of arguments for 'exec' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");
+    ASSERT_FALSE(s.exists("k").success);
+
+    // Before AUTH: MULTI is refused, and EXEC says why
+    const std::string password = "s3cret";
+    CommandContext locked{s};
+    locked.transaction = &tx;
+    locked.password = &password;
+    locked.authenticated = false;
+    ASSERT_EQ(executeCommand(locked, {"MULTI"}), kNoAuth);
+    ASSERT_EQ(executeCommand(locked, {"EXEC"}),
+              "-EXECABORT Transaction discarded because of: NOAUTH Authentication required.\r\n");
+}
+
+TEST(test_transactions_in_the_aof) {
+    // A transaction that writes is logged between MULTI and EXEC; one that
+    // only reads isn't logged at all
+    const std::string aof_file = "test_aof_transactions.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        Transaction tx;
+        CommandContext ctx{s, &aof};
+        ctx.transaction = &tx;
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"MULTI"}, {"SET", "a", "1"}, {"SET", "b", "2"}, {"EXEC"},
+                {"MULTI"}, {"GET", "a"}, {"EXEC"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    std::string bytes;
+    {
+        AOFLogger aof(aof_file);
+        bytes = aof.readRaw();
+    }
+    ASSERT_EQ(bytes, "*1\r\n$5\r\nMULTI\r\n"
+                     "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                     "*1\r\n$4\r\nEXEC\r\n");
+    AOFLogger aof(aof_file);
+    InMemoryStorage s(10, &aof);
+    auto loaded = replayAOF(s, aof);
+    ASSERT_TRUE(loaded.ok);
+    ASSERT_EQ(loaded.commands, size_t{2});
+    ASSERT_EQ(s.get("a").value, "1");
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_replay_drops_an_incomplete_transaction) {
+    // The server stopped while writing a transaction: replay applies none of
+    // it, and cuts it off the file, as an incomplete record
+    auto record = [](std::initializer_list<std::string_view> words) {
+        std::string r;
+        RespParser::appendArray(r, words);
+        return r;
+    };
+    const std::string before = record({"SET", "x", "1"});
+    const std::string multi = record({"MULTI"});
+    const std::string set_a = record({"SET", "a", "1"});
+    const std::string set_b = record({"SET", "b", "1"});
+    const std::string aof_file = "test_aof_incomplete_tx.aof";
+    // Cut after a whole record, and in the middle of one
+    for(const std::string& tail : {multi + set_a + set_b, multi + set_a + set_b.substr(0, 9)}) {
+        std::remove(aof_file.c_str());
+        { std::ofstream(aof_file, std::ios::binary) << before << tail; }
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.truncated_bytes, tail.size());
+        ASSERT_EQ(s.get("x").value, "1");
+        ASSERT_FALSE(s.exists("a").success);
+        ASSERT_EQ(aof.readRaw(), before);
+    }
+    // A transaction's markers out of place mean damage, not a cut-short write
+    for(const std::string& bad : {before + record({"EXEC"}), before + multi + multi + record({"EXEC"})}) {
+        std::remove(aof_file.c_str());
+        { std::ofstream(aof_file, std::ios::binary) << bad; }
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_FALSE(loaded.ok);
+        ASSERT_TRUE(loaded.error.find("damaged") != std::string::npos);
+    }
+    std::remove(aof_file.c_str());
+}
+
 // ==================== RESP3 and HELLO ====================
 // Expected bytes are Redis 7.0.15's for the same commands
 
@@ -2785,6 +2948,12 @@ int main() {
     RUN_TEST(test_auth_required_before_commands);
     RUN_TEST(test_quit_needs_no_auth);
     RUN_TEST(test_auth_without_a_password);
+
+    std::cout << "\n[Transactions]\n";
+    RUN_TEST(test_transactions_queue_and_run);
+    RUN_TEST(test_transactions_abort);
+    RUN_TEST(test_transactions_in_the_aof);
+    RUN_TEST(test_aof_replay_drops_an_incomplete_transaction);
 
     std::cout << "\n[RESP3 and HELLO]\n";
     RUN_TEST(test_resp3_reply_types);
