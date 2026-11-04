@@ -2026,6 +2026,16 @@ TEST(test_dispatch_appends_replies) {
                    "-ERR unknown command 'NOSUCH', with args beginning with: \r\n");
 }
 
+TEST(test_dispatch_ping) {
+    // Redis 7.0.15's replies: a message comes back as a bulk string
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", "hi"}), "$2\r\nhi\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", ""}), "$0\r\n\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", "a", "b"}), "-ERR wrong number of arguments for 'ping' command\r\n");
+}
+
 TEST(test_dispatch_quit_closes_connection) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
@@ -2743,6 +2753,7 @@ int main() {
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
     RUN_TEST(test_dispatch_appends_replies);
+    RUN_TEST(test_dispatch_ping);
     RUN_TEST(test_dispatch_quit_closes_connection);
     RUN_TEST(test_dispatch_set_options);
     RUN_TEST(test_dispatch_set_rejects_bad_options);

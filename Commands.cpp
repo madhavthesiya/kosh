@@ -78,7 +78,10 @@ std::string parseExpiry(const std::string& text, bool seconds, bool relative,
 
 // ---- Connection and server ----
 
-void cmdPing(CommandContext&, const Args&, std::string& out) {
+// PING [message]: PONG, or the message back as a bulk string, as in Redis
+void cmdPing(CommandContext&, const Args& args, std::string& out) {
+    if(args.size() > 2) return RespParser::appendError(out, "ERR wrong number of arguments for 'ping' command");
+    if(args.size() == 2) return RespParser::appendBulk(out, args[1]);
     RespParser::appendSimpleString(out, "PONG");
 }
 

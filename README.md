@@ -527,7 +527,7 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 ### Server Commands
 | Command | Description |
 |---------|-------------|
-| `PING` | Returns PONG |
+| `PING` | `PING [message]`: PONG, or the message back |
 | `AUTH` | `AUTH password` or `AUTH default password`: authenticates the connection when the server has a password (see [Who can connect](#run-the-server)). A wrong one gets `-WRONGPASS` and changes nothing. |
 | `HELLO` | `HELLO [2\|3] [AUTH default password] [SETNAME name]`: picks the connection's protocol, RESP2 (the default) or RESP3, can authenticate and name it, and describes the server. In RESP3, a missing value is `_`, `HGETALL` and `CONFIG GET` reply with maps, `SMEMBERS` with a set, and `INFO` with a verbatim string, as in Redis. |
 | `CLIENT` | `ID`, `GETNAME`, `SETNAME name`, `HELP`. Other subcommands get Redis's "unknown subcommand" error, which clients skip. |
@@ -560,7 +560,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**120 unit tests** (`tests/test_main.cpp`):
+**121 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -579,13 +579,13 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Type Safety]           4 tests    ✅
 [LRU with Mixed Types]  1 test     ✅
 [AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
-[Command Table]        11 tests    ✅  (arity, SET options, strict integers, error replies, replies appended in place)
+[Command Table]        12 tests    ✅  (arity, SET options, strict integers, error replies, PING's message, replies appended in place)
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 120 passed, 0 failed
+Results: 121 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -651,7 +651,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 120 unit tests
+    ├── test_main.cpp              # 121 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary
