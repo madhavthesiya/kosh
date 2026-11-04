@@ -607,7 +607,14 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
   - the client-disconnect regression (Challenge 7).
 - `ctest` runs them twice: with the default poller, and with `--poller select`, so the path `epoll` replaced as the default stays tested.
 
-All four `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
+**Fuzzing** (`tests/fuzz/`):
+- A fuzz target in libFuzzer's interface sends arbitrary bytes through the parser and the command table, as the server does, with and without a password set.
+- Besides crashes and sanitizer reports, it checks that the same bytes in two reads parse into exactly the same commands as in one read. Where a read happens to end must not change a command.
+- GCC has no libFuzzer, so a small driver replays the 22 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
+- The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
+- Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which is planned for CI.
+
+All five `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
 
 ---
 
@@ -642,6 +649,7 @@ kosh/
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary
+    ├── fuzz/                      # Fuzz target for the parser and commands, its driver, seed corpus
     └── windows/
         └── port_test.ps1          # How the server takes its port, run on Windows
 ```

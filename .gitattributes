@@ -1,0 +1,2 @@
+# Fuzz inputs are raw bytes from clients, CRLF included: never convert them
+tests/fuzz/corpus/** binary

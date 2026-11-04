@@ -135,9 +135,28 @@ add_executable(auth_compare
 )
 target_link_libraries(auth_compare Threads::Threads)
 
+# Fuzz target: client bytes through the parser and the command table
+# (tests/fuzz). With GCC it gets a standalone driver that replays the corpus
+# (a ctest) or mutates it at random; with clang and -DKOSH_LIBFUZZER=ON it
+# is coverage-guided libFuzzer instead.
+option(KOSH_LIBFUZZER "Build fuzz_commands with libFuzzer (clang only)" OFF)
+if(KOSH_LIBFUZZER)
+    add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp
+        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+    target_compile_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
+else()
+    add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp tests/fuzz/standalone_main.cpp
+        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+endif()
+target_link_libraries(fuzz_commands Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+if(NOT KOSH_LIBFUZZER)
+    add_test(NAME fuzz_corpus COMMAND fuzz_commands ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
+endif()
 
 # Integration tests start the real server binary and talk to it over TCP.
 # They need Python 3 (standard library only); skipped if it isn't installed.
