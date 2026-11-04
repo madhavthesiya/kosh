@@ -248,7 +248,8 @@ void Server::run() {
         // On Windows the console handler runs on another thread, so the timeout
         // is what lets the loop notice.
         if(poller_->wait(1000, ready) < 0) {
-            if(running_) std::cerr << poller_->name() << " error " << lastSocketError() << "\n";
+            int error = lastSocketError();      // before printing, which can reset it (Windows)
+            if(running_) std::cerr << poller_->name() << " error: " << socketErrorText(error) << "\n";
             continue;
         }
 
