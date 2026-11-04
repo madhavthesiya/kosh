@@ -1518,18 +1518,15 @@ TEST(test_aof_logs_absolute_expiry_times) {
     std::remove(aof_file.c_str());
 }
 
-TEST(test_aof_expiry_is_absolute) {
-    // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
-    // so every restart gave keys their full TTL again, even keys that had
-    // already expired. They must expire at the same moment after a restart.
-    //
-    // The AOF holds wall-clock times, but this test waits on the monotonic
-    // clock, so a step of the wall clock during the wait shifts the result.
-    // WSL2 steps it when it resyncs with Windows (its journal logs "Time
-    // jumped backwards"). With 1 s TTLs and a 1.1 s wait, a step back of over
-    // 100 ms made this fail once; 200 ms TTLs leave a 900 ms margin.
+int64_t wallMinusMonotonicMs();     // defined with the randomized replay test below
+
+// One run of test_aof_expiry_is_absolute. False if the wall clock was stepped
+// during it: the AOF holds wall-clock times, but the wait is on the monotonic
+// clock, so a step shifts the result and the run proves nothing.
+bool absoluteExpiryHolds() {
     const std::string aof_file = "test_aof_absolute.aof";
     std::remove(aof_file.c_str());
+    const int64_t offset = wallMinusMonotonicMs();
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
@@ -1542,6 +1539,11 @@ TEST(test_aof_expiry_is_absolute) {
         s.set("long", "v", 100);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // As in checkReplayMatchesLive: beyond 10 ms, the wall clock was stepped
+    if(std::llabs(wallMinusMonotonicMs() - offset) > 10) {
+        std::remove(aof_file.c_str());
+        return false;
+    }
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
@@ -1555,6 +1557,23 @@ TEST(test_aof_expiry_is_absolute) {
         ASSERT_TRUE(remaining >= 97 && remaining <= 99);
     }
     std::remove(aof_file.c_str());
+    return true;
+}
+
+TEST(test_aof_expiry_is_absolute) {
+    // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
+    // so every restart gave keys their full TTL again, even keys that had
+    // already expired. They must expire at the same moment after a restart.
+    //
+    // WSL2 steps the wall clock when it resyncs (its journal logs "Time
+    // jumped backwards", and systemd-timesyncd steps it right after WSL
+    // starts). 200 ms TTLs and a 1.1 s wait left a 900 ms margin, and a step
+    // still broke it once, on 2026-11-04, a minute after WSL started. So a
+    // run during which the clock was stepped doesn't count, and runs again.
+    for(int attempt = 0; attempt < 5; attempt++) {
+        if(absoluteExpiryHolds()) return;
+    }
+    throw std::runtime_error("the wall clock was stepped during 5 runs in a row");
 }
 
 TEST(test_aof_old_relative_records_still_load) {
