@@ -821,10 +821,9 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
 | The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
-| The hash function (`std::hash`) has no secret seed, so a client that chooses keys that all collide can make every lookup walk one long chain (hash flooding). | A keyed hash (SipHash) with a random seed, as Redis uses |
 | On systems other than Linux and macOS (Windows), the key table's big arrays come from `calloc` and are freed at once, so growth can stall for longer there (Challenge 15). | Map and release them with the OS's own calls |
 
-**Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), `AUTH`.
+**Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), TLS.
 
 ---
 
