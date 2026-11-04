@@ -388,7 +388,9 @@ void Server::acceptNewClients() {
 
         // Register client with empty buffers, watched for readability. With a
         // password set, it must AUTH first.
-        clients_[client].authenticated = !password_;
+        Client& added = clients_[client];
+        added.authenticated = !password_;
+        added.id = ++last_client_id_;
         poller_->add(client);
 
         std::cout << "Client connected: " << ip << ":"
@@ -508,6 +510,9 @@ void Server::runCommands(Client& client) {
     CommandContext ctx{storage_, aof_, clients_.size()};
     ctx.password = password_ ? &*password_ : nullptr;
     ctx.authenticated = client.authenticated;
+    ctx.protocol = client.protocol;
+    ctx.client_id = client.id;
+    ctx.client_name = &client.name;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
         // Into args_, whose strings are reused from command to command. Until
         // the client authenticates, smaller limits apply (see RespParser); an
@@ -528,7 +533,8 @@ void Server::runCommands(Client& client) {
 
         // The reply goes straight into the client's buffer
         executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
-        client.authenticated = ctx.authenticated;   // AUTH may have succeeded
+        client.authenticated = ctx.authenticated;   // AUTH or HELLO may have succeeded
+        client.protocol = ctx.protocol;             // HELLO may have switched it
         releaseLargeArgs(parsed.argc);
 
         // QUIT: send its reply, then disconnect; commands after it don't run

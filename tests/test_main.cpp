@@ -2128,6 +2128,7 @@ TEST(test_dispatch_write_flags) {
         ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
     }
     ASSERT_TRUE(lookupCommand("AUTH")->flags & kCmdNoAuth);
+    ASSERT_TRUE(lookupCommand("HELLO")->flags & kCmdNoAuth);   // it can carry the AUTH
     ASSERT_TRUE(lookupCommand("QUIT")->flags & kCmdNoAuth);
 }
 
@@ -2212,6 +2213,122 @@ TEST(test_auth_without_a_password) {
     ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "anything"}), "+OK\r\n");
     ASSERT_EQ(executeCommand(ctx, {"AUTH", "nobody", "x"}), kWrongPass);
     ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
+}
+
+// ==================== RESP3 and HELLO ====================
+// Expected bytes are Redis 7.0.15's for the same commands
+
+TEST(test_resp3_reply_types) {
+    // The replies whose type depends on the protocol, in both
+    for(int protocol : {2, 3}) {
+        InMemoryStorage s(10);
+        CommandContext ctx{s};
+        ctx.protocol = protocol;
+        bool v3 = protocol == 3;
+        const std::string null = v3 ? "_\r\n" : "$-1\r\n";
+        ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), null);
+        ASSERT_EQ(executeCommand(ctx, {"LPOP", "missing"}), null);
+        ASSERT_EQ(executeCommand(ctx, {"HGET", "missing", "f"}), null);
+        executeCommand(ctx, {"HSET", "h", "f", "1"});
+        ASSERT_EQ(executeCommand(ctx, {"HGETALL", "h"}),
+                  std::string(v3 ? "%1" : "*2") + "\r\n$1\r\nf\r\n$1\r\n1\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"HGETALL", "missing"}), v3 ? "%0\r\n" : "*0\r\n");
+        executeCommand(ctx, {"SADD", "s", "a"});
+        ASSERT_EQ(executeCommand(ctx, {"SMEMBERS", "s"}), std::string(v3 ? "~1" : "*1") + "\r\n$1\r\na\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"SMEMBERS", "missing"}), v3 ? "~0\r\n" : "*0\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"CONFIG", "GET", "save"}), v3 ? "%0\r\n" : "*0\r\n");
+        // Lists stay arrays, and INFO is a verbatim string: "=", length, "txt:"
+        executeCommand(ctx, {"RPUSH", "l", "a"});
+        ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "-1"}), "*1\r\n$1\r\na\r\n");
+        std::string info = executeCommand(ctx, {"INFO"});
+        ASSERT_EQ(info.substr(0, 1), v3 ? "=" : "$");
+        ASSERT_EQ(info.find("txt:# Server") != std::string::npos, v3);
+    }
+}
+
+TEST(test_hello) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ctx.client_id = 7;
+    const std::string fields = "$6\r\nserver\r\n$4\r\nkosh\r\n$7\r\nversion\r\n$5\r\n3.0.0\r\n$5\r\nproto\r\n";
+    const std::string rest = "$2\r\nid\r\n:7\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n"
+                             "$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n";
+    // HELLO 3 switches to RESP3 and answers with a map; HELLO 2 back, with an array
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3"}), "%7\r\n" + fields + ":3\r\n" + rest);
+    ASSERT_EQ(ctx.protocol, 3);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), "_\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO"}), "%7\r\n" + fields + ":3\r\n" + rest);   // no version: keeps it
+    ASSERT_EQ(executeCommand(ctx, {"hello", "2"}), "*14\r\n" + fields + ":2\r\n" + rest);
+    ASSERT_EQ(ctx.protocol, 2);
+
+    // Errors, Redis's words; none switches the protocol
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "4"}), "-NOPROTO unsupported protocol version\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "1"}), "-NOPROTO unsupported protocol version\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "x"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3abc"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "BOGUS"}), "-ERR Syntax error in HELLO option 'BOGUS'\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default"}), "-ERR Syntax error in HELLO option 'AUTH'\r\n");
+    ASSERT_EQ(ctx.protocol, 2);
+
+    // No password set: HELLO AUTH works for "default" with any password
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "nobody", "x"}), kWrongPass);
+    ASSERT_EQ(ctx.protocol, 2);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "x"}).substr(0, 4), "%7\r\n");
+}
+
+TEST(test_hello_with_a_password) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    const std::string noauth = "-NOAUTH HELLO must be called with the client already authenticated, "
+        "otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client and "
+        "select the RESP protocol version at the same time\r\n";
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3"}), noauth);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO"}), noauth);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "DEFAULT", "s3cret"}), kWrongPass);
+    ASSERT_FALSE(ctx.authenticated);
+    ASSERT_EQ(ctx.protocol, 2);
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), kNoAuth);
+    // What redis-py and node-redis send first when given a password
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "s3cret"}).substr(0, 4), "%7\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+    ASSERT_EQ(ctx.protocol, 3);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), "_\r\n");
+}
+
+TEST(test_client_subcommands) {
+    InMemoryStorage s(10);
+    std::string name;
+    CommandContext ctx{s};
+    ctx.client_id = 42;
+    ctx.client_name = &name;
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "ID"}), ":42\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "$-1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", "app"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"client", "getname"}), "$3\r\napp\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", "a b"}),
+              "-ERR Client names cannot contain spaces, newlines or special characters.\r\n");
+    ASSERT_EQ(name, "app");                                         // unchanged
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", ""}), "+OK\r\n");   // clears it
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "$-1\r\n");
+    ctx.protocol = 3;
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "_\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "SETNAME", "n"}).substr(0, 4), "%7\r\n");
+    ASSERT_EQ(name, "n");
+
+    // What clients send on connect and newer Redis versions support: an error
+    // they skip, never an OK claiming support Kosh lacks
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETINFO", "LIB-NAME", "redis-py"}),
+              "-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME"}),
+              "-ERR wrong number of arguments for 'client|setname' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "ID", "x"}),
+              "-ERR wrong number of arguments for 'client|id' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT"}), "-ERR wrong number of arguments for 'client' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "HELP"}).substr(0, 4), "*9\r\n");
 }
 
 // ==================== Pollers ====================
@@ -2622,6 +2739,12 @@ int main() {
     RUN_TEST(test_auth_required_before_commands);
     RUN_TEST(test_quit_needs_no_auth);
     RUN_TEST(test_auth_without_a_password);
+
+    std::cout << "\n[RESP3 and HELLO]\n";
+    RUN_TEST(test_resp3_reply_types);
+    RUN_TEST(test_hello);
+    RUN_TEST(test_hello_with_a_password);
+    RUN_TEST(test_client_subcommands);
 
     std::cout << "\n[Pollers]\n";
     RUN_TEST(test_poller_select);

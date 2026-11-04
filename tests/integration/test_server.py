@@ -753,6 +753,80 @@ class NetworkAccessTest(ServerTestCase):
             self.assertEqual(c.call("PING"), b"PONG")
 
 
+class Resp3Client(Client):
+    """A client that speaks RESP3 after HELLO 3: reads its maps, sets, nulls
+    and verbatim strings too, and keeps each reply's type marker, so a test
+    can check what was sent, not only what it decodes to."""
+
+    def read_typed(self):
+        line = self.reader.readline()
+        if not line.endswith(b"\r\n"):
+            raise ConnectionError(f"connection closed mid-reply: {line!r}")
+        kind, payload = line[:1], line[1:-2]
+        if kind == b"_":
+            return kind, None
+        if kind == b"%":
+            items = [self.read_typed()[1] for _ in range(2 * int(payload))]
+            return kind, dict(zip(items[::2], items[1::2]))
+        if kind == b"~":
+            return kind, {self.read_typed()[1] for _ in range(int(payload))}
+        if kind == b"=":
+            return kind, self.reader.read(int(payload) + 2)[:-2]
+        if kind == b"*":
+            return kind, [self.read_typed()[1] for _ in range(int(payload))]
+        if kind == b"$":
+            length = int(payload)
+            return kind, None if length < 0 else self.reader.read(length + 2)[:-2]
+        if kind == b"-":
+            raise RespError(payload.decode())
+        return kind, int(payload) if kind == b":" else payload
+
+    def typed(self, *args):
+        self.sock.sendall(self.encode(args))
+        return self.read_typed()
+
+
+class Resp3Test(ServerTestCase):
+    """HELLO and RESP3, which redis-py 8 and node-redis 6 ask for on connect."""
+
+    def test_hello_3_switches_only_its_own_connection(self):
+        server = self.start_server("--appendonly", "no")
+        with Resp3Client(server.port) as v3, Resp3Client(server.port) as v2:
+            kind, hello = v3.typed("HELLO", "3")
+            self.assertEqual(kind, b"%")
+            self.assertEqual((hello[b"server"], hello[b"proto"]), (b"kosh", 3))
+            v3.typed("HSET", "h", "f", "1")
+            self.assertEqual(v3.typed("HGETALL", "h"), (b"%", {b"f": b"1"}))
+            self.assertEqual(v3.typed("GET", "missing"), (b"_", None))
+            # The other connection still speaks RESP2
+            self.assertEqual(v2.typed("HGETALL", "h"), (b"*", [b"f", b"1"]))
+            self.assertEqual(v2.typed("GET", "missing"), (b"$", None))
+
+    def test_hello_authenticates_as_clients_send_it(self):
+        # redis-py and node-redis, given a password, open with HELLO 3 AUTH default <password>
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        with Resp3Client(server.port) as c:
+            with self.assertRaisesRegex(RespError, "^NOAUTH HELLO must be called"):
+                c.typed("HELLO", "3")
+            with self.assertRaisesRegex(RespError, WRONGPASS):
+                c.typed("HELLO", "3", "AUTH", "default", "wrong")
+            kind, hello = c.typed("HELLO", "3", "AUTH", "default", "s3cret")
+            self.assertEqual((kind, hello[b"proto"]), (b"%", 3))
+            self.assertEqual(c.typed("SMEMBERS", "missing"), (b"~", set()))
+
+    def test_client_ids_and_names(self):
+        server = self.start_server("--appendonly", "no")
+        with Resp3Client(server.port) as a, Resp3Client(server.port) as b:
+            ids = [a.typed("CLIENT", "ID")[1], b.typed("CLIENT", "ID")[1]]
+            self.assertLess(ids[0], ids[1])
+            a.typed("CLIENT", "SETNAME", "worker-1")
+            self.assertEqual(a.typed("CLIENT", "GETNAME"), (b"$", b"worker-1"))
+            self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", None))   # names are per connection
+            _, hello = b.typed("HELLO", "3", "SETNAME", "worker-2")
+            self.assertEqual(hello[b"id"], ids[1])
+            self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", b"worker-2"))
+
+
 NOAUTH = "^NOAUTH Authentication required.$"
 WRONGPASS = "^WRONGPASS invalid username-password pair or user is disabled.$"
 

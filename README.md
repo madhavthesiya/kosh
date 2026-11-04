@@ -2,7 +2,7 @@
 
 *Kosh (कोश) is Sanskrit and Hindi for a treasury: a store of valuables. Formerly Mini-Redis.*
 
-A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
+A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP2 and RESP3** (works with `redis-cli` and `redis-benchmark`, and with client libraries that open with `HELLO 3`, as redis-py 8 and node-redis 6 do), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
@@ -529,6 +529,8 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 |---------|-------------|
 | `PING` | Returns PONG |
 | `AUTH` | `AUTH password` or `AUTH default password`: authenticates the connection when the server has a password (see [Who can connect](#run-the-server)). A wrong one gets `-WRONGPASS` and changes nothing. |
+| `HELLO` | `HELLO [2\|3] [AUTH default password] [SETNAME name]`: picks the connection's protocol, RESP2 (the default) or RESP3, can authenticate and name it, and describes the server. In RESP3, a missing value is `_`, `HGETALL` and `CONFIG GET` reply with maps, `SMEMBERS` with a set, and `INFO` with a verbatim string, as in Redis. |
+| `CLIENT` | `ID`, `GETNAME`, `SETNAME name`, `HELP`. Other subcommands get Redis's "unknown subcommand" error, which clients skip. |
 | `INFO` | Server info (version, connected clients) |
 | `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
@@ -558,7 +560,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**116 unit tests** (`tests/test_main.cpp`):
+**120 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -579,10 +581,11 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
 [Command Table]        11 tests    ✅  (arity, SET options, strict integers, error replies, replies appended in place)
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
+[RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 116 passed, 0 failed
+Results: 120 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -592,12 +595,13 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 49 tests that start the real server binary on a free port and speak RESP over TCP.
+- 52 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
   - the log reaching its file while the server runs, as under systemd or Docker;
   - who can connect: loopback only by default, `--bind`, and protected mode, tested by connecting from this machine's own network address as a client on another machine would;
   - passwords: `NOAUTH` until `AUTH`, `AUTH` in a pipeline, the limits before `AUTH`, `--requirepass-file`, and the password never reaching the log, the AOF or an error message;
+  - `HELLO` and RESP3: the protocol switches for its own connection only, `HELLO 3 AUTH` as client libraries send it, client ids and names;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
@@ -636,6 +640,7 @@ kosh/
 ├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
+├── Version.h                 # Kosh's version (HELLO, INFO)
 ├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
@@ -646,7 +651,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 116 unit tests
+    ├── test_main.cpp              # 120 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary

@@ -13,13 +13,21 @@
 
 // RESP (Redis Serialization Protocol) parser and serializer.
 //
-// RESP is a simple text-based protocol with 5 types:
+// RESP2 is a simple text-based protocol with 5 types:
 //   +OK\r\n              → Simple String
 //   -ERR message\r\n     → Error
 //   :42\r\n              → Integer
 //   $6\r\nfoobar\r\n     → Bulk String (length-prefixed binary-safe string)
 //   $-1\r\n              → Null Bulk String
 //   *3\r\n...            → Array of N elements
+//
+// RESP3, which a client asks for with HELLO 3, adds types for replies that
+// RESP2 spells as arrays and bulk strings (Kosh uses these):
+//   _\r\n                → Null
+//   %1\r\n<key><value>   → Map of N key/value pairs (HGETALL, CONFIG GET, HELLO)
+//   ~2\r\n...            → Set of N elements (SMEMBERS)
+//   =9\r\ntxt:hello\r\n  → Verbatim string: text meant for people (INFO)
+// Requests are the same arrays of bulk strings in both.
 //
 // Client sends commands as RESP arrays of bulk strings:
 //   SET name madhav  →  *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nmadhav\r\n
@@ -204,8 +212,29 @@ public:
         out += "\r\n";
     }
 
-    static void appendNull(std::string& out) {
-        out += "$-1\r\n";
+    // The replies whose type depends on the connection's protocol (2 or 3).
+    // There is deliberately no form without it: a reply written without
+    // asking which protocol the client speaks would be wrong for one of them.
+    static void appendNull(std::string& out, int protocol) {
+        out += protocol == 3 ? "_\r\n" : "$-1\r\n";
+    }
+    // A map of `pairs` keys and values follows; RESP2 sends them as a flat
+    // array of 2 * pairs elements
+    static void appendMapLength(std::string& out, size_t pairs, int protocol) {
+        if(protocol == 3) appendLength(out, '%', pairs);
+        else appendLength(out, '*', 2 * pairs);
+    }
+    static void appendSetLength(std::string& out, size_t n, int protocol) {
+        appendLength(out, protocol == 3 ? '~' : '*', n);
+    }
+    // Text for people: RESP3's verbatim string, whose payload starts with the
+    // 3-letter format "txt" and a colon; a bulk string in RESP2
+    static void appendVerbatim(std::string& out, std::string_view text, int protocol) {
+        if(protocol != 3) return appendBulk(out, text);
+        appendLength(out, '=', text.size() + 4);
+        out += "txt:";
+        out.append(text);
+        out += "\r\n";
     }
 
 private:

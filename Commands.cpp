@@ -1,10 +1,12 @@
 #include "Commands.h"
 #include "RespParser.h"
+#include "Version.h"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <climits>
 #include <cstring>
+#include <iterator>
 #include <unordered_map>
 
 namespace {
@@ -85,40 +87,170 @@ void cmdQuit(CommandContext& ctx, const Args&, std::string& out) {
     ok(out);
 }
 
-// AUTH <password>, or AUTH <username> <password>: Redis's two forms, where
-// the only user is "default" (as in Redis without ACL users). Replies are
-// Redis's, word for word. A failed AUTH changes nothing: a client that had
-// authenticated stays authenticated, as in Redis.
+constexpr const char* kWrongPass = "WRONGPASS invalid username-password pair or user is disabled.";
+
+// Whether user/password may log in: the only user is "default" (as in Redis
+// without ACL users), and user names are case-sensitive. With no password
+// set, "default" accepts any password (Redis's nopass user).
+bool credentialsMatch(const CommandContext& ctx, const std::string& user, const std::string& password) {
+    bool password_ok = !ctx.password || constantTimeEquals(password, *ctx.password);
+    return user == "default" && password_ok;
+}
+
+// AUTH <password>, or AUTH <username> <password>: Redis's two forms. Replies
+// are Redis's, word for word. A failed AUTH changes nothing: a client that
+// had authenticated stays authenticated, as in Redis.
 void cmdAuth(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.size() > 3) return RespParser::appendError(out, kSyntaxError);
     if(args.size() == 2 && !ctx.password) {
         return RespParser::appendError(out, "ERR AUTH <password> called without any password "
             "configured for the default user. Are you sure your configuration is correct?");
     }
-    // User names are case-sensitive, as in Redis. With no password set,
-    // "default" accepts any password (Redis's nopass user).
-    bool user_ok = args.size() == 2 || args[1] == "default";
-    bool password_ok = !ctx.password || constantTimeEquals(args[args.size() - 1], *ctx.password);
-    if(!user_ok || !password_ok) {
-        return RespParser::appendError(out,
-            "WRONGPASS invalid username-password pair or user is disabled.");
-    }
+    static const std::string kDefaultUser = "default";
+    const std::string& user = args.size() == 3 ? args[1] : kDefaultUser;
+    if(!credentialsMatch(ctx, user, args[args.size() - 1])) return RespParser::appendError(out, kWrongPass);
     ctx.authenticated = true;
     ok(out);
 }
 
-// redis-cli and redis-benchmark send these at startup
-void cmdCommand(CommandContext&, const Args&, std::string& out) { RespParser::appendLength(out, '*', 0); }
-void cmdClient(CommandContext&, const Args&, std::string& out) { ok(out); }
+// A client name must be printable ASCII without spaces, as in Redis, whose
+// CLIENT LIST output is split on spaces. Empty means "no name".
+bool setClientName(CommandContext& ctx, const std::string& name, std::string& out) {
+    for(unsigned char c : name) {
+        if(c < '!' || c > '~') {
+            RespParser::appendError(out, "ERR Client names cannot contain spaces, newlines or special characters.");
+            return false;
+        }
+    }
+    if(ctx.client_name) *ctx.client_name = name;
+    return true;
+}
 
-void cmdConfig(CommandContext&, const Args& args, std::string& out) {
-    if(equalsIgnoreCase(args[1], "GET")) return RespParser::appendLength(out, '*', 0);
+// HELLO [protover [AUTH username password] [SETNAME clientname]]
+//
+// What modern clients send first: redis-py 8 and node-redis 6 open every
+// connection with HELLO 3 (with AUTH when there's a password), and give up
+// if it fails, without falling back to RESP2. It switches the connection's
+// protocol, can authenticate and name it, and describes the server. Checks
+// and replies follow Redis 7.0.15's, in its order: the version, the
+// options, the credentials, then whether the client is authenticated.
+void cmdHello(CommandContext& ctx, const Args& args, std::string& out) {
+    int protocol = ctx.protocol;
+    size_t next = 1;
+    if(args.size() >= 2) {
+        int64_t version;
+        if(!parseInt64(args[1], version)) {
+            return RespParser::appendError(out, "ERR Protocol version is not an integer or out of range");
+        }
+        if(version < 2 || version > 3) return RespParser::appendError(out, "NOPROTO unsupported protocol version");
+        protocol = static_cast<int>(version);
+        next = 2;
+    }
+    const std::string* user = nullptr;
+    const std::string* password = nullptr;
+    const std::string* name = nullptr;
+    for(size_t i = next; i < args.size(); i++) {
+        size_t more = args.size() - 1 - i;
+        if(equalsIgnoreCase(args[i], "AUTH") && more >= 2) {
+            user = &args[i + 1];
+            password = &args[i + 2];
+            i += 2;
+        } else if(equalsIgnoreCase(args[i], "SETNAME") && more >= 1) {
+            name = &args[i + 1];
+            i += 1;
+        } else {
+            return RespParser::appendError(out, "ERR Syntax error in HELLO option '" + args[i].substr(0, 128) + "'");
+        }
+    }
+    if(user) {
+        if(!credentialsMatch(ctx, *user, *password)) return RespParser::appendError(out, kWrongPass);
+        ctx.authenticated = true;
+    }
+    if(!ctx.authenticated) {
+        return RespParser::appendError(out, "NOAUTH HELLO must be called with the client already "
+            "authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate "
+            "the client and select the RESP protocol version at the same time");
+    }
+    if(name && !setClientName(ctx, *name, out)) return;
+    ctx.protocol = protocol;
+
+    // The server's description, in the protocol just chosen: a map in RESP3,
+    // a flat array of names and values in RESP2. Same fields as Redis.
+    RespParser::appendMapLength(out, 7, protocol);
+    RespParser::appendBulk(out, "server");
+    RespParser::appendBulk(out, "kosh");
+    RespParser::appendBulk(out, "version");
+    RespParser::appendBulk(out, kKoshVersion);
+    RespParser::appendBulk(out, "proto");
+    RespParser::appendInteger(out, protocol);
+    RespParser::appendBulk(out, "id");
+    RespParser::appendInteger(out, static_cast<long long>(ctx.client_id));
+    RespParser::appendBulk(out, "mode");
+    RespParser::appendBulk(out, "standalone");
+    RespParser::appendBulk(out, "role");
+    RespParser::appendBulk(out, "master");
+    RespParser::appendBulk(out, "modules");
+    RespParser::appendLength(out, '*', 0);
+}
+
+// CLIENT ID | GETNAME | SETNAME name | HELP. Anything else gets Redis's
+// "unknown subcommand" error, which clients expect: on connect they send
+// subcommands newer Redis versions have (SETINFO, MAINT_NOTIFICATIONS) and
+// carry on when they fail. Answering OK would claim support Kosh lacks.
+void cmdClient(CommandContext& ctx, const Args& args, std::string& out) {
+    const std::string& sub = args[1];
+    // A known subcommand with the wrong number of arguments gets Redis's
+    // arity error, which names it in lower case
+    static const std::pair<const char*, size_t> kSubcommands[] = {
+        {"id", 2}, {"getname", 2}, {"setname", 3}, {"help", 2}};
+    for(const auto& [name, argc] : kSubcommands) {
+        if(equalsIgnoreCase(sub, name) && args.size() != argc) {
+            return RespParser::appendError(out, std::string("ERR wrong number of arguments for 'client|")
+                                                + name + "' command");
+        }
+    }
+    if(equalsIgnoreCase(sub, "ID")) return RespParser::appendInteger(out, static_cast<long long>(ctx.client_id));
+    if(equalsIgnoreCase(sub, "GETNAME")) {
+        if(!ctx.client_name || ctx.client_name->empty()) return RespParser::appendNull(out, ctx.protocol);
+        return RespParser::appendBulk(out, *ctx.client_name);
+    }
+    if(equalsIgnoreCase(sub, "SETNAME")) {
+        if(setClientName(ctx, args[2], out)) ok(out);
+        return;
+    }
+    if(equalsIgnoreCase(sub, "HELP")) {
+        static const char* const kHelp[] = {
+            "CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "GETNAME",
+            "    Return the name of the current connection.",
+            "ID",
+            "    Return the ID of the current connection.",
+            "SETNAME <name>",
+            "    Assign the name <name> to the current connection.",
+            "HELP",
+            "    Print this help.",
+        };
+        RespParser::appendLength(out, '*', std::size(kHelp));
+        for(const char* line : kHelp) RespParser::appendSimpleString(out, line);
+        return;
+    }
+    RespParser::appendError(out, "ERR unknown subcommand '" + sub.substr(0, 128) + "'. Try CLIENT HELP.");
+}
+
+// redis-cli sends COMMAND DOCS at startup; an empty reply means "no docs"
+void cmdCommand(CommandContext&, const Args&, std::string& out) { RespParser::appendLength(out, '*', 0); }
+
+// redis-benchmark sends CONFIG GET save and CONFIG GET appendonly at
+// startup; Kosh has no such settings to report, so the map is empty
+void cmdConfig(CommandContext& ctx, const Args& args, std::string& out) {
+    if(equalsIgnoreCase(args[1], "GET")) return RespParser::appendMapLength(out, 0, ctx.protocol);
     RespParser::appendError(out, "ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
 }
 
 void cmdInfo(CommandContext& ctx, const Args&, std::string& out) {
-    RespParser::appendBulk(out, "# Server\r\nkosh_version:2.0\r\n"
-                                "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n");
+    RespParser::appendVerbatim(out, std::string("# Server\r\nkosh_version:") + kKoshVersion + "\r\n"
+                               "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n",
+                               ctx.protocol);
 }
 
 // ---- Strings ----
@@ -158,7 +290,7 @@ void cmdGet(CommandContext& ctx, const Args& args, std::string& out) {
         RespParser::appendBulk(out, value);
     });
     if(r.error == ErrorCode::WRONG_TYPE) RespParser::appendError(out, kWrongType);
-    else if(!r.success) RespParser::appendNull(out);
+    else if(!r.success) RespParser::appendNull(out, ctx.protocol);
 }
 
 void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
@@ -224,7 +356,7 @@ void cmdRpush(CommandContext& ctx, const Args& args, std::string& out) { cmdPush
 void cmdPop(CommandContext& ctx, const Args& args, std::string& out, bool left) {
     auto r = left ? ctx.storage.lpop(args[1]) : ctx.storage.rpop(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out, ctx.protocol);
 }
 void cmdLpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, true); }
 void cmdRpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, false); }
@@ -262,7 +394,8 @@ void cmdSrem(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdSmembers(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.smembers(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    RespParser::appendArray(out, r.values);
+    RespParser::appendSetLength(out, r.values.size(), ctx.protocol);
+    for(const auto& member : r.values) RespParser::appendBulk(out, member);
 }
 
 void cmdSismember(CommandContext& ctx, const Args& args, std::string& out) {
@@ -293,7 +426,7 @@ void cmdHset(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdHget(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hget(args[1], args[2]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out, ctx.protocol);
 }
 
 void cmdHdel(CommandContext& ctx, const Args& args, std::string& out) {
@@ -305,7 +438,9 @@ void cmdHdel(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdHgetall(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hgetall(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    RespParser::appendArray(out, r.values);
+    // r.values holds field, value, field, value...: a map in RESP3
+    RespParser::appendMapLength(out, r.values.size() / 2, ctx.protocol);
+    for(const auto& item : r.values) RespParser::appendBulk(out, item);
 }
 
 void cmdHlen(CommandContext& ctx, const Args& args, std::string& out) {
@@ -332,9 +467,10 @@ const Command kCommands[] = {
     // name           arity  flags      handler
     {"ping",            -1,  0,         cmdPing},
     {"auth",            -2,  kCmdNoAuth, cmdAuth},
+    {"hello",           -1,  kCmdNoAuth, cmdHello},
     {"quit",            -1,  kCmdNoAuth, cmdQuit},
     {"command",         -1,  0,         cmdCommand},
-    {"client",          -1,  0,         cmdClient},
+    {"client",          -2,  0,         cmdClient},
     {"config",          -2,  0,         cmdConfig},
     {"info",            -1,  0,         cmdInfo},
 

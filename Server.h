@@ -1,6 +1,7 @@
 #pragma once
 #include "Socket.h"     // first: on Windows it must set FD_SETSIZE before winsock2.h is included
 #include "Poller.h"
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -55,6 +56,9 @@ private:
         bool want_write = false;
         bool queued = false;             // in to_serve_ for this pass of the loop
         bool authenticated = false;      // AUTH succeeded, or no password is set
+        int protocol = 2;                // RESP2 until HELLO 3
+        uint64_t id = 0;                 // CLIENT ID: 1, 2, 3... in order of connection
+        std::string name;                // CLIENT SETNAME; empty: none
     };
 
     enum class SendStatus { Done, Blocked, Failed };
@@ -118,6 +122,7 @@ private:
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
+    uint64_t last_client_id_ = 0;       // never reused, as in Redis
 
     // Clients with replies to send in this pass of the loop, in order. They are
     // served after the pass's AOF records are written (group commit).

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,11 @@ struct CommandContext {
     // Whether this client may run commands: with a password set, only once
     // AUTH has succeeded. The server keeps it per client; AUTH sets it.
     bool authenticated = true;
+    // The protocol this client speaks: RESP2 until HELLO 3 (HELLO sets it).
+    // Replies that are a null, a map or a set are written in it.
+    int protocol = 2;
+    uint64_t client_id = 0;                 // CLIENT ID, HELLO
+    std::string* client_name = nullptr;     // CLIENT SETNAME/GETNAME; nullptr: no connection
 };
 
 // A command's arguments (args[0] is its name): a view of strings the caller
@@ -56,8 +62,8 @@ struct Command {
 
 // The command changes data. Only these are logged, so only these can be replayed.
 constexpr unsigned kCmdWrite = 1u << 0;
-// The command runs before the client has authenticated (AUTH, QUIT), as
-// Redis's no-auth flag
+// The command runs before the client has authenticated (AUTH, HELLO, QUIT),
+// as Redis's no-auth flag
 constexpr unsigned kCmdNoAuth = 1u << 1;
 
 // Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
