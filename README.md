@@ -589,10 +589,11 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 36 tests that start the real server binary on a free port and speak RESP over TCP.
+- 41 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
   - the log reaching its file while the server runs, as under systemd or Docker;
+  - who can connect: loopback only by default, `--bind`, and protected mode, tested by connecting from this machine's own network address as a client on another machine would;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
@@ -657,7 +658,7 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 ### Run the server
 
 ```bash
-./build/kosh-server                       # port 6379, 10,000 keys, AOF in ./appendonly.aof
+./build/kosh-server                       # 127.0.0.1:6379, 10,000 keys, AOF in ./appendonly.aof
 ./build/kosh-server --port 6380 --maxkeys 1000000 --appendonly no
 ./build/kosh-server --help
 
@@ -670,6 +671,8 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--port <1-65535>` | 6379 | TCP port to listen on |
+| `--bind <ipv4>` | 127.0.0.1 | Address to listen on; `0.0.0.0` listens on every interface |
+| `--protected-mode <yes\|no>` | yes | With no password set, refuse clients on other machines |
 | `--maxkeys <n>` | 10000 | Keys to hold before evicting one |
 | `--eviction <sieve\|lru>` | sieve | Which key a full server evicts: SIEVE's choice, or the least recently used |
 | `--appendonly <yes\|no>` | yes | Log writes to the AOF and replay it at startup |
@@ -677,6 +680,8 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | `--appendfsync <always\|everysec\|no>` | everysec | When the AOF reaches the disk: before every reply, once a second, or when the OS decides |
 | `--maxclients <n>` | 10000 | Clients served at once; more get an error and are disconnected |
 | `--poller <epoll\|select>` | epoll on Linux, else select | How the event loop waits for sockets (`select()` serves about 1,000 clients) |
+
+**Who can connect.** By default Kosh listens on 127.0.0.1, so only programs on the same machine can reach it. `--bind 0.0.0.0` listens on every interface. Even then, while no password is set, protected mode (as in Redis) answers clients on other machines with `-DENIED` and disconnects them; `--protected-mode no` turns it off, for a network you trust. Redis started without a config file listens on every interface and relies on protected mode alone; Kosh makes the network an explicit choice.
 
 ### Benchmark
 

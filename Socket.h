@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <climits>
 #include <cstddef>
+#include <cstring>
+#include <string>
 
 // Portable sockets: Winsock on Windows, BSD sockets elsewhere. Everything the
 // server needs that differs between the two is kept here.
@@ -36,12 +38,38 @@
     #define SOCKET_ERROR (-1)
 #endif
 
+// A dotted IPv4 address ("127.0.0.1"), into `out`; false if `text` isn't one.
+// Numeric only: no host names, so nothing is looked up.
+inline bool parseIPv4(const char* text, in_addr& out) {
+    return inet_pton(AF_INET, text, &out) == 1;
+}
+
+// 127.0.0.0/8: the connection comes from this machine
+inline bool isLoopback(const in_addr& address) {
+    return (ntohl(address.s_addr) >> 24) == 127;
+}
+
 // The error code of the last failed socket call: errno, or WSAGetLastError() on Windows.
 inline int lastSocketError() {
 #ifdef _WIN32
     return WSAGetLastError();
 #else
     return errno;
+#endif
+}
+
+// A socket error code as words, for messages ("Address already in use")
+inline std::string socketErrorText(int error) {
+#ifdef _WIN32
+    // Windows's own wording, plus the code, which is what its docs list
+    char text[256];
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                             static_cast<DWORD>(error), 0, text, sizeof(text), nullptr);
+    while(n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == '.')) n--;
+    std::string code = "Winsock error " + std::to_string(error);
+    return n > 0 ? std::string(text, n) + " (" + code + ")" : code;
+#else
+    return std::strerror(error);
 #endif
 }
 

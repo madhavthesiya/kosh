@@ -11,9 +11,13 @@
 
 // Settings that would otherwise mean editing and rebuilding, e.g. a larger
 // key limit for benchmarks or a separate port and AOF file for tests.
-// Defaults match the server's previous hard-coded behaviour.
 struct ServerConfig {
     int port = 6379;
+    // Loopback: a server started with no options can't be reached from the
+    // network. (Redis listens on every interface unless its config file says
+    // otherwise, and relies on protected mode alone.)
+    std::string bindAddress = "127.0.0.1";
+    bool protectedMode = true;
     size_t maxKeys = 10000;
     // SIEVE: fewer misses than LRU on every trace measured, and a hit
     // writes nothing outside the entry (bench/results/after-memory-fixes)
@@ -29,6 +33,11 @@ struct ServerConfig {
 static void printUsage(std::ostream& out) {
     out << "Usage: kosh-server [options]\n"
            "  --port <1-65535>         TCP port to listen on (default 6379)\n"
+           "  --bind <ipv4>            Address to listen on (default 127.0.0.1: this machine\n"
+           "                           only); 0.0.0.0 listens on every interface\n"
+           "  --protected-mode <yes|no>\n"
+           "                           With no password set, refuse clients on other\n"
+           "                           machines (default yes)\n"
            "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
            "  --eviction <sieve|lru>   Which key a full server evicts: SIEVE's choice\n"
            "                           (NSDI 2024), or the least recently used (default sieve)\n"
@@ -63,7 +72,8 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         std::string option = argv[i];
         if(option == "--help" || option == "-h") return ParseResult::Help;
 
-        if(option != "--port" && option != "--maxkeys" && option != "--eviction" &&
+        if(option != "--port" && option != "--bind" && option != "--protected-mode" &&
+           option != "--maxkeys" && option != "--eviction" &&
            option != "--appendonly" && option != "--appendfilename" && option != "--appendfsync" &&
            option != "--maxclients" && option != "--poller") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
@@ -78,6 +88,14 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         bool ok = true;
         if(option == "--port") {
             ok = parseNumber(value, 1, 65535, config.port);
+        } else if(option == "--bind") {
+            // Numeric only, so a host name can't resolve to an address nobody meant
+            in_addr address;
+            ok = parseIPv4(value.c_str(), address);
+            if(ok) config.bindAddress = value;
+        } else if(option == "--protected-mode") {
+            ok = (value == "yes" || value == "no");
+            if(ok) config.protectedMode = (value == "yes");
         } else if(option == "--maxkeys") {
             // 0 is rejected: eviction assumes at least one key fits
             ok = parseNumber<size_t>(value, 1, SIZE_MAX, config.maxKeys);
@@ -173,10 +191,9 @@ int main(int argc, char* argv[]) {
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
     Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);
-    if(!server.start()) {
-        std::cerr << "Failed to start server on port " << config.port << "\n";
-        return 1;
-    }
+    server.setBindAddress(config.bindAddress);
+    server.setProtectedMode(config.protectedMode);
+    if(!server.start()) return 1;   // start() said why
 
     // Serve until a stop signal (exit code 0), or until the AOF fails for good
     // with --appendfsync always (exit code 1)

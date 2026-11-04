@@ -33,11 +33,21 @@ void onStopSignal(int) {
 }
 #endif
 
-// Tells a client the server is full, as Redis does at maxclients, then closes
-// its socket. The new socket's buffer is empty, so the short reply fits.
-void refuseClient(socket_t fd) {
-    static const char kReply[] = "-ERR max number of clients reached\r\n";
-    sendSome(fd, kReply, sizeof(kReply) - 1);
+const char kServerFull[] = "-ERR max number of clients reached\r\n";
+
+// Protected mode's reply, which Redis also starts with -DENIED
+const char kDenied[] =
+    "-DENIED Kosh is running in protected mode: no password is set, so only clients on "
+    "this machine are served. To serve this one, start Kosh with --protected-mode no, "
+    "but only on a network you trust.\r\n";
+
+// Sends a new client one error reply, as Redis does, then closes its socket.
+// The new socket's send buffer is empty, so the short reply fits. (A client
+// that sent a command first may lose the reply: closing a socket with unread
+// data resets the connection. Redis's refusals behave the same.)
+template<size_t N>
+void refuseClient(socket_t fd, const char (&reply)[N]) {
+    sendSome(fd, reply, N - 1);
     CLOSE_SOCKET(fd);
 }
 
@@ -135,15 +145,26 @@ bool Server::start() {
     setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&opt), sizeof(opt));
 
-    // Bind to port
+    // Listen on one address: 127.0.0.1 unless --bind says otherwise. Only this
+    // machine can reach a loopback address, so a server nobody configured
+    // can't be reached from the network.
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    if(!parseIPv4(bind_address_.c_str(), addr.sin_addr)) {
+        std::cerr << "Cannot listen on '" << bind_address_ << "': not an IPv4 address\n";
+        CLOSE_SOCKET(listen_socket_);
+        return false;
+    }
     addr.sin_port = htons(static_cast<uint16_t>(port_));
 
     if(bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&addr),
             sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "bind() failed — is port " << port_ << " already in use?\n";
+        // e.g. the port is in use, or the address isn't one of this machine's.
+        // Read before printing: on Windows, writing the message's first part
+        // resets the error code to 0.
+        int error = lastSocketError();
+        std::cerr << "Cannot listen on " << bind_address_ << ":" << port_ << ": "
+                  << socketErrorText(error) << "\n";
         CLOSE_SOCKET(listen_socket_);
         return false;
     }
@@ -157,8 +178,17 @@ bool Server::start() {
 
     poller_->add(listen_socket_);
     running_ = true;
-    std::cout << "Kosh server listening on port " << port_ << "\n";
+    std::cout << "Kosh server listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
+    if(isLoopback(addr.sin_addr)) {
+        std::cout << "Access: this machine only (--bind 0.0.0.0 listens on every interface)\n";
+    } else if(protected_mode_) {
+        std::cout << "Access: protected mode: clients on other machines are refused, "
+                     "since no password is set\n";
+    } else {
+        std::cout << "WARNING: protected mode is off and no password is set: anyone who can "
+                     "reach port " << port_ << " can read and change every key\n";
+    }
     std::cout << "I/O multiplexing: " << poller_->name();
     if(poller_->capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << poller_->capacity() << ")";
     std::cout << ", single-threaded | maxclients " << max_clients_ << "\n";
@@ -282,7 +312,7 @@ void Server::acceptNewClients() {
                 close(reserve_fd_);
                 socket_t extra = accept(listen_socket_, nullptr, nullptr);
                 if(extra != INVALID_SOCKET) {
-                    refuseClient(extra);
+                    refuseClient(extra, kServerFull);
                     std::cout << "Client refused: the server is out of file descriptors\n";
                 }
                 reserve_fd_ = open("/dev/null", O_RDONLY);
@@ -304,16 +334,27 @@ void Server::acceptNewClients() {
             continue;
         }
 
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+
+        // Protected mode, as Redis's: with no password, only clients on this
+        // machine. Checked first, since it is the lasting reason: a client told
+        // "server full" would only retry.
+        if(protected_mode_ && !isLoopback(client_addr.sin_addr)) {
+            refuseClient(client, kDenied);
+            std::cout << "Client refused: " << ip << " is not on this machine (protected mode)\n";
+            continue;
+        }
         // As Redis does at maxclients
         if(clients_.size() >= max_clients_) {
-            refuseClient(client);
+            refuseClient(client, kServerFull);
             std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
             continue;
         }
         // Watching a socket select() can't hold would write past the end of
         // fd_set (Linux) or silently never serve it (Windows)
         if(!poller_->canWatch(client)) {
-            refuseClient(client);
+            refuseClient(client, kServerFull);
             std::cout << "Client refused: the server is at its " << poller_->name() << " limit ("
                       << clients_.size() << " clients)\n";
             continue;
@@ -330,8 +371,6 @@ void Server::acceptNewClients() {
         clients_[client];
         poller_->add(client);
 
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
         std::cout << "Client connected: " << ip << ":"
                   << ntohs(client_addr.sin_port)
                   << " (total: " << clients_.size() << ")\n";

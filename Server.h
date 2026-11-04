@@ -22,6 +22,14 @@ public:
            std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
     ~Server();
 
+    // Set these before start().
+    // The IPv4 address to listen on: 127.0.0.1 by default, so only this
+    // machine can connect; 0.0.0.0 listens on every interface.
+    void setBindAddress(std::string address) { bind_address_ = std::move(address); }
+    // Protected mode, as Redis's (on by default): with no password set, a
+    // client that isn't on this machine gets -DENIED and is disconnected.
+    void setProtectedMode(bool on) { protected_mode_ = on; }
+
     bool start();       // Create socket, bind, listen
     void run();         // Event loop — handles multiple clients concurrently
     void stop();
@@ -85,6 +93,8 @@ private:
     static constexpr size_t kKeepArgs = 1024;
 
     int port_;
+    std::string bind_address_ = "127.0.0.1";
+    bool protected_mode_ = true;
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
     bool running_ = false;

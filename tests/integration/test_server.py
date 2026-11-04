@@ -53,6 +53,9 @@ class ServerProcess:
             workdir = self._tmp.name
         self.workdir = workdir
         self.port = free_port()
+        # Where clients connect: the --bind address, or loopback
+        bind = args[args.index("--bind") + 1] if "--bind" in args else "0.0.0.0"
+        self.host = "127.0.0.1" if bind == "0.0.0.0" else bind
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
         def set_limits():
@@ -81,7 +84,7 @@ class ServerProcess:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"server exited during startup ({describe_exit(self.proc.returncode)}):\n{self.output()}")
             try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
+                socket.create_connection((self.host, self.port), timeout=0.2).close()
                 return
             except OSError:
                 time.sleep(0.05)
@@ -135,8 +138,8 @@ class RespError(Exception):
 class Client:
     """Minimal RESP client: sends commands as RESP arrays, parses one reply per call."""
 
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    def __init__(self, port, host="127.0.0.1"):
+        self.sock = socket.create_connection((host, port), timeout=5)
         self.reader = self.sock.makefile("rb")
 
     def call(self, *args):
@@ -677,6 +680,70 @@ class AofWriteErrorTest(ServerTestCase):
             restarted.stop()
 
 
+def network_ipv4():
+    """This machine's address on its network (not loopback), or None. Connecting
+    from it is what a client on another machine looks like to the server. A UDP
+    connect() only picks a route: it sends nothing."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))   # RFC 5737: for documentation, never a real host
+            address = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if address.startswith("127.") or address == "0.0.0.0" else address
+
+
+def read_until_closed(host, port, timeout=2.0):
+    """Connects, sends nothing, and returns what the server sends before closing."""
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        received = b""
+        while chunk := s.recv(4096):
+            received += chunk
+        return received
+
+
+class NetworkAccessTest(ServerTestCase):
+    """Who can connect: --bind and protected mode."""
+
+    def network_address(self):
+        address = network_ipv4()
+        if address is None:
+            self.skipTest("this machine has no network address besides loopback")
+        return address
+
+    def test_listens_on_loopback_only_by_default(self):
+        server = self.start_server("--appendonly", "no")
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection((self.network_address(), server.port), timeout=2).close()
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn(f"listening on 127.0.0.1:{server.port}", server.output())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux routes all of 127.0.0.0/8 to loopback")
+    def test_bind_picks_the_address(self):
+        server = self.start_server("--appendonly", "no", "--bind", "127.0.0.2")
+        with Client(server.port, host="127.0.0.2") as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", server.port), timeout=2).close()
+
+    def test_protected_mode_refuses_other_machines(self):
+        # Every interface, but no password: as Redis, only this machine is served
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0")
+        reply = read_until_closed(self.network_address(), server.port)
+        self.assertTrue(reply.startswith(b"-DENIED Kosh is running in protected mode"), reply)
+        self.assertTrue(reply.endswith(b"\r\n") and reply.count(b"\r\n") == 1, reply)
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn("(protected mode)", server.output())
+
+    def test_protected_mode_no_serves_other_machines(self):
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0", "--protected-mode", "no")
+        with Client(server.port, host=self.network_address()) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn("WARNING: protected mode is off and no password is set", server.output())
+
+
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
         with tempfile.TemporaryDirectory() as workdir:
@@ -695,12 +762,31 @@ class CommandLineTest(ServerTestCase):
             ("--appendfsync", "sometimes"), ("--appendfsync",),
             ("--poller", "kqueue"), ("--maxclients", "0"), ("--maxclients", "many"),
             ("--eviction", "fifo"), ("--eviction",),
+            # Numeric IPv4 only: no host names, IPv6 or partial addresses
+            ("--bind", "localhost"), ("--bind", "1.2.3"), ("--bind", "256.0.0.1"),
+            ("--bind", "::1"), ("--bind", ""), ("--bind",),
+            ("--protected-mode", "on"), ("--protected-mode",),
         ]
         for args in cases:
             with self.subTest(args=args):
                 result = self.run_server(*args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertTrue(result.stderr, "expected an error message on stderr")
+
+    def test_failing_to_listen_says_why(self):
+        # The reason is the system's own (glibc's wording), so a wrong error
+        # code shows. 192.0.2.1 (RFC 5737, for documentation) is no machine's address.
+        port = free_port()
+        result = self.run_server("--port", str(port), "--bind", "192.0.2.1", "--appendonly", "no")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Cannot listen on 192.0.2.1:%d: Cannot assign requested address" % port,
+                      result.stderr)
+
+        server = self.start_server("--appendonly", "no")
+        result = self.run_server("--port", str(server.port), "--appendonly", "no")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Cannot listen on 127.0.0.1:%d: Address already in use" % server.port,
+                      result.stderr)
 
     def test_unopenable_aof_file_fails_fast(self):
         # Running without persistence while the user believes it is on would be worse than not starting.
