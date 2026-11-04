@@ -226,7 +226,7 @@ class BasicCommandTest(ServerTestCase):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call("SAVE")
-            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE'")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE', with args beginning with: ")
         self.assertFalse(os.path.exists(os.path.join(self.server.workdir, "dump.rdb")))
 
 
@@ -501,14 +501,15 @@ class ErrorReplyTest(ServerTestCase):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call(b"bad\r\nname")
-            self.assertEqual(str(caught.exception), "ERR unknown command 'bad  name'")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'bad  name', with args beginning with: ")
             self.assertEqual(c.call("PING"), b"PONG")
 
     def test_long_command_name_is_quoted_up_to_128_bytes(self):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call(b"x" * 10_000)
-            self.assertEqual(str(caught.exception), "ERR unknown command '" + "x" * 128 + "'")
+            self.assertEqual(str(caught.exception),
+                             "ERR unknown command '" + "x" * 128 + "', with args beginning with: ")
 
 
 class AofDamageTest(ServerTestCase):

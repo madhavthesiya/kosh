@@ -1974,10 +1974,26 @@ TEST(test_dispatch_checks_arity) {
 TEST(test_dispatch_unknown_command) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
-    ASSERT_EQ(executeCommand(ctx, {"NOPE", "x"}), "-ERR unknown command 'NOPE'\r\n");
+    // Redis 7.0.15's replies to the same commands, byte for byte
+    const std::string prefix = "-ERR unknown command '";
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), prefix + "NOPE', with args beginning with: \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", "a", "b"}), prefix + "NOPE', with args beginning with: 'a' 'b' \r\n");
     // Longer than any command: rejected without upper-casing a copy; 128 bytes quoted
     ASSERT_EQ(executeCommand(ctx, {std::string(1000, 'x')}),
-              "-ERR unknown command '" + std::string(128, 'x') + "'\r\n");
+              prefix + std::string(128, 'x') + "', with args beginning with: \r\n");
+    // Arguments are quoted until 128 bytes of them are written
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", std::string(200, 'x')}),
+              prefix + "NOPE', with args beginning with: '" + std::string(128, 'x') + "' \r\n");
+    std::vector<std::string> many(21, "abcdefghij");
+    many[0] = "NOPE";
+    std::string ten;
+    for(int i = 0; i < 10; i++) ten += "'abcdefghij' ";
+    ASSERT_EQ(executeCommand(ctx, many), prefix + "NOPE', with args beginning with: " + ten + "\r\n");
+    // Each part stops at a NUL byte, as C's %s does; line breaks become spaces
+    ASSERT_EQ(executeCommand(ctx, {std::string("NO\0PE", 5), std::string("a\0b", 3)}),
+              prefix + "NO', with args beginning with: 'a' \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", "line\r\nbreak"}),
+              prefix + "NOPE', with args beginning with: 'line  break' \r\n");
     ASSERT_TRUE(lookupCommand("\xff\xfe") == nullptr);
 }
 
@@ -2007,7 +2023,7 @@ TEST(test_dispatch_appends_replies) {
     executeCommand(ctx, {"NOSUCH"}, out);
     ASSERT_EQ(out, "+earlier reply\r\n+OK\r\n$100\r\n" + std::string(100, 'v') + "\r\n$-1\r\n"
                    "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-                   "-ERR unknown command 'NOSUCH'\r\n");
+                   "-ERR unknown command 'NOSUCH', with args beginning with: \r\n");
 }
 
 TEST(test_dispatch_quit_closes_connection) {
@@ -2167,7 +2183,7 @@ TEST(test_auth_required_before_commands) {
     ASSERT_FALSE(s.exists("k").success);                 // nothing ran
     ASSERT_EQ(executeCommand(ctx, {"CONFIG", "GET", "x"}), kNoAuth);
     // As in Redis, unknown commands and wrong arities are reported first
-    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE'\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE', with args beginning with: \r\n");
     ASSERT_EQ(executeCommand(ctx, {"GET"}), "-ERR wrong number of arguments for 'get' command\r\n");
     ASSERT_EQ(executeCommand(ctx, {"AUTH"}), "-ERR wrong number of arguments for 'auth' command\r\n");
 

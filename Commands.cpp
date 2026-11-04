@@ -568,13 +568,29 @@ bool arityMatches(const Command& cmd, size_t argc) {
     return argc >= static_cast<size_t>(-cmd.arity);
 }
 
+// Redis's unknown-command error, byte for byte (server.c in 7.0.15): the name
+// (128 bytes at most), then the arguments, each quoted, until 128 bytes of
+// them are written. Each stops at a NUL byte, as C's %s does. Some clients
+// and tests match on this text.
+std::string unknownCommandError(const Args& args) {
+    auto asCString = [](const std::string& s) {
+        return std::string_view(s.data(), std::min(s.size(), s.find('\0')));
+    };
+    std::string quoted;
+    for(size_t i = 1; i < args.size() && quoted.size() < 128; i++) {
+        size_t room = 128 - quoted.size();
+        quoted += '\'';
+        quoted += asCString(args[i]).substr(0, room);
+        quoted += "' ";
+    }
+    return "ERR unknown command '" + std::string(asCString(args[0]).substr(0, 128)) +
+           "', with args beginning with: " + quoted;
+}
+
 void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.empty()) return RespParser::appendError(out, "ERR empty command");
     const Command* cmd = lookupCommand(args[0]);
-    if(!cmd) {
-        // Quote at most 128 bytes of the name, as Redis does
-        return RespParser::appendError(out, "ERR unknown command '" + args[0].substr(0, 128) + "'");
-    }
+    if(!cmd) return RespParser::appendError(out, unknownCommandError(args));
     if(!arityMatches(*cmd, args.size())) {
         return RespParser::appendError(out, std::string("ERR wrong number of arguments for '")
                                             + cmd->name + "' command");

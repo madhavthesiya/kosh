@@ -535,7 +535,7 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 | `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
 
-There is no `SAVE`: the AOF is the server's only persistence. A wrong number of arguments gets Redis's `-ERR wrong number of arguments for '…' command`. While AOF writes are failing, write commands get `-MISCONF` (see AOF Persistence).
+There is no `SAVE`: the AOF is the server's only persistence. A wrong number of arguments gets Redis's `-ERR wrong number of arguments for '…' command`, and an unknown command Redis's `-ERR unknown command '…', with args beginning with: …`, byte for byte. While AOF writes are failing, write commands get `-MISCONF` (see AOF Persistence).
 
 ---
 
