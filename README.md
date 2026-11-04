@@ -558,14 +558,14 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**107 unit tests** (`tests/test_main.cpp`):
+**116 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
 [LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
-[Key Table]             5 tests    ✅  (against std::unordered_map at random, every key in one chain, rehash bounded, a mapped table given back mid-rehash)
+[Key Table]             9 tests    ✅  (against std::unordered_map at random, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
 [SIEVE Eviction]        5 tests    ✅  (a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model)
 [TTL Expiration]        5 tests    ✅
 [TTL > LRU Priority]    2 tests    ✅
@@ -578,10 +578,11 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [LRU with Mixed Types]  1 test     ✅
 [AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
 [Command Table]        11 tests    ✅  (arity, SET options, strict integers, error replies, replies appended in place)
+[Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
-[RESP Parser]          11 tests    ✅  (malformed input, size limits, every split point, reused argument strings)
+[RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 107 passed, 0 failed
+Results: 116 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
