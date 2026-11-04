@@ -202,6 +202,15 @@ class BasicCommandTest(ServerTestCase):
             self.assertEqual(c.call("GET", "greeting"), value)
             self.assertIsNone(c.call("GET", "missing"))
 
+    def test_log_lines_are_written_at_once(self):
+        # The log is a file here, as under systemd or docker: each line must
+        # reach it while the server runs, not when a buffer fills or at exit.
+        # The server logs a connection when it accepts it, before reading the
+        # PING, so the line is written by the time PONG arrives.
+        with Client(self.server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+            self.assertIn("Client connected", self.server.output())
+
     def test_bgrewriteaof_reports_error_when_aof_is_disabled(self):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError):

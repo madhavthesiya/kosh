@@ -589,9 +589,10 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 35 tests that start the real server binary on a free port and speak RESP over TCP.
+- 36 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
+  - the log reaching its file while the server runs, as under systemd or Docker;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;

@@ -3,6 +3,7 @@
 #include <optional>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
 #include "Commands.h"
@@ -111,6 +112,20 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
 }
 
 int main(int argc, char* argv[]) {
+    // The log goes out a line at a time, as Redis's does, even when stdout is a
+    // file or a pipe (systemd, docker logs), which the C library would
+    // otherwise buffer a few KB at a time: a line would show up only once
+    // dozens more had followed it, or never if the server were killed. A
+    // write per log line costs little: lines are per connection, never per
+    // command. (std::cout writes through stdout while synced with stdio, the
+    // default.) Windows's C library treats line buffering as full buffering,
+    // so there it is unbuffered.
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+#endif
+
     ServerConfig config;
     switch(parseArgs(argc, argv, config)) {
         case ParseResult::Help:  printUsage(std::cout); return 0;
