@@ -140,10 +140,22 @@ bool Server::start() {
         return false;
     }
 
-    // Allow port reuse (avoid "address already in use" on restart)
+    // The same option name means different things on the two systems.
+    // POSIX: SO_REUSEADDR lets a restarted server bind its port while
+    // connections the old one closed are still in TIME_WAIT; a port another
+    // socket is listening on stays refused.
+    // Windows: SO_REUSEADDR lets a socket bind a port another one is already
+    // listening on, so a second server would start and serve no one, and any
+    // program could bind beside Kosh. SO_EXCLUSIVEADDRUSE refuses that, as
+    // Microsoft advises for servers.
     int opt = 1;
+#ifdef _WIN32
+    setsockopt(listen_socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
     setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&opt), sizeof(opt));
+#endif
 
     // Listen on one address: 127.0.0.1 unless --bind says otherwise. Only this
     // machine can reach a loopback address, so a server nobody configured
