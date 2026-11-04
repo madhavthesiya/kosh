@@ -219,6 +219,7 @@ graph LR
   - Nothing is sized up front, and no insert moves every key: growing to 1,000,000 keys, the slowest insert took 272–405 µs (Challenge 13).
   - Big tables are mapped from the OS, the old one is given back as the rehash goes, and freed child buckets are reused (Challenge 15).
 - **Entries never move:** the table holds pointers, so the eviction queue and the expiry index can point at entries.
+- **Keys are hashed with SipHash-1-3 under a random key per process** (`SipHash.h`), as Python and Rust's `HashMap` do (Redis uses SipHash-1-2). Clients choose the keys. With `std::hash`, whose seed is fixed, anyone can compute keys that all land in one bucket, and then every insert walks one long chain: inserting n keys costs O(n²) ("hash flooding"). [`bench/hash_flood.cpp`](bench/hash_flood.cpp) builds such keys and measures both the attack and the keyed hash's cost. The lookup times above predate the keyed hash: they were measured with `std::hash`.
 
 **One allocation per key:** each key is a `CacheEntry` with the key's bytes right after it.
 - With 16-byte keys and 3-byte values, that is 113 bytes per key at 800,000 keys against Redis's 120 (resident memory).
@@ -624,6 +625,7 @@ kosh/
 ├── StorageInterface.h        # Abstract interface (pure virtual base class)
 ├── InMemoryStorage.h / .cpp  # Storage engine — entries, eviction (SIEVE/LRU), TTL, variant types, AOF
 ├── KeyTable.h                # Hash table — cache-line buckets, incremental rehashing (header-only)
+├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
@@ -631,11 +633,11 @@ kosh/
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
 │                             #   memory (and against Redis), allocations per request, insert and
 │                             #   lookup latency, eviction miss ratios, layout bias, idle clients,
-│                             #   password check timing
+│                             #   password check timing, hash flooding
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 112 unit tests
+    ├── test_main.cpp              # 116 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   └── test_server.py         # Integration tests against the real server binary

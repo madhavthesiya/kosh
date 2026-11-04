@@ -123,6 +123,9 @@ add_executable(alloc_count
 )
 target_link_libraries(alloc_count Threads::Threads)
 
+# Hash flooding against std::hash and KeyedHash, and SipHash's cost (see bench/README.md)
+add_executable(hash_flood bench/hash_flood.cpp)
+
 # Times a password check by where the guess goes wrong (see bench/README.md)
 add_executable(auth_compare
     bench/auth_compare.cpp

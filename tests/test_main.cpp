@@ -19,6 +19,7 @@
 #endif
 #include "../Poller.h"
 #include "../KeyTable.h"
+#include "../SipHash.h"
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
@@ -315,6 +316,113 @@ TEST(test_keytable_big_table_given_back) {
         checked = true;
     }
     ASSERT_TRUE(checked);
+}
+
+// ==================== SipHash ====================
+
+TEST(test_siphash24_reference_vectors) {
+    // The 64 test vectors of the reference implementation (github.com/veorq/
+    // SipHash, vectors.h): key 00 01 .. 0f, message i = bytes 00 01 .. i-1
+    static const uint64_t expected[64] = {
+        0x726fdb47dd0e0e31ull, 0x74f839c593dc67fdull, 0x0d6c8009d9a94f5aull,
+        0x85676696d7fb7e2dull, 0xcf2794e0277187b7ull, 0x18765564cd99a68dull,
+        0xcbc9466e58fee3ceull, 0xab0200f58b01d137ull, 0x93f5f5799a932462ull,
+        0x9e0082df0ba9e4b0ull, 0x7a5dbbc594ddb9f3ull, 0xf4b32f46226bada7ull,
+        0x751e8fbc860ee5fbull, 0x14ea5627c0843d90ull, 0xf723ca908e7af2eeull,
+        0xa129ca6149be45e5ull, 0x3f2acc7f57c29bdbull, 0x699ae9f52cbe4794ull,
+        0x4bc1b3f0968dd39cull, 0xbb6dc91da77961bdull, 0xbed65cf21aa2ee98ull,
+        0xd0f2cbb02e3b67c7ull, 0x93536795e3a33e88ull, 0xa80c038ccd5ccec8ull,
+        0xb8ad50c6f649af94ull, 0xbce192de8a85b8eaull, 0x17d835b85bbb15f3ull,
+        0x2f2e6163076bcfadull, 0xde4daaaca71dc9a5ull, 0xa6a2506687956571ull,
+        0xad87a3535c49ef28ull, 0x32d892fad841c342ull, 0x7127512f72f27cceull,
+        0xa7f32346f95978e3ull, 0x12e0b01abb051238ull, 0x15e034d40fa197aeull,
+        0x314dffbe0815a3b4ull, 0x027990f029623981ull, 0xcadcd4e59ef40c4dull,
+        0x9abfd8766a33735cull, 0x0e3ea96b5304a7d0ull, 0xad0c42d6fc585992ull,
+        0x187306c89bc215a9ull, 0xd4a60abcf3792b95ull, 0xf935451de4f21df2ull,
+        0xa9538f0419755787ull, 0xdb9acddff56ca510ull, 0xd06c98cd5c0975ebull,
+        0xe612a3cb9ecba951ull, 0xc766e62cfcadaf96ull, 0xee64435a9752fe72ull,
+        0xa192d576b245165aull, 0x0a8787bf8ecb74b2ull, 0x81b3e73d20b49b6full,
+        0x7fa8220ba3b2eceaull, 0x245731c13ca42499ull, 0xb78dbfaf3a8d83bdull,
+        0xea1ad565322a1a0bull, 0x60e61c23a3795013ull, 0x6606d7e446282b93ull,
+        0x6ca4ecb15c5f91e1ull, 0x9f626da15c9625f3ull, 0xe51b38608ef25f57ull,
+        0x958a324ceb064572ull,
+    };
+    const uint64_t k0 = 0x0706050403020100ull, k1 = 0x0f0e0d0c0b0a0908ull;
+    unsigned char message[64];
+    for(int i = 0; i < 64; i++) message[i] = static_cast<unsigned char>(i);
+    for(int len = 0; len < 64; len++) {
+        ASSERT_EQ((sipHash<2, 4>(k0, k1, message, static_cast<size_t>(len))), expected[len]);
+    }
+}
+
+TEST(test_siphash13_matches_cpython) {
+    // CPython hashes bytes with SipHash-1-3, and PYTHONHASHSEED=0 makes its key
+    // all zeros: these are hash(b) & (2**64 - 1) from Python 3.12, an
+    // implementation independent of this one. (Python hashes b"" to 0 without
+    // SipHash, so it isn't compared. And python3 -I or -E would ignore
+    // PYTHONHASHSEED and hash with a random key: values from such a run
+    // differ every time.)
+    unsigned char bytes[63];
+    for(int i = 0; i < 63; i++) bytes[i] = static_cast<unsigned char>(i);
+    const std::string hundred(100, 'x');
+    struct Case { const void* data; size_t len; uint64_t expected; };
+    const Case cases[] = {
+        {"a", 1, 0x407448d2b89b1813ull},
+        {"abc", 3, 0xc03bc3a0042630f2ull},
+        {"key:000000000001", 16, 0x789c96b712070d0aull},
+        {bytes, 7, 0x2f098ab0c751325aull},
+        {bytes, 8, 0xead411e67ebe2eeaull},
+        {bytes, 15, 0xf30eb725bb91c9eaull},
+        {bytes, 63, 0x385d3e39e5f37359ull},
+        {hundred.data(), 100, 0x12de6d6e12e5750cull},
+    };
+    for(const auto& c : cases) ASSERT_EQ((sipHash<1, 3>(0, 0, c.data, c.len)), c.expected);
+}
+
+TEST(test_keyed_hash_depends_on_the_key) {
+    // Different keys scatter the same strings differently; the same key
+    // always gives the same hash
+    SipKey a = SipKey::random(), b = SipKey::random();
+    ASSERT_TRUE(a.k0 != b.k0 || a.k1 != b.k1);   // 128 random bits each
+    KeyedHash ha{a}, hb{b}, ha_again{a};
+    int same = 0;
+    for(int i = 0; i < 100; i++) {
+        std::string key = "key:" + std::to_string(i);
+        ASSERT_EQ(ha(key), ha_again(key));
+        same += ha(key) == hb(key);
+    }
+    ASSERT_EQ(same, 0);
+
+    // And a table works with it
+    KeyTable<TableEntry, TableKeyOf, KeyedHash> t(ha);
+    std::vector<TableEntry> entries(1000);
+    for(int i = 0; i < 1000; i++) {
+        entries[i].key = "k" + std::to_string(i);
+        t.insert(&entries[i]);
+    }
+    for(int i = 0; i < 1000; i++) ASSERT_TRUE(t.find(entries[i].key) == &entries[i]);
+}
+
+TEST(test_tables_hash_with_their_own_key) {
+    // A table hashes with the hasher it was given, not a default-constructed
+    // one (which, for KeyedHash, would be the all-zero key every process shares)
+    SipKey key = SipKey::random();
+    KeyTable<TableEntry, TableKeyOf, KeyedHash> t{KeyedHash{key}};
+    ASSERT_EQ(t.hashOf("some key"), KeyedHash{key}("some key"));
+    ASSERT_TRUE(t.hashOf("some key") != KeyedHash{}("some key"));
+
+    // Every storage draws its own random key, so no one can precompute a
+    // collision that works on all of them
+    InMemoryStorage a(10), b(10);
+    int same = 0;
+    for(int i = 0; i < 100; i++) {
+        std::string k = "key:" + std::to_string(i);
+        ASSERT_EQ(a.hashOf(k), a.hashOf(k));
+        same += a.hashOf(k) == b.hashOf(k);
+        ASSERT_TRUE(a.hashOf(k) != KeyedHash{}(k));
+        ASSERT_TRUE(a.hashOf(k) != std::hash<std::string_view>{}(k));
+    }
+    ASSERT_EQ(same, 0);
 }
 
 // ==================== SIEVE Eviction ====================
@@ -2405,6 +2513,10 @@ int main() {
     RUN_TEST(test_keytable_matches_unordered_map);
     RUN_TEST(test_keytable_rehash_is_incremental);
     RUN_TEST(test_keytable_big_table_given_back);
+    RUN_TEST(test_siphash24_reference_vectors);
+    RUN_TEST(test_siphash13_matches_cpython);
+    RUN_TEST(test_keyed_hash_depends_on_the_key);
+    RUN_TEST(test_tables_hash_with_their_own_key);
 
     std::cout << "\n[SIEVE Eviction]\n";
     RUN_TEST(test_sieve_evicts_first_unvisited_key);

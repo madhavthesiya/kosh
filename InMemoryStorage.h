@@ -2,6 +2,7 @@
 #include "StorageInterface.h"
 #include "AOFLogger.h"
 #include "KeyTable.h"
+#include "SipHash.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -55,6 +56,11 @@ class InMemoryStorage final : public StorageInterface {
         // Throws std::invalid_argument if capacity is 0
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr,
                                  EvictionPolicy policy=EvictionPolicy::LRU);
+
+        // The key table's hash of `key`, for tests: each storage must hash
+        // with its own random key. Never exposed to clients, who could use
+        // it to pick colliding keys.
+        size_t hashOf(std::string_view key) const { return data_.hashOf(key); }
 
         // String operations
         Result set(const std::string& key, const std::string& value) override;
@@ -150,7 +156,10 @@ class InMemoryStorage final : public StorageInterface {
         struct EntryKey {
             static std::string_view key(const CacheEntry& e) { return e.key(); }
         };
-        using DataMap = KeyTable<CacheEntry, EntryKey>;
+        // Clients choose the keys, so the table's hash is keyed with a
+        // random key per process (SipHash.h): no one can pick keys that all
+        // land in one bucket
+        using DataMap = KeyTable<CacheEntry, EntryKey, KeyedHash>;
 
         // The entry and its key's bytes in one block, and its release
         static CacheEntry* newEntry(std::string_view key);

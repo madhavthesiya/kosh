@@ -55,7 +55,7 @@ int64_t InMemoryStorage::unixTimeMs() {
 }
 
 InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof, EvictionPolicy policy)
-    : policy_(policy), capacity_(capacity), aof_(aof) {
+    : data_(KeyedHash{SipKey::random()}), policy_(policy), capacity_(capacity), aof_(aof) {
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
