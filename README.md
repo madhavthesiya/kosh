@@ -636,6 +636,7 @@ kosh/
 ├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
+├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
@@ -700,6 +701,8 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | `--poller <epoll\|select>` | epoll on Linux, else select | How the event loop waits for sockets (`select()` serves about 1,000 clients) |
 
 **Who can connect.** By default Kosh listens on 127.0.0.1, so only programs on the same machine can reach it. `--bind 0.0.0.0` listens on every interface. Even then, while no password is set, protected mode (as in Redis) answers clients on other machines with `-DENIED` and disconnects them; `--protected-mode no` turns it off, for a network you trust. Redis started without a config file listens on every interface and relies on protected mode alone; Kosh makes the network an explicit choice.
+
+[SECURITY.md](SECURITY.md) lists what Kosh defends against, what it doesn't (there is no TLS, for one), and how to report a vulnerability.
 
 **Passwords.** With `--requirepass-file` (or `--requirepass`), a client gets `-NOAUTH` for everything but `AUTH` and `QUIT` until it sends `AUTH <password>` (or `AUTH default <password>`). The replies are Redis's, byte for byte, which matters to client libraries that match on them. Two details guard against a client that doesn't have the password:
 - Until it authenticates, a client's commands may have at most 10 arguments of 16 KB each, Redis's limits since 6.2.6. Without them, a client without the password could still make the server buffer up to 1 GB for it on each connection.
