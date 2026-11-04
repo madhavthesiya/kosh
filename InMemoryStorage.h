@@ -1,6 +1,7 @@
 #pragma once
 #include "StorageInterface.h"
 #include "AOFLogger.h"
+#include "KeyTable.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -9,23 +10,36 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
-#include <list>
+#include <memory>
 #include <set>
 #include <deque>
 #include <optional>
 #include <variant>
 #include <shared_mutex>
 
-// Type-safe tagged union for storing different Redis data types
-// std::variant enforces compile-time type checking — no void* or std::any needed
+using ListValue = std::deque<std::string>;                      // O(1) push and pop at both ends
+using SetValue = std::unordered_set<std::string>;
+using HashValue = std::unordered_map<std::string, std::string>;
+
+// A key's value, as a type-safe tagged union. Strings, the common case, are
+// stored inline; lists, sets and hashes behind a pointer. A variant is as
+// large as its largest alternative, and a std::deque is 80 bytes, so storing
+// them inline made every key, strings included, pay 88 bytes for its value;
+// boxed, it is 40.
 using ValueType = std::variant<
-    std::string,                                    // String
-    std::deque<std::string>,                        // List (deque for O(1) push/pop at both ends)
-    std::unordered_set<std::string>,                // Set
-    std::unordered_map<std::string, std::string>    // Hash
+    std::string,
+    std::unique_ptr<ListValue>,
+    std::unique_ptr<SetValue>,
+    std::unique_ptr<HashValue>
 >;
 
 enum class DataType { STRING, LIST, SET, HASH };
+
+// How a full engine picks the key to remove (--eviction)
+enum class EvictionPolicy {
+    LRU,    // the least recently used key: a hit moves the key to the front of the queue
+    SIEVE,  // SIEVE (Zhang et al., NSDI 2024): a hit only sets a bit; see sieveVictim()
+};
 
 // When a key expires. In memory it is a time on the monotonic clock, in
 // milliseconds, so a change to the wall clock while the server runs can't make
@@ -39,7 +53,8 @@ using ExpiryTime = std::chrono::time_point<std::chrono::steady_clock, std::chron
 class InMemoryStorage final : public StorageInterface {
     public:
         // Throws std::invalid_argument if capacity is 0
-        explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
+        explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr,
+                                 EvictionPolicy policy=EvictionPolicy::LRU);
 
         // String operations
         Result set(const std::string& key, const std::string& value) override;
@@ -106,36 +121,66 @@ class InMemoryStorage final : public StorageInterface {
         //   DELs. Once loading is done, keys beyond the capacity are evicted.
         void setLoading(bool loading);
 
-        // Buckets in the key table. It is sized for the capacity at
-        // construction, so this doesn't change as keys are added (tests check it).
+        // Buckets in the key table: none until the first key, then growing
+        // with the keys (tests check it)
         size_t bucketCount() const;
+
+        ~InMemoryStorage() override;
+        InMemoryStorage(const InMemoryStorage&) = delete;
+        InMemoryStorage& operator=(const InMemoryStorage&) = delete;
 
     private:
         // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
         friend struct MemoryLayoutReport;
 
+        // One key: a single allocation, this struct followed by the key's
+        // bytes (see newEntry). The eviction queue runs through the entries
+        // themselves (an intrusive list), newest at the front. Entries never
+        // move, so the queue's links and the expiry index's pointers stay valid.
         struct CacheEntry {
             ValueType value;        // std::variant — holds String, List, Set, or Hash
-            bool has_expiry;
             ExpiryTime expiry_time;
-            std::list<std::string>::iterator lru_it;
+            CacheEntry* newer = nullptr;    // towards the front of the queue
+            CacheEntry* older = nullptr;    // towards the back
+            uint32_t key_len = 0;
+            bool has_expiry = false;
+            bool visited = false;           // SIEVE: used since the hand last passed it
+            std::string_view key() const { return {reinterpret_cast<const char*>(this + 1), key_len}; }
         };
-        using DataMap = std::unordered_map<std::string, CacheEntry>;
+        struct EntryKey {
+            static std::string_view key(const CacheEntry& e) { return e.key(); }
+        };
+        using DataMap = KeyTable<CacheEntry, EntryKey>;
+
+        // The entry and its key's bytes in one block, and its release
+        static CacheEntry* newEntry(std::string_view key);
+        static void deleteEntry(CacheEntry* entry);
+
+        // Adds a key that isn't in data_ yet, with this value, and links it
+        // into the queue: at the front (the newest), or at the back when
+        // `newest` is false
+        CacheEntry* insertEntry(std::string_view key, ValueType value, bool newest = true);
+
+        // The queue's links
+        void linkNewest(CacheEntry& entry);
+        void linkOldest(CacheEntry& entry);
+        void unlink(CacheEntry& entry);
 
         // Every change to an entry's expiry and every removal goes through
         // these, so the expiry index stays in step with data_
-        void setExpiry(DataMap::iterator it, std::optional<ExpiryTime> expiry);
-        void eraseEntry(DataMap::iterator it);
+        void setExpiry(CacheEntry* entry, std::optional<ExpiryTime> expiry);
+        void eraseEntry(CacheEntry* entry);         // and frees it
 
-        // LRU helpers
-        void touchLRU(CacheEntry& entry);               // marks it most recently used
-        void evictLRU();                                // removes and logs the LRU key
-        void makeRoomForNewKey();                       // expired keys first, then LRU
+        // Eviction helpers
+        void markUsed(CacheEntry& entry);               // a hit, for the eviction policy
+        void evictOne();                                // removes and logs the policy's choice
+        CacheEntry* sieveVictim();                      // SIEVE's choice; leaves the hand on it
+        void makeRoomForNewKey();                       // expired keys first, then evictOne()
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
-        void expireKey(const std::string& key);         // removes an expired key, logs DEL
-        void removeKey(const std::string& key);         // removes without logging
+        void expireEntry(CacheEntry* entry);            // removes an expired key, logs DEL
+        void freeAllEntries();                          // empties the table and the queue
 
         // Type helpers
         DataType getDataType(const CacheEntry& entry) const;
@@ -163,19 +208,24 @@ class InMemoryStorage final : public StorageInterface {
                     const std::vector<std::pair<std::string, std::string>>& pairs);
 
         DataMap data_;
-        std::list<std::string> lru_list_;
+        CacheEntry* newest_ = nullptr;      // the front of the queue
+        CacheEntry* oldest_ = nullptr;      // the back
+        EvictionPolicy policy_;
+        // SIEVE's hand: the next entry it looks at, or nullptr to start from
+        // the oldest. Never points at a removed key (see eraseEntry).
+        CacheEntry* hand_ = nullptr;
 
         // Keys with a TTL, soonest expiry first, so expired keys are found
-        // without a scan when room is needed. The pointer is to the key inside
-        // data_: unordered_map keeps references to its elements valid until they
-        // are erased, even when it rehashes.
-        using ExpiryItem = std::pair<ExpiryTime, const std::string*>;
+        // without a scan when room is needed. Entries never move, so the
+        // pointers stay valid until the entry is erased (eraseEntry takes it
+        // out of the index first).
+        using ExpiryItem = std::pair<ExpiryTime, const CacheEntry*>;
         struct ExpiryOrder {
             bool operator()(const ExpiryItem& a, const ExpiryItem& b) const {
                 if(a.first != b.first) return a.first < b.first;
                 // `<` on pointers into different objects is unspecified;
                 // std::less is guaranteed to be a total order
-                return std::less<const std::string*>()(a.second, b.second);
+                return std::less<const CacheEntry*>()(a.second, b.second);
             }
         };
         std::set<ExpiryItem, ExpiryOrder> expiry_index_;
@@ -188,15 +238,15 @@ class InMemoryStorage final : public StorageInterface {
 
 template<typename Use>
 Result InMemoryStorage::readString(const std::string& key, Use&& use) {
-    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the LRU order changes
-    auto it = data_.find(key);
-    if(it == data_.end()) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(it->second)) {
-        expireKey(key);
+    std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the hit is recorded
+    CacheEntry* e = data_.find(key);
+    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    if(isExpired(*e)) {
+        expireEntry(e);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
-    if(getDataType(it->second) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
-    touchLRU(it->second);
-    use(std::get<std::string>(it->second.value));
+    if(getDataType(*e) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
+    markUsed(*e);
+    use(std::get<std::string>(e->value));
     return Result::ok();
 }

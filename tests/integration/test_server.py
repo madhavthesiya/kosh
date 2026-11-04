@@ -685,6 +685,7 @@ class CommandLineTest(ServerTestCase):
             ("--appendonly", "maybe"), ("--appendfilename", ""), ("--bogus",),
             ("--appendfsync", "sometimes"), ("--appendfsync",),
             ("--poller", "kqueue"), ("--maxclients", "0"), ("--maxclients", "many"),
+            ("--eviction", "fifo"), ("--eviction",),
         ]
         for args in cases:
             with self.subTest(args=args):
@@ -705,6 +706,24 @@ class CommandLineTest(ServerTestCase):
                 c.call("SET", key, "1")
             self.assertIsNone(c.call("GET", "a"))  # least recently used, so evicted
             self.assertEqual(c.call("GET", "c"), b"1")
+
+    def test_eviction_option_picks_the_policy(self):
+        # Both keys read, b then a, and c needs room. LRU evicts b, the less
+        # recently used; SIEVE evicts a, the oldest: a hit doesn't move a key.
+        # Without --eviction, the server uses SIEVE.
+        for policy, evicted, kept in (("lru", "b", "a"), ("sieve", "a", "b"), (None, "a", "b")):
+            with self.subTest(policy=policy):
+                flags = ("--eviction", policy) if policy else ()
+                server = self.start_server("--appendonly", "no", "--maxkeys", "2", *flags)
+                with Client(server.port) as c:
+                    c.call("SET", "a", "1")
+                    c.call("SET", "b", "1")
+                    c.call("GET", "b")
+                    c.call("GET", "a")
+                    c.call("SET", "c", "1")
+                    self.assertEqual(c.call("EXISTS", evicted), 0)
+                    self.assertEqual(c.call("EXISTS", kept), 1)
+                server.stop()
 
     def test_appendonly_no_writes_no_file(self):
         server = self.start_server("--appendonly", "no")

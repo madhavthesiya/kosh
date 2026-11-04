@@ -5,11 +5,16 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | Script | Measures | Output |
 |---|---|---|
 | [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
-| [`compare_commits.py`](compare_commits.py) | Mini-Redis at several commits in one session, compared round by round with a sign test: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
+| [`compare_commits.py`](compare_commits.py) | Mini-Redis at several commits in one session, compared round by round with a sign test and a 95% confidence interval for each ratio: the before/after numbers for a change | `commits.md`, `commits-runs.csv` |
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
 | [`insert_latency.cpp`](insert_latency.cpp) | How long one insert of a new key can take in the storage engine, and every rehash of the hash table (no network) | stdout |
+| [`lookup_latency.cpp`](lookup_latency.cpp) | ns per GET and SET in the storage engine, and per `find()` in a plain `std::unordered_map` and in `KeyTable`, for tables of 1,000 to 4,000,000 keys, with uniform and Zipf keys; lookups independent (as in a pipeline) and one at a time (full latency); `--eviction both` measures both policies interleaved in one process. The knee where the table outgrows the cache shows the cost of memory latency without hardware counters (no network) | stdout |
+| [`eviction_sim.cpp`](eviction_sim.cpp) | Miss ratio of the engine's eviction on cache traces (Zipf, Zipf with scans, or a CSV such as Twitter's), at capacities given as fractions of the trace's distinct keys, under `--eviction lru`, `sieve` or `both`. Each request is a GET; a miss SETs the key (no network) | stdout |
+| [`eviction_reference.py`](eviction_reference.py) | Replays the requests `eviction_sim --dump-trace` ran through a textbook implementation of each policy; `--expect` fails unless every miss count is exactly the engine's | stdout |
+| [`memory_compare.py`](memory_compare.py) | Memory per key, Mini-Redis against real Redis for the same keys: growth of resident memory (RSS), with Mini-Redis also under jemalloc to separate the allocator from the data layout | `memory.md` |
+| [`layout_bias.py`](layout_bias.py) | How much `lookup_latency` moves from code and stack layout alone: every link order of its objects, each under several environment sizes, in shuffled order. The spread (with run-to-run noise) is the floor a microbenchmark gain must clear | stdout |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -31,6 +36,21 @@ python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
 ./build/memory_layout > bench/results/<name>/memory-layout.md
 cmake --build build --target insert_latency && taskset -c 2 ./build/insert_latency 100000 5
+cmake --build build --target lookup_latency && taskset -c 2 ./build/lookup_latency   # about 3 minutes
+
+# Eviction: the miss ratio on traces, then an exact check against a textbook policy.
+# Twitter's trace (CC-BY 4.0) as libCacheSim ships it: 1,000,000 requests, 143,542 keys.
+curl -sSfLo ~/traces/twitter_cluster52.csv --create-dirs \
+    https://raw.githubusercontent.com/cacheMon/libCacheSim/develop/data/twitter_cluster52.csv
+cmake --build build --target eviction_sim
+./build/eviction_sim --dump-trace /tmp/trace.txt zipf:0.99 zipfscan:0.99 csv:$HOME/traces/twitter_cluster52.csv > sim.md
+python3 bench/eviction_reference.py /tmp/trace.txt --expect sim.md
+
+# Memory per key against real Redis (1,000,000 keys, 3 runs; about 2 minutes)
+python3 bench/memory_compare.py --out bench/results/<name>/memory.md
+
+# The layout-and-noise floor for lookup_latency's numbers (about 10 minutes)
+python3 bench/layout_bias.py > bench/results/<name>/layout-bias.md
 cmake --build build --target alloc_count && ./build/alloc_count
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:

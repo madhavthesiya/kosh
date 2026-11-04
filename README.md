@@ -1,6 +1,6 @@
 # Mini-Redis — Redis-Compatible In-Memory Key-Value Server in C++17
 
-A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
+A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
@@ -8,36 +8,33 @@ This is a learning project, not production software. What it does not handle yet
 
 ## Performance
 
-Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability (both with `appendfsync no`). 100,000 random keys, 50 clients, middle of 3 runs, the server measured first alternating from run to run. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the speed fixes](bench/results/after-speed-fixes/README.md). Earlier stages: [after the correctness fixes](bench/results/after-correctness-fixes/README.md), [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
+Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability (both with `appendfsync no`). Pipeline 16, 100,000 random keys, 50 clients, middle of 3 runs, the server measured first alternating from run to run. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the memory-latency fixes](bench/results/after-memory-fixes/README.md) (Phase 4B). Earlier stages: [after the speed fixes](bench/results/after-speed-fixes/README.md) (Phase 4), [after the correctness fixes](bench/results/after-correctness-fixes/README.md), [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
 
-| Test | Mini-Redis | Redis | Mini-Redis / Redis | CPU per request vs Redis | At v0-baseline |
-|---|---:|---:|---:|---:|---:|
-| SET, pipeline 16, AOF on | 232,148 req/s | 192,485 req/s | **1.21×** | **0.73×** | 0.43× |
-| GET, pipeline 16, AOF on | 277,316 req/s | 252,653 req/s | 1.10× | 0.90× | 0.56× |
-| SET, pipeline 16, AOF off | 262,743 req/s | 262,688 req/s | 1.00× | 0.99× | 0.50× |
-| GET, pipeline 16, AOF off | 247,011 req/s | 261,083 req/s | 0.95× | 1.00× | 0.48× |
-| SET, no pipelining, AOF on | 22,701 req/s | 21,044 req/s | 1.08× | | 0.97× |
-| GET, no pipelining, AOF on | 23,833 req/s | 24,217 req/s | 0.98× | | 0.97× |
-| Startup, replaying a 1,000,000-command AOF (45 MB) | 0.68 s | 0.64 s | 1.07× | | over 750× |
+| Test, pipeline 16 | Mini-Redis | Redis | Mini-Redis / Redis | CPU per request vs Redis | At Phase 4 (`v2-fast`) | At v0-baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| SET, AOF on | 350,435 req/s | 254,621 req/s | **1.38×** | **0.67×** | 1.21× | 0.43× |
+| GET, AOF on | 407,664 req/s | 332,934 req/s | **1.22×** | **0.75×** | 1.10× | 0.56× |
+| SET, AOF off | 399,584 req/s | 312,012 req/s | **1.28×** | **0.71×** | 1.00× | 0.50× |
+| GET, AOF off | 391,665 req/s | 338,547 req/s | **1.16×** | **0.77×** | 0.95× | 0.48× |
 
 What the measurements show:
-- **With AOF on, Mini-Redis serves pipelined `SET`s faster than Redis, on less CPU:**
-  - 1.21× the throughput, and 0.73–0.82× the CPU per request, in two sessions;
-  - faster in every one of 6 runs, including the runs where Redis was measured first.
-  - The change behind it is **group commit**: the AOF records of every command in a pass of the event loop now go out in one `write()`, before any of their replies. 100,000 pipelined `SET`s made 132 `write()` calls where they made 100,002, and SET got 1.42–1.71× faster in every round of a commit-by-commit comparison.
-- **Everything else ties with Redis:** pipelined `GET`, and both without AOF (0.90–1.02× the CPU per request). At v0 Mini-Redis was at 0.43–0.56×.
-- **p99 is lower than Redis's in all four pipelined tests,** in both sessions: for `SET` with AOF on, 6.0 ms against 7.0. A table that grew all at once used to freeze every client for about 20 ms at 85,000 keys (Challenge 13), so the worst `SET` took 23–77 ms; with the table sized at startup the slowest insert takes 28–112 µs.
-- **No request allocates memory:**
-  - commands are parsed into reused strings;
-  - replies are built straight into the client's buffer, AOF records straight into the log's.
-  - [`bench/alloc_count`](bench/alloc_count.cpp) counts 0 allocations per `GET` or `SET`, where Phase 3's code made 5 and 11.
-- **What is left is memory latency.** Both are cache misses on separately allocated nodes, and the next things to change:
-  - the hash table's bucket walk: 24% of pipelined `SET`'s CPU, and most of the 31% `GET` spends in `cmdGet`, where it is inlined;
-  - the LRU list relink: 9–11%.
-- **With 1,000 idle clients, `epoll` uses 9–14× less CPU per busy request than `select()`**, which rebuilds and scans every socket on each wakeup.
-- **With `--appendfsync always`, both servers wait for the disk and tie**: each syncs once per pass of its event loop, about 390 `SET`s per `fdatasync()` at pipeline 16.
-- **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip sets the pace for both.
-- **312 bytes of heap per key** for a 16-byte key and a 3-byte value.
+- **Mini-Redis was faster than Redis in all 12 paired runs,** with lower CPU per request in every one (0.66–0.85×) and a lower p99 in every one (3.7–4.1 ms against 4.3–5.0, medians).
+  - CPU per request is the fairer measure here: Mini-Redis ran at 81–91% of a core, so the client and the loopback network limited its throughput too.
+  - Ratios to Redis move by up to ±0.10 between sessions on this machine, so the change since Phase 4 is certain where it is larger than that: `GET`, and both tests without AOF, which were at parity.
+- **Phase 4B removed the waits on memory that kept `GET` at parity:**
+  - **a hash table of its own** finds a key in half the time of `std::unordered_map` at 100,000 and 1,000,000 keys (Challenge 13);
+  - **one allocation per key:** memory per key fell from 312 bytes to 113, against Redis's 120 at 800,000 keys;
+  - **SIEVE eviction:** 13–17% fewer misses than LRU on Zipf traces.
+  - Commit by commit, this session's rounds were too noisy to separate most changes; KeyTable alone resolved at 9% less CPU per request for `SET` without AOF.
+- **Phase 4 made it competitive:**
+  - **group commit:** the AOF records of every command in a pass of the event loop go out in one `write()`, before any of their replies; 100,000 pipelined `SET`s made 132 `write()` calls where they made 100,002;
+  - **no request allocates memory:** commands are parsed into reused strings, and replies and AOF records are built straight into their buffers. [`bench/alloc_count`](bench/alloc_count.cpp) counts 0 allocations per `GET` or `SET`, where Phase 3's code made 5 and 11.
+- **No freeze while the table grows:** growing to 1,000,000 keys with nothing sized up front, the slowest insert took 272–405 µs. A table that grew all at once used to freeze every client for 20 ms at 85,000 keys (Challenges 13 and 15).
+- **From Phase 4's session:**
+  - **with 1,000 idle clients, `epoll` uses 9–14× less CPU per busy request than `select()`**, which rebuilds and scans every socket on each wakeup;
+  - **with `--appendfsync always`, both servers wait for the disk and tie**: each syncs once per pass of its event loop, about 390 `SET`s per `fdatasync()` at pipeline 16;
+  - **without pipelining, the two tie** (1.08× for `SET`, 0.98× for `GET`): neither server reaches 100% CPU, and the network round trip sets the pace for both;
+  - **startup, replaying a 1,000,000-command AOF (45 MB):** 0.68 s against Redis's 0.64 s.
 
 Raw numbers vary between sessions on this machine (WSL2 on a hybrid CPU) by more than most code changes, so comparisons are made within one session, with the order of measurements alternating, and reported with their spread. The full results also say which differences were too small to resolve.
 
@@ -56,7 +53,7 @@ flowchart TD
     Client3["redis-cli / Client N"]
 
     Server["TCP Server\n<i>epoll event loop</i>\nI/O multiplexing · RESP protocol"]
-    Storage["InMemoryStorage\n<i>std::variant · shared_mutex</i>\nLRU · TTL · Type dispatch"]
+    Storage["InMemoryStorage\n<i>KeyTable · std::variant · shared_mutex</i>\nSIEVE / LRU · TTL · Type dispatch"]
     AOF["AOFLogger\n<i>Binary RESP format</i>\nAppend-only file"]
 
     Client1 --> Server
@@ -85,7 +82,8 @@ flowchart TD
 | **Protocol** | `RespParser.h` | RESP parsing (binary-safe, with limits) + inline command support |
 | **Commands** | `Commands.h/.cpp` | One table of commands (name, number of arguments, write flag, handler), used by both the server and AOF replay |
 | **Controller** | `RedisLite.h/.cpp` | Input validation, command routing for the interactive CLI |
-| **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL with an expiry index, type dispatch, AOF integration |
+| **Engine** | `InMemoryStorage.h/.cpp` | Entries (one allocation per key), eviction (SIEVE or LRU), TTL with an expiry index, type dispatch, AOF integration |
+| **Key table** | `KeyTable.h` | The hash table: 64-byte buckets with hash tags, incremental rehashing, entries that never move |
 | **Persistence** | `AOFLogger.h/.cpp` | Append-only file: appends, crash-safe rewrite, failed writes |
 | **Entry points** | `server_main.cpp`, `main.cpp` | Server (command-line flags) and interactive CLI |
 
@@ -100,21 +98,22 @@ flowchart TD
 | **Set** | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` | `std::unordered_set<string>` |
 | **Hash** | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN` | `std::unordered_map<string,string>` |
 
-All types are stored in a single `std::variant`:
-- **Benefits:** no virtual calls, no separate heap object per value, and type checks at compile time.
-- **Cost:** size. Every value is as large as the largest alternative plus a type tag.
+All types are stored in a single `std::variant`, with lists, sets and hashes behind a pointer:
+- **Benefits:** no virtual calls, type checks at compile time, and strings (most values) stored inline, so a `GET` follows no extra pointer.
+- **Why the pointer:** a variant is as large as its largest alternative. With a `std::deque` inline (80 bytes), every value, strings included, took 88 bytes; boxed, it takes 40.
 
 Measured on x86-64 Linux with GCC 13 (libstdc++):
 
 | Type | `sizeof` (bytes) |
 |------|:----------------:|
 | `std::string` | 32 |
-| `std::deque<std::string>` (largest alternative) | 80 |
+| `std::deque<std::string>` | 80 |
 | `std::unordered_set` / `std::unordered_map` | 56 |
-| `ValueType` (the variant) | 88 |
-| `CacheEntry` (variant + TTL + LRU iterator) | 112 |
+| `ValueType` (a string, or a pointer to a list, set or hash) | 40 |
+| `CacheEntry` (value, expiry, eviction-queue links, key length, flags) | 72 |
+| `KeyTable` bucket (one cache line) | 64 |
 
-So a 3-byte string value still occupies 88 bytes inside the variant. Other compilers and standard libraries give different sizes.
+A key costs one allocation: its `CacheEntry` with the key's bytes right after it. With 16-byte keys and 3-byte values, that is 100–113 bytes per key in all, about what Redis uses (see [the key table](#4-the-key-table-and-eviction)). Other compilers and standard libraries give different sizes.
 
 ---
 
@@ -175,46 +174,69 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 | Group commit | The records of every command in one pass of the event loop go out in one `write()`, and with `always` one `fdatasync()`. Measured with `strace`: 100,000 pipelined `SET`s took 132 `write()` calls, where they took 100,002; with `always`, one sync covers about 390 `SET`s at pipeline 16 and 25 without pipelining. |
 | Binary safety | RESP format — spaces, newlines, any byte in values |
 | Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
-| Removals | Every key the server removes on its own, by LRU eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The LRU order isn't rebuilt: reads aren't logged. |
+| Removals | Every key the server removes on its own, by eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The eviction order isn't rebuilt from the log: reads aren't logged. |
 | Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
 | Damaged file | An incomplete last record, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
 | Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis; a failed `everysec` sync does the same. With `always`, a failed write or sync can no longer be made good, so the server sends none of the waiting replies and stops with exit code 1, as Redis does. |
-| Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
+| Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. It writes the keys oldest first, so loading the new file rebuilds the eviction order. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
 | Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file; `--appendfsync` the sync policy |
 
-### 4. O(1) LRU Eviction
+### 4. The Key Table and Eviction
 
 ```mermaid
 graph LR
-    subgraph HashMap["std::unordered_map"]
-        A["key → CacheEntry"]
+    subgraph Table["KeyTable: buckets of one 64-byte cache line"]
+        B["metadata · 7 hash tags · 7 entry pointers"]
     end
 
-    subgraph DLL["std::list (Doubly Linked List)"]
-        MRU["Most Recent"] --> N2["..."] --> LRU["Least Recent"]
+    subgraph Entry["One allocation per key"]
+        V["CacheEntry: value · expiry · newer/older links · flags"]
+        K["the key's bytes"]
     end
 
-    subgraph Entry["CacheEntry"]
-        V["std::variant value"]
-        E["has_expiry + expiry_time"]
-        I["lru_iterator ──────────┐"]
+    subgraph Queue["Eviction queue, through the entries"]
+        N["newest"] --> M["..."] --> O["oldest"]
     end
 
-    A --> Entry
-    I -.->|points to| DLL
+    B --> V
+    V --- K
+    V -.->|links| Queue
 
-    style HashMap fill:#1e293b,color:#e2e8f0,stroke:#334155
-    style DLL fill:#1e293b,color:#e2e8f0,stroke:#334155
+    style Table fill:#1e293b,color:#e2e8f0,stroke:#334155
     style Entry fill:#1e293b,color:#e2e8f0,stroke:#334155
+    style Queue fill:#1e293b,color:#e2e8f0,stroke:#334155
 ```
 
-- HashMap for O(1) lookup + doubly-linked list for O(1) reordering
-- Iterator stored in each entry — no linear scan to find position
-- Capacity is set with `--maxkeys` (default 10,000)
-- **The hash table is sized for the capacity at startup,** so it never rehashes while serving. `std::unordered_map` rehashes all at once, moving every key: the insert of the 85,230th key took about 20 ms, during which every client waited (Challenge 13). The bucket array costs 8 bytes per key of capacity, up front; it is capped at 4,194,304 keys (35 MB), beyond which the table grows by rehashing as before.
-- **A read relinks the key's LRU node** with `std::list::splice`: no allocation and no second hash lookup.
-- **Expired keys go before live ones.** Keys with a TTL are also kept in an index ordered by expiry time (a `std::set` of expiry time and a pointer to the key in the hash map). When a new key needs room, expired keys are removed from the front of the index first, and a live key is evicted only when none is left. Only as many are removed as are needed, so one insert never sweeps a large backlog.
-- The pointers stay valid because `std::unordered_map` keeps references to its elements valid until they are erased, even when it rehashes.
+**The key table** (`KeyTable.h`, after Valkey 8.1's design):
+- **A bucket is one 64-byte cache line:** a metadata byte, a one-byte hash tag per slot, and 7 pointers to entries.
+  - A lookup reads the bucket, compares the tags, and compares the key only on a match (1 in 256 by chance).
+  - That is two dependent memory reads, the bucket and the entry, where `std::unordered_map` makes three or four.
+  - Measured: 103 → 50 ns per lookup at 100,000 keys, and 223 → 107 at 1,000,000 ([results](bench/results/after-memory-fixes/README.md#3-lookups-in-the-engine)). It is 14% slower at 1,000 keys, all in cache, where only instruction count is left.
+- **A full bucket's last slot points to a child bucket.**
+- **It grows incrementally, as Redis's dict does:** a table twice the size, one bucket chain moved per insert or erase, and lookups checking both tables meanwhile.
+  - Nothing is sized up front, and no insert moves every key: growing to 1,000,000 keys, the slowest insert took 272–405 µs (Challenge 13).
+  - Big tables are mapped from the OS, the old one is given back as the rehash goes, and freed child buckets are reused (Challenge 15).
+- **Entries never move:** the table holds pointers, so the eviction queue and the expiry index can point at entries.
+
+**One allocation per key:** each key is a `CacheEntry` with the key's bytes right after it.
+- With 16-byte keys and 3-byte values, that is 113 bytes per key at 800,000 keys against Redis's 120 (resident memory).
+- At 1,000,000 keys it is 124 against 116, because the table is in the middle of growing there.
+- Before Phase 4B it was 312: four allocations per key, with the key stored twice.
+
+**Eviction: SIEVE by default, LRU on request** (`--eviction sieve|lru`):
+- Capacity is set with `--maxkeys` (default 10,000). The eviction queue runs through the entries themselves (an intrusive list), newest at the front.
+- **SIEVE** (Zhang et al., NSDI 2024):
+  - a hit sets a bit in the entry the lookup has just read;
+  - to evict, a hand walks from the oldest key towards the newest, wrapping round, and clears the bits it passes;
+  - the first key whose bit is clear is evicted, and the keys it passed keep their places.
+- **LRU:** a hit relinks the entry at the front. That writes its two neighbours, memory that a big table rarely has in cache.
+- **Measured** ([results](bench/results/after-memory-fixes/README.md#5-eviction)):
+  - SIEVE missed 13–17% less than LRU on Zipf traces, and 1.4–4.7% less on Twitter's production trace;
+  - every miss count matches a textbook LRU and the paper's SIEVE exactly;
+  - engine `GET` was 10% faster with SIEVE at 1,000,000 keys, and the same at 100,000.
+- **Expired keys go before live ones.** Keys with a TTL are also kept in an index ordered by expiry time (a `std::set` of expiry time and entry pointer).
+  - When a new key needs room, expired keys are removed from the front of the index first, and a live key is evicted only when none is left.
+  - Only as many are removed as are needed, so one insert never sweeps a large backlog.
 
 ### 5. Thread Safety
 
@@ -222,9 +244,10 @@ graph LR
 
 | Method | Lock Type | Why |
 |--------|-----------|-----|
-| `GET`, `EXISTS` | `unique_lock` | Lazy expiration may trigger write |
-| `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data |
-| `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read |
+| `GET` | `unique_lock` | Records the hit (SIEVE's bit, or LRU's relink), and lazy expiration may remove the key |
+| `EXISTS` | `unique_lock` | Lazy expiration may remove the key |
+| `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data; an insert or erase also moves one bucket chain of a rehash in progress |
+| `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read: a lookup in the key table never moves anything |
 | `SAVE` (CLI only) | `shared_lock` | Snapshot is read-only |
 
 The single-threaded server doesn't need this lock. It exists so the storage engine is safe to use from several threads, which the stress tests do.
@@ -410,7 +433,9 @@ A crash at any point leaves either the old file or the new one, whole. `strace` 
 
 The server is single-threaded, so such a `SET` makes every client wait: about 800 requests at 50 clients pipelining 16. Only new keys trigger it, which is why only `SET`s showed it.
 
-**Solution:** The table is sized for `--maxkeys` at startup (`reserve()`), as low-latency systems preallocate, so it never rehashes while serving: the slowest insert dropped to 0.15–0.33 ms. Redis instead rehashes incrementally, a few buckets per operation, which needs a hash table of its own. The cost is 8 bytes of buckets per key of capacity, allocated up front, capped at 4,194,304 keys (35 MB), so a huge `--maxkeys` meant as "unlimited" doesn't allocate gigabytes.
+**First solution (Phase 4):** The table was sized for `--maxkeys` at startup (`reserve()`), as low-latency systems preallocate, so it never rehashed while serving: the slowest insert dropped to 0.15–0.33 ms. The cost was 8 bytes of buckets per key of capacity, up front, and a cap (4,194,304 keys), beyond which the stall came back.
+
+**Solution now (Phase 4B):** a hash table of its own, [`KeyTable.h`](KeyTable.h), that grows incrementally, as Redis's dict does: it allocates a table twice the size and moves one bucket chain per insert or erase, and lookups check both tables meanwhile. Nothing is sized up front and there is no cap. Growing to 1,000,000 keys, the slowest insert took 272–405 µs, at scattered positions ([results](bench/results/after-memory-fixes/insert-latency.md)). Getting there took a second hunt: Challenge 15.
 
 ### Challenge 14: A Test That Failed Once in Eight Runs
 
@@ -426,6 +451,25 @@ The server is single-threaded, so such a `SET` makes every client wait: about 80
 **Proof**, with an `LD_PRELOAD` shim that steps `CLOCK_REALTIME` and leaves `CLOCK_MONOTONIC` alone:
 - the old test fails exactly as on WSL, and the new one passes;
 - with the bug the test exists for put back (expired keys not logged), the new test still fails, on a steady clock and on a stepping one.
+
+### Challenge 15: The Stall That Was the Allocator
+
+**Problem:** With the incremental table, growing to 1,000,000 keys still had inserts of 2.9–4.1 ms, at the same positions in every repeat: where a rehash starts, and shortly after one ends. Incremental rehashing exists to prevent exactly that.
+
+**How it was found**, one measurement at a time:
+
+| Finding | Evidence | Fix |
+|---|---|---|
+| When a rehash finished, the old table's every bucket was read again, to free child buckets that the rehash steps had already freed | the stall positions pointed at rehash ends; the code did a full scan there | free the block, no scan |
+| `calloc` gives lazily zeroed pages only for blocks glibc maps from the OS, and glibc raises that size after it frees a big block; below it, a new table comes from the heap and is zeroed byte by byte | a stall where a growth *started* | tables of 1 MB or more are `mmap`ed directly |
+| Freeing megabytes at once makes the kernel release every page in one call | `strace`: `munmap` of 7 MB took 1.6 ms | the moved part of the old table is given back as the rehash goes, 64 KB at a time (`madvise(MADV_DONTNEED)`) |
+| A 2 ms stall 60–136 inserts *after* each rehash ended, with no slow system call | a program timing a bare table, every entry allocated up front, still showed it; switching glibc's fastbins off (`GLIBC_TUNABLES=glibc.malloc.mxfast=0`) cut it to 0.3–0.8 ms | freed child buckets are kept and reused, so they never go back to `malloc` |
+
+The last one is the lesson: a rehash frees thousands of small blocks at once. glibc parks them unmerged in its fastbins and merges them all later, inside one unlucky insert. Redis's dict moves its entry nodes during a rehash rather than freeing them, and it allocates with jemalloc, whose small blocks go back to fixed-size slabs with no merging pass.
+
+**Result:** the bare table's slowest insert went from 2.1–2.4 ms at fixed positions to 0.33–0.8 ms at scattered ones, some outside any rehash, which is this VM's own noise. Through the engine, on a quiet machine: 272–405 µs.
+
+**A null result, kept:** giving back 16 KB at a time instead of 64 KB made no difference that alternating runs could resolve, so 64 KB (fewer system calls) stayed.
 
 ---
 
@@ -494,7 +538,7 @@ There is no `SAVE`: the AOF is the server's only persistence. A wrong number of 
 | Operation | Time | Space |
 |-----------|:----:|:-----:|
 | SET / GET / DEL | O(1) average, plus O(log T) when a TTL is set or removed | O(1) |
-| Making room for a new key | O(log T) per expired key removed, then O(1) to evict | O(1) |
+| Making room for a new key | O(log T) per expired key removed, then O(1) amortized to evict (SIEVE's hand clears one bit per step; LRU takes the oldest) | O(1) |
 | LPUSH / RPUSH | O(1) per element | O(1) per element |
 | LPOP / RPOP | O(1) | O(1) |
 | LRANGE | O(K) | O(K) |
@@ -510,13 +554,15 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**97 unit tests** (`tests/test_main.cpp`):
+**107 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Mini-Redis Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
-[LRU Eviction]          7 tests    ✅  (includes: the table never rehashes up to its capacity)
+[LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
+[Key Table]             5 tests    ✅  (against std::unordered_map at random, every key in one chain, rehash bounded, a mapped table given back mid-rehash)
+[SIEVE Eviction]        5 tests    ✅  (a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model)
 [TTL Expiration]        5 tests    ✅
 [TTL > LRU Priority]    2 tests    ✅
 [Persistence]           4 tests    ✅  (the CLI's SAVE/LOAD)
@@ -531,7 +577,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          11 tests    ✅  (malformed input, size limits, every split point, reused argument strings)
 
-Results: 97 passed, 0 failed
+Results: 107 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -541,9 +587,9 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 34 tests that start the real server binary on a free port and speak RESP over TCP.
+- 35 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
-  - basic commands, command-line flags, and AOF replay after a restart;
+  - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
   - many clients pipelining at once, and `BGREWRITEAOF` in the middle of a pipeline (group commit);
   - a damaged AOF at startup, failed AOF writes under a file size limit (Challenge 12), and `--appendfsync always` stopping the server when they fail;
   - protocol errors and error replies;
@@ -570,17 +616,19 @@ mini-redis/
 ├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
 ├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
 ├── StorageInterface.h        # Abstract interface (pure virtual base class)
-├── InMemoryStorage.h / .cpp  # Storage engine — LRU, TTL, variant types, AOF
+├── InMemoryStorage.h / .cpp  # Storage engine — entries, eviction (SIEVE/LRU), TTL, variant types, AOF
+├── KeyTable.h                # Hash table — cache-line buckets, incremental rehashing (header-only)
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
-│                             #   memory, allocations per request, insert latency, idle clients
+│                             #   memory (and against Redis), allocations per request, insert and
+│                             #   lookup latency, eviction miss ratios, layout bias, idle clients
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 97 unit tests
+    ├── test_main.cpp              # 107 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     └── integration/
         └── test_server.py         # Integration tests against the real server binary
@@ -619,7 +667,8 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--port <1-65535>` | 6379 | TCP port to listen on |
-| `--maxkeys <n>` | 10000 | Keys to hold before LRU eviction |
+| `--maxkeys <n>` | 10000 | Keys to hold before evicting one |
+| `--eviction <sieve\|lru>` | sieve | Which key a full server evicts: SIEVE's choice, or the least recently used |
 | `--appendonly <yes\|no>` | yes | Log writes to the AOF and replay it at startup |
 | `--appendfilename <path>` | appendonly.aof | AOF file; the server refuses to start if it can't be opened |
 | `--appendfsync <always\|everysec\|no>` | everysec | When the AOF reaches the disk: before every reply, once a second, or when the OS decides |
@@ -697,7 +746,9 @@ On Windows (MinGW), add `-lws2_32` to the server and unit-test commands for Wins
 | **Refuse writes while the AOF can't be written** | Same as Redis's `MISCONF`. Acknowledging writes that can't be saved would lose them silently at the next restart; exiting would take reads down too. **Cost:** a full disk makes the server read-only until there is room. |
 | **Reject unsupported `SET` options** | `NX`, `XX`, `GET` and `KEEPTTL` return a syntax error. Ignoring `NX` would let `SET lock me NX` take a lock that someone else holds. |
 | **`TCP_NODELAY` enabled** | Disables Nagle's algorithm. Trades bandwidth efficiency for latency — correct for request-response protocols. |
-| **`std::variant` over inheritance** | No vtable pointer, no separate heap object per value, compile-time type checks. **Cost:** every value is as large as the largest alternative (88 bytes on x86-64 GCC 13, even for a 3-byte string). |
+| **`std::variant` over inheritance** | No vtable pointer, compile-time type checks, strings stored inline. Lists, sets and hashes are behind a pointer, so the variant is 40 bytes, not the 88 of its largest alternative. **Cost:** creating a list, set or hash allocates once more, and reading one follows one more pointer. |
+| **A hash table of its own over `std::unordered_map`** | Cache-line buckets with one-byte hash tags: a lookup is two dependent memory reads, not three or four, and the key lives inside its entry (one allocation per key). It grows incrementally, so no insert moves every key. **Cost:** code to own and test (a differential test against `std::unordered_map`, planted bugs), 14% slower lookups when everything fits in cache, and it never shrinks. Flat tables such as `absl::flat_hash_map` were ruled out: they move elements when they grow, and the eviction queue and expiry index point at entries. |
+| **SIEVE by default, LRU on request** | A SIEVE hit writes one bit in the entry the lookup already read; an LRU hit relinks three entries. SIEVE missed 13–17% less on Zipf traces and up to 5% less on Twitter's. **Cost:** it isn't scan-resistant on some block-storage workloads (per its authors), so LRU stays available. |
 | **Lazy TTL over active expiration** | No background thread or timer. O(1) per access. **Cost:** expired keys use memory until they're accessed or a new key needs their room. Redis also samples keys with a TTL about 10 times a second. |
 | **`shared_mutex` over lock-free** | Correct and easy to reason about. Lock-free structures can scale better under contention but are much harder to get right. The single-threaded server needs neither. |
 | **Assert-based tests over gtest** | Zero dependencies (the integration tests use only Python's standard library). Tests are the spec — readable by anyone. |
@@ -731,7 +782,9 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
-| The hash table is sized at startup for at most 4,194,304 keys. With a larger `--maxkeys`, it grows past that by rehashing all at once, which stalls every client for longer the bigger the table (20 ms at 85,000 keys, Challenge 13). | Incremental rehashing, as Redis does, with the storage rework (one key copy, intrusive LRU links) |
+| The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
+| The hash function (`std::hash`) has no secret seed, so a client that chooses keys that all collide can make every lookup walk one long chain (hash flooding). | A keyed hash (SipHash) with a random seed, as Redis uses |
+| On systems other than Linux and macOS (Windows), the key table's big arrays come from `calloc` and are freed at once, so growth can stall for longer there (Challenge 15). | Map and release them with the OS's own calls |
 
 **Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), `AUTH`.
 
