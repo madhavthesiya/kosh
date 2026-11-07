@@ -101,9 +101,13 @@ class ServerProcess:
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
     def output(self):
-        self._log.flush()
-        self._log.seek(0)
-        return self._log.read()
+        # Through a handle of its own. The server's stdout is self._log's open
+        # file, and every handle to one open file shares its offset: seeking
+        # self._log back to read moved where the server's next line went, so a
+        # line logged meanwhile overwrote the log's start and the read began
+        # after it (seen once in ctest; a sleep after the seek made it every time).
+        with open(self._log.name) as log:
+            return log.read()
 
     def stop(self):
         if self.is_running():
