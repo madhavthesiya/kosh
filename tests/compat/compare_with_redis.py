@@ -145,6 +145,28 @@ MESSAGE_CASES = {
     "unknown command, inline": b"nope inline args\r\n",
 }
 
+def fresh(*keys):
+    """Deletes the keys one DEL each, so a case starts clean whether or not
+    the server takes several keys in one DEL"""
+    return b"".join(arr("DEL", k) for k in keys)
+
+
+# Numbers in arguments and values are read as Redis's string2ll reads them:
+# only the canonical form ("5", "-5", "0"), no sign but "-", no leading zero,
+# no space, at most 20 bytes
+INTEGER_CASES = {
+    "EXPIRE 010": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", "010") + arr("TTL", "k"),
+    "EXPIRE -0": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", "-0") + arr("EXISTS", "k"),
+    "EXPIRE +5": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", "+5") + arr("TTL", "k"),
+    "EXPIRE ' 5'": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", " 5") + arr("TTL", "k"),
+    "EXPIRE 0": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", "0") + arr("EXISTS", "k"),
+    "EXPIRE, 20 digits with leading zeros": fresh("k") + arr("SET", "k", "v") + arr("EXPIRE", "k", "0" * 19 + "9"),
+    "SET EX 010": fresh("k") + arr("SET", "k", "v", "EX", "010") + arr("TTL", "k"),
+    "LRANGE 01": fresh("l") + arr("RPUSH", "l", "a", "b") + arr("LRANGE", "l", "01", "1") + arr("LRANGE", "l", "-0", "1"),
+    "LRANGE 2^63": fresh("l") + arr("RPUSH", "l", "a") + arr("LRANGE", "l", 0, "9223372036854775808"),
+    "HELLO 03": arr("HELLO", "03"),
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -154,6 +176,7 @@ GROUPS = {
     "Transactions": (TRANSACTION_CASES, None),
     "Transactions, password set": (TRANSACTION_PASSWORD_CASES, "secret"),
     "PING and error messages": (MESSAGE_CASES, None),
+    "Integer arguments": (INTEGER_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why

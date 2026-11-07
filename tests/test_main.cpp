@@ -24,6 +24,7 @@
 #include "../RedisLite.h"
 #include "../RespParser.h"
 #include "../Commands.h"
+#include "../Integer.h"
 
 int passed = 0;
 int failed = 0;
@@ -2103,10 +2104,34 @@ TEST(test_dispatch_set_rejects_bad_options) {
     ASSERT_FALSE(s.exists("k").success);        // nothing was stored
 }
 
+TEST(test_parse_int64_reads_as_redis) {
+    // Redis's string2ll: only the canonical form of a number is one
+    int64_t v = 42;
+    for(const char* ok : {"0", "5", "-5", "10", "9223372036854775807", "-9223372036854775808"}) {
+        if(!parseInt64(ok, v) || std::to_string(v) != ok) throw std::runtime_error(std::string("rejected ") + ok);
+    }
+    for(const char* bad : {"", "-", "05", "-0", "00", "-05", "+5", " 5", "5 ", "5x", "1.5", "--5", "0x10",
+                           "9223372036854775808", "-9223372036854775809", "00000000000000000009",
+                           "100000000000000000000"}) {
+        if(parseInt64(bad, v)) throw std::runtime_error(std::string("accepted '") + bad + "'");
+    }
+    // A long argument is refused by its length, before any digit is read
+    ASSERT_FALSE(parseInt64(std::string(1 << 20, '1'), v));
+}
+
 TEST(test_dispatch_strict_integer_arguments) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
     const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    // Non-canonical forms are refused, as Redis 7.0.15 refuses them (from_chars accepted them)
+    executeCommand(ctx, {"SET", "k", "v"});
+    for(const char* bad : {"010", "-0", "+5", " 5"}) {
+        ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", bad}), not_int);
+        ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", bad}), not_int);
+    }
+    ASSERT_EQ(s.ttl("k").value, "-1");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "03"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    executeCommand(ctx, {"DEL", "k"});
     // SETEX: a TTL of 0 used to store the key without one; std::stoi read "10abc" as 10
     ASSERT_EQ(executeCommand(ctx, {"SETEX", "k", "0", "v"}),
               "-ERR invalid expire time in 'setex' command\r\n");
@@ -2125,6 +2150,7 @@ TEST(test_dispatch_strict_integer_arguments) {
 
     executeCommand(ctx, {"RPUSH", "l", "a", "b"});
     ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "1x"}), not_int);
+    ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "01", "1"}), not_int);
     ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "99999999999"}),     // past INT_MAX
               "*2\r\n$1\r\na\r\n$1\r\nb\r\n");
 }
@@ -3025,6 +3051,7 @@ int main() {
     RUN_TEST(test_dispatch_quit_closes_connection);
     RUN_TEST(test_dispatch_set_options);
     RUN_TEST(test_dispatch_set_rejects_bad_options);
+    RUN_TEST(test_parse_int64_reads_as_redis);
     RUN_TEST(test_dispatch_strict_integer_arguments);
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);

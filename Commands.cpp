@@ -1,9 +1,9 @@
 #include "Commands.h"
+#include "Integer.h"
 #include "RespParser.h"
 #include "Version.h"
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <climits>
 #include <cstring>
 #include <fstream>
@@ -45,13 +45,6 @@ bool equalsIgnoreCase(std::string_view a, std::string_view b) {
            std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) {
                return std::toupper(x) == std::toupper(y);
            });
-}
-
-// The whole of `text` as a 64-bit integer. std::from_chars, unlike std::stoll,
-// rejects trailing garbage such as "10abc" and reports overflow instead of throwing.
-bool parseInt64(const std::string& text, int64_t& out) {
-    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-    return ec == std::errc() && end == text.data() + text.size();
 }
 
 // An index past the range of int selects what INT_MIN or INT_MAX would
