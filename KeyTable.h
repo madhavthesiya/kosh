@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <new>
 #include <string_view>
 
@@ -212,9 +213,12 @@ class KeyTable {
 #endif
             void* block = std::calloc(1, bytes + alignof(Bucket));
             if(!block) throw std::bad_alloc();
-            auto addr = reinterpret_cast<uintptr_t>(block);
-            addr = (addr + alignof(Bucket) - 1) & ~uintptr_t{alignof(Bucket) - 1};
-            return {reinterpret_cast<Bucket*>(addr), block, buckets - 1, 0, 0};
+            // std::align, not integer arithmetic on the address: a pointer
+            // made from an integer loses track of the block it points into
+            void* aligned = block;
+            size_t space = bytes + alignof(Bucket);
+            std::align(alignof(Bucket), bytes, aligned, space);
+            return {static_cast<Bucket*>(aligned), block, buckets - 1, 0, 0};
         }
 
         static void freeBlock(Table& t) {

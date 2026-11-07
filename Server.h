@@ -90,7 +90,7 @@ private:
     static constexpr int kMaxAcceptsPerEvent = 1000;
 
     // Bytes read per recv() (Redis reads 16 KB as well)
-    static constexpr size_t kReadChunk = 16 * 1024;
+    static constexpr size_t kReadChunk = size_t{16} * 1024;
 
     // Stop running a client's commands once this many bytes of its replies are
     // waiting to be sent, and stop reading from it until they have gone. Memory
@@ -100,7 +100,7 @@ private:
 
     // The parsed arguments keep their memory between commands, up to this much
     // per argument and this many arguments; more is given back after use
-    static constexpr size_t kKeepArgBytes = 64 * 1024;
+    static constexpr size_t kKeepArgBytes = size_t{64} * 1024;
     static constexpr size_t kKeepArgs = 1024;
 
     int port_;

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <csignal>
 #ifndef _WIN32
 #include <signal.h>
@@ -329,7 +330,7 @@ void Server::sampleOpsPerSec() {
     const OpSample& oldest = op_samples_[op_samples_taken_ < kOpSamples ? 0 : op_sample_next_];
     double seconds = duration<double>(now - oldest.time).count();
     stats_.ops_per_sec = seconds > 0
-        ? static_cast<uint64_t>(static_cast<double>(stats_.commands_processed - oldest.commands) / seconds + 0.5)
+        ? static_cast<uint64_t>(std::llround(static_cast<double>(stats_.commands_processed - oldest.commands) / seconds))
         : 0;
 }
 

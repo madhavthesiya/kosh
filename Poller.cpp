@@ -44,7 +44,7 @@ int SelectPoller::wait(int timeout_ms, std::vector<Event>& ready) {
 
     struct timeval timeout;
     timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>(timeout_ms % 1000) * 1000;
 
     // The first argument is the highest socket number + 1 (Windows ignores it).
     int n = select(static_cast<int>(max_fd + 1), &readfds, &writefds, nullptr, &timeout);

@@ -74,7 +74,7 @@ uint64_t sipHash(uint64_t k0, uint64_t k1, const void* data, size_t len) {
         case 3: b |= uint64_t(p[2]) << 16; [[fallthrough]];
         case 2: b |= uint64_t(p[1]) << 8;  [[fallthrough]];
         case 1: b |= uint64_t(p[0]);       break;
-        case 0: break;
+        default: break;   // len & 7 == 0: no bytes left
     }
     s.v3 ^= b;
     for(int i = 0; i < C; i++) s.round();

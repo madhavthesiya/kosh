@@ -76,6 +76,7 @@ InMemoryStorage::~InMemoryStorage() {
 InMemoryStorage::CacheEntry* InMemoryStorage::newEntry(std::string_view key){
     if(key.size() > UINT32_MAX) throw std::length_error("key too long");
     void* block = ::operator new(sizeof(CacheEntry) + key.size());
+    // cppcheck-suppress legacyUninitvar ; misreads placement new, which initializes entry
     auto* entry = new (block) CacheEntry{};
     entry->key_len = static_cast<uint32_t>(key.size());
     // The key's bytes go into the raw storage after the entry, not into it

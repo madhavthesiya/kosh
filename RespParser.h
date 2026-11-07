@@ -57,8 +57,8 @@ public:
 
     // Limits, matching Redis's defaults, so one client can't make the server
     // wait for or buffer an unbounded amount of data.
-    static constexpr size_t kMaxBulkLength = 512 * 1024 * 1024;  // proto-max-bulk-len
-    static constexpr size_t kMaxInlineLength = 64 * 1024;        // PROTO_INLINE_MAX_SIZE
+    static constexpr size_t kMaxBulkLength = size_t{512} * 1024 * 1024;  // proto-max-bulk-len
+    static constexpr size_t kMaxInlineLength = size_t{64} * 1024;        // PROTO_INLINE_MAX_SIZE
     // "*" or "$", a 64-bit number and "\r\n" need at most 23 bytes, so a longer
     // header line without "\r\n" is an error, not something to wait for.
     static constexpr size_t kMaxHeaderLength = 32;
@@ -70,7 +70,7 @@ public:
     // the same two limits (added in 6.2.6, the release that fixed
     // CVE-2021-32675, a denial of service from many-element requests).
     static constexpr size_t kMaxUnauthenticatedArgs = 10;
-    static constexpr size_t kMaxUnauthenticatedBulk = 16 * 1024;
+    static constexpr size_t kMaxUnauthenticatedBulk = size_t{16} * 1024;
 
     // What parseInto() found; the arguments themselves are in the caller's vector
     struct Parsed {
