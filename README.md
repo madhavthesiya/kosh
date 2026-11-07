@@ -95,7 +95,7 @@ flowchart TD
 
 | Type | Commands | Internal Structure |
 |------|----------|-------------------|
-| **String** | `SET`, `GET`, `SETEX` | `std::string` |
+| **String** | `SET`, `GET`, `SETEX`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY` | `std::string` |
 | **List** | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN` | `std::deque<string>` |
 | **Set** | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` | `std::unordered_set<string>` |
 | **Hash** | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN` | `std::unordered_map<string,string>` |
@@ -177,6 +177,7 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 | Binary safety | RESP format — spaces, newlines, any byte in values |
 | Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
 | Removals | Every key the server removes on its own, by eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The eviction order isn't rebuilt from the log: reads aren't logged. |
+| One record per command | `MSET` and a `DEL` of several keys are each one record, so a crash mid-write leaves all of the command or none of it, as Redis's AOF does. `MSET` makes room for its keys after its record, so the evictions' `DEL`s come after it in the file, in the order replay reads them. `INCR`, `DECR` and `DECRBY` are logged as `INCRBY` with the delta: the operation, as Redis logs it, which leaves the TTL's own record as it was. |
 | Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
 | Damaged file | An incomplete last record, or a transaction without its `EXEC`, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
 | Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis; a failed `everysec` sync does the same. With `always`, a failed write or sync can no longer be made good, so the server sends none of the waiting replies and stops with exit code 1, as Redis does. |
@@ -250,6 +251,8 @@ graph LR
 | `GET` | `unique_lock` | Records the hit (SIEVE's bit, or LRU's relink), and lazy expiration may remove the key |
 | `EXISTS` | `unique_lock` | Lazy expiration may remove the key |
 | `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data; an insert or erase also moves one bucket chain of a rehash in progress |
+| `MGET`, `MSET`, `DEL`/`EXISTS` with several keys | one `unique_lock` for the whole command | No thread sees an `MSET` or a `DEL` half done |
+| `INCR` and the other counters | `unique_lock` | Read, add and write in one step: two threads' increments can't lose one |
 | `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read: a lookup in the key table never moves anything |
 | `SAVE` (CLI only) | `shared_lock` | Snapshot is read-only |
 
@@ -488,6 +491,10 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 | Transactions (`MULTI`, `EXEC`, `DISCARD`) | 17 of 18; the other uses `WATCH`, not supported |
 | Transactions with a password | 2 of 2 |
 | `PING` and error messages | 12 of 12 |
+| Integer arguments (`010`, `-0`, `+5` are refused, as Redis refuses them) | 10 of 10 |
+| `INCR`, `DECR`, `INCRBY`, `DECRBY`: the edges of 64 bits, values that aren't integers | 28 of 28 |
+| `DEL` and `EXISTS` with several keys | 9 of 9 |
+| `MGET`, `MSET` | 14 of 14 |
 | `INFO`'s counters after the same commands | 4 of 4 |
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
@@ -508,7 +515,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 - Keys are limited by `--maxkeys`, not `maxmemory`. The AOF is the only persistence: there are no RDB snapshots.
 - `BGREWRITEAOF` is refused inside `MULTI`.
 
-**Not supported yet:** `WATCH`, `SCAN`, `INCR`/`DECR`, `MGET`/`MSET`, `DEL` and `EXISTS` with several keys, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
+**Not supported yet:** `WATCH`, `SCAN`, `PEXPIRE`/`PTTL`/`PERSIST`, `DBSIZE`, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
 
 ---
 
@@ -521,12 +528,16 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `SET` | `SET key value EX seconds` | Set with a TTL. Also `PX milliseconds`, `EXAT unix-seconds` and `PXAT unix-milliseconds`. The number must be a positive integer, with Redis's error replies. `NX`, `XX`, `GET` and `KEEPTTL` are not supported and return a syntax error. |
 | `SETEX` | `SETEX key seconds value` | Set with TTL (alternative) |
 | `GET` | `GET key` | Get value |
+| `MGET` | `MGET key1 key2 ...` | Each value, or nil where there is none, or a key holds another type (no `WRONGTYPE`, as in Redis) |
+| `MSET` | `MSET key1 value1 key2 value2 ...` | Sets them all at once: one lock, one AOF record. Like `SET`, drops a key's old type and TTL |
+| `INCR` / `DECR` | `INCR key` | Adds 1 (or -1) to the integer in the key; a missing key counts from 0. A TTL stays |
+| `INCRBY` / `DECRBY` | `INCRBY key n` | Adds `n` (or `-n`). An integer means its canonical form, as in Redis: `"05"` isn't one, so `INCR` never rewrites a string like a zip code. A sum outside 64 bits is an error that changes nothing |
 
 ### Key Commands
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `DEL` | `DEL key` | Delete key |
-| `EXISTS` | `EXISTS key` | Check existence |
+| `DEL` | `DEL key1 key2 ...` | Deletes the keys; replies how many there were |
+| `EXISTS` | `EXISTS key1 key2 ...` | How many of the keys exist; a key given twice counts twice, as in Redis |
 | `TYPE` | `TYPE key` | Get data type |
 | `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less makes the key expire at once |
 | `PEXPIREAT` | `PEXPIREAT key unix-milliseconds` | Set the expiry as an absolute time (the form the AOF records) |
@@ -593,6 +604,8 @@ They behave as Redis's, replies included (redis-py's `pipeline()` uses them by d
 | Operation | Time | Space |
 |-----------|:----:|:-----:|
 | SET / GET / DEL | O(1) average, plus O(log T) when a TTL is set or removed | O(1) |
+| MGET / MSET / DEL / EXISTS with K keys | O(K) average | O(K) for MGET's reply |
+| INCR / DECR / INCRBY / DECRBY | O(1) average | O(1) |
 | Making room for a new key | O(log T) per expired key removed, then O(1) amortized to evict (SIEVE's hand clears one bit per step; LRU takes the oldest) | O(1) |
 | LPUSH / RPUSH | O(1) per element | O(1) per element |
 | LPOP / RPOP | O(1) | O(1) |
@@ -609,7 +622,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**127 unit tests** (`tests/test_main.cpp`):
+**135 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -627,28 +640,29 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Hash Operations]       5 tests    ✅
 [Type Safety]           4 tests    ✅
 [LRU with Mixed Types]  1 test     ✅
-[AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check, damaged files, failed writes, group commit, fsync policies)
-[Command Table]        12 tests    ✅  (arity, SET options, strict integers, error replies, PING's message, replies appended in place)
+[AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check under both eviction policies, damaged files, failed writes, group commit, fsync policies)
+[Command Table]        13 tests    ✅  (arity, SET options, integers read as Redis reads them, error replies, PING's message, replies appended in place)
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
 [Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
+[Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
 [INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 127 passed, 0 failed
+Results: 135 passed, 0 failed
 ```
 
-The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
+The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
 
 **Thread-safety stress tests** (`tests/test_thread_safety.cpp`):
 - 5 tests, each running 8 threads at once against one storage instance (20,000 operations in total).
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 56 tests that start the real server binary on a free port and speak RESP over TCP.
+- 57 tests that start the real server binary on a free port and speak RESP over TCP.
 - They cover:
-  - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart;
+  - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart, `MSET`, several-key `DEL` and the counters included;
   - the log reaching its file while the server runs, as under systemd or Docker;
   - who can connect: loopback only by default, `--bind`, and protected mode, tested by connecting from this machine's own network address as a client on another machine would;
   - passwords: `NOAUTH` until `AUTH`, `AUTH` in a pipeline, the limits before `AUTH`, `--requirepass-file`, and the password never reaching the log, the AOF or an error message;
@@ -672,7 +686,7 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 **Fuzzing** (`tests/fuzz/`):
 - A fuzz target in libFuzzer's interface sends arbitrary bytes through the parser and the command table, as the server does, with and without a password set.
 - Besides crashes and sanitizer reports, it checks that the same bytes in two reads parse into exactly the same commands as in one read. Where a read happens to end must not change a command.
-- GCC has no libFuzzer, so a small driver replays the 25 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
+- GCC has no libFuzzer, so a small driver replays the 27 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
 - The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
 - Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which is planned for CI.
 
@@ -698,6 +712,7 @@ kosh/
 ├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
+├── Integer.h                 # Integers as Redis reads them (arguments, and INCR's values)
 ├── Version.h                 # Kosh's version (HELLO, INFO)
 ├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
@@ -709,7 +724,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 127 unit tests
+    ├── test_main.cpp              # 135 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary
