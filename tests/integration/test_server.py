@@ -85,9 +85,20 @@ class ServerProcess:
                 raise RuntimeError(f"server exited during startup ({describe_exit(self.proc.returncode)}):\n{self.output()}")
             try:
                 socket.create_connection((self.host, self.port), timeout=0.2).close()
-                return
             except OSError:
                 time.sleep(0.05)
+                continue
+            # The server counts the probe as a client until it reads its close.
+            # A test that counts clients (--maxclients, INFO) starts only after
+            # that: otherwise the probe and the test's own connections can wait
+            # in the backlog together, be accepted in one pass, and the probe
+            # takes a slot (seen: 22 of 200 runs refused a client too early).
+            while time.monotonic() < deadline:
+                log = self.output()
+                if "Client disconnected" in log or "Client refused" in log:
+                    return
+                time.sleep(0.01)
+            break
         self.stop()
         raise RuntimeError(f"server did not listen on port {self.port} within {timeout} s")
 
