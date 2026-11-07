@@ -2,7 +2,7 @@
 
 *Kosh (कोश) is Sanskrit and Hindi for a treasury: a store of valuables. Formerly Mini-Redis.*
 
-[![CI](https://github.com/madhavthesiya/mini-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/madhavthesiya/mini-redis/actions/workflows/ci.yml)
+[![CI](https://github.com/madhavthesiya/kosh/actions/workflows/ci.yml/badge.svg)](https://github.com/madhavthesiya/kosh/actions/workflows/ci.yml)
 
 A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP2 and RESP3** (works with `redis-cli` and `redis-benchmark`, and with client libraries that open with `HELLO 3`, as redis-py 8 and node-redis 6 do), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
@@ -13,7 +13,7 @@ This is a learning project, not production software. What it does not handle yet
 On Linux, with Git, CMake 3.16+ and a C++17 compiler:
 
 ```bash
-git clone https://github.com/madhavthesiya/mini-redis.git && cd mini-redis
+git clone https://github.com/madhavthesiya/kosh.git && cd kosh
 cmake -B build && cmake --build build -j --target kosh-server
 ./build/kosh-server                       # then, in another terminal: redis-cli ping
 ```
@@ -21,7 +21,7 @@ cmake -B build && cmake --build build -j --target kosh-server
 Or with Docker, no compiler needed:
 
 ```bash
-docker build -t kosh https://github.com/madhavthesiya/mini-redis.git
+docker build -t kosh https://github.com/madhavthesiya/kosh.git
 docker run -d --name kosh -p 127.0.0.1:6379:6379 kosh --protected-mode no
 redis-cli ping                            # PONG
 ```

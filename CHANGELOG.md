@@ -16,6 +16,8 @@ The first release under the name Kosh, and the first meant for others to run.
 
 - The project is renamed from Mini-Redis to Kosh. The binaries are now
   `kosh-server` (was `mini_redis_server`) and `kosh-cli` (was `mini_redis`).
+  The repository moved to `github.com/madhavthesiya/kosh`; GitHub redirects
+  the old address.
 - The server listens on 127.0.0.1 by default (it listened on every interface).
   `--bind 0.0.0.0` listens everywhere; with no password, protected mode then
   refuses clients on other machines, as Redis's does.
@@ -69,4 +71,4 @@ The first release under the name Kosh, and the first meant for others to run.
   writes, absolute expiry times in the AOF.
 - **`v0-baseline`** (2026-10-31): the project before any of this work.
 
-[3.0.0]: https://github.com/madhavthesiya/mini-redis/compare/v2.5-memory...HEAD
+[3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...HEAD
