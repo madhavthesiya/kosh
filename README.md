@@ -2,6 +2,8 @@
 
 *Kosh (कोश) is Sanskrit and Hindi for a treasury: a store of valuables. Formerly Mini-Redis.*
 
+[![CI](https://github.com/madhavthesiya/mini-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/madhavthesiya/mini-redis/actions/workflows/ci.yml)
+
 A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP2 and RESP3** (works with `redis-cli` and `redis-benchmark`, and with client libraries that open with `HELLO 3`, as redis-py 8 and node-redis 6 do), a **single-threaded epoll event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence with group commit and a configurable fsync policy**, **4 data types**, a **hash table of its own with cache-line buckets and incremental rehashing**, **SIEVE eviction** (NSDI 2024; exact LRU on request), **lazy TTL expiration**, a **reader–writer-locked storage engine**, and **no heap allocation per request** once warmed up.
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
@@ -681,7 +683,7 @@ The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 57 tests that start the real server binary on a free port and speak RESP over TCP.
+- 58 tests that start the real server binary on a free port and speak RESP over TCP. Each test starts once the server has dropped the connection that checked it was listening, so tests that count clients see only their own.
 - They cover:
   - basic commands, command-line flags (including which policy `--eviction` picks, and the default), and AOF replay after a restart, `MSET`, several-key `DEL` and the counters included;
   - the log reaching its file while the server runs, as under systemd or Docker;
@@ -709,9 +711,26 @@ The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_
 - Besides crashes and sanitizer reports, it checks that the same bytes in two reads parse into exactly the same commands as in one read. Where a read happens to end must not change a command.
 - GCC has no libFuzzer, so a small driver replays the 27 seed inputs (a `ctest`) or mutates them at random. With clang, `-DKOSH_LIBFUZZER=ON` builds the coverage-guided version.
 - The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
-- Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which is planned for CI.
+- Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which CI runs on every push (below).
 
 All seven `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer, the client libraries' and the comparison with Redis included. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
+
+### Continuous integration
+
+Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on GitHub Actions:
+
+| Job | What it runs |
+|-----|--------------|
+| Linux, GCC and Clang | Build with warnings as errors; every `ctest` suite, under `epoll` and `select()`, with redis-py, node-redis and Redis 7.0.15 installed (a missing one fails instead of skipping) |
+| Sanitizers | Every suite under ASan + UBSan; unit, thread-safety and integration tests under TSan |
+| Windows | Cross-compiled with MinGW-w64 (warnings as errors, linked statically), then `port_test.ps1` on a Windows runner with that `.exe` |
+| Static analysis | clang-tidy (bugprone and performance checks; [`.clang-tidy`](.clang-tidy) says why two are off) and cppcheck; any finding fails |
+| Fuzz | 2 minutes of coverage-guided libFuzzer under ASan + UBSan, with a [RESP dictionary](tests/fuzz/resp.dict) ([measured](bench/results/fuzz-dictionary/README.md): 0.1–1.8% more code edges at 50,000 inputs, every seed; small because, most likely, the seed inputs already contain all 43 command names); then the coverage of the corpus, uploaded as an HTML report |
+| Docker | Builds the image; checks `--version`, protected mode refusing by default, `PING` with `--protected-mode no`, the non-root user, and a clean `docker stop` |
+
+Each job was first run in a local copy of GitHub's Ubuntu 24.04 runner, and each check was shown to fail when its fix is undone. That first run found two bugs: a test race (a test could start before the server had dropped the connection that checked it was up; 22 of 200 runs failed) and a CI step that failed at random (`ctest -N | grep -q` under `pipefail`: `grep` exits at the first match and `ctest` gets `SIGPIPE`).
+
+Not in CI: clang's static analyzer, which ran past 10 minutes on `InMemoryStorage.cpp` and on `Commands.cpp` without finishing (it found nothing in the other sources).
 
 ---
 
@@ -738,6 +757,9 @@ kosh/
 ├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
 ├── CHANGELOG.md              # What changed in each release
 ├── Dockerfile                # Multi-stage build; runs as a non-root user (.dockerignore: a whitelist)
+├── .github/workflows/ci.yml  # CI: compilers, sanitizers, Windows, static analysis, fuzzing, Docker
+├── .clang-tidy               # clang-tidy's checks for CI, and why two are off
+├── cmake/mingw-w64.cmake     # Toolchain file: cross-compile for Windows with MinGW-w64
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
