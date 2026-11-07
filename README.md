@@ -6,6 +6,26 @@ A Redis-compatible server built from scratch in **C++17**: a **TCP server speaki
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
+## Quick start
+
+On Linux, with Git, CMake 3.16+ and a C++17 compiler:
+
+```bash
+git clone https://github.com/madhavthesiya/mini-redis.git && cd mini-redis
+cmake -B build && cmake --build build -j --target kosh-server
+./build/kosh-server                       # then, in another terminal: redis-cli ping
+```
+
+Or with Docker, no compiler needed:
+
+```bash
+docker build -t kosh https://github.com/madhavthesiya/mini-redis.git
+docker run -d --name kosh -p 127.0.0.1:6379:6379 kosh --protected-mode no
+redis-cli ping                            # PONG
+```
+
+[Run with Docker](#run-with-docker) explains `--protected-mode no` and how to keep the data. Changes from version to version are in [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## Performance
@@ -714,8 +734,10 @@ kosh/
 ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
 ├── Result.h                  # Result type with error codes
 ├── Integer.h                 # Integers as Redis reads them (arguments, and INCR's values)
-├── Version.h                 # Kosh's version (HELLO, INFO)
+├── Version.h                 # Kosh's version (--version, HELLO, INFO)
 ├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
+├── CHANGELOG.md              # What changed in each release
+├── Dockerfile                # Multi-stage build; runs as a non-root user (.dockerignore: a whitelist)
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
 ├── bench/                    # Measurement tools: throughput, commit comparison, replay, profile,
@@ -761,6 +783,7 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 ./build/kosh-server                       # 127.0.0.1:6379, 10,000 keys, AOF in ./appendonly.aof
 ./build/kosh-server --port 6380 --maxkeys 1000000 --appendonly no
 ./build/kosh-server --help
+./build/kosh-server --version             # kosh-server 3.0.0
 
 # Connect with redis-cli (in another terminal)
 redis-cli -p 6379
@@ -790,6 +813,25 @@ Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections, write
 **Passwords.** With `--requirepass-file` (or `--requirepass`), a client gets `-NOAUTH` for everything but `AUTH` and `QUIT` until it sends `AUTH <password>` (or `AUTH default <password>`). The replies are Redis's, byte for byte, which matters to client libraries that match on them. Two details guard against a client that doesn't have the password:
 - Until it authenticates, a client's commands may have at most 10 arguments of 16 KB each, Redis's limits since 6.2.6. Without them, a client without the password could still make the server buffer up to 1 GB for it on each connection.
 - The password check takes the same time however much of a guess is right, so response times can't reveal the password byte by byte. [Measured](bench/results/password-check/README.md): at most 1.03× between guesses, where a loop that stops at the first wrong byte takes 79× longer for a right 512-byte guess than for one wrong at the first byte.
+
+### Run with Docker
+
+```bash
+docker build -t kosh .                    # 37.5 MB: the server, glibc and libstdc++; no shell
+docker run -d --name kosh -v kosh-data:/data -p 127.0.0.1:6379:6379 kosh --protected-mode no
+docker stop kosh                          # SIGTERM: the AOF is written and synced, exit code 0
+```
+
+The image runs as an unprivileged user (uid 65532) and keeps the AOF in the `/data` volume, so the data outlives the container. Options after the image name are passed to the server, as in the table above.
+
+**Why `--protected-mode no`.** Inside a container the server must listen on every interface (the image passes `--bind 0.0.0.0`), and your connections arrive through Docker's network, not from "this machine". So with no password, protected mode refuses them, as it should. Redis's official image turns protected mode off for you; Kosh's doesn't, because a `-p 6379:6379` without an address publishes the port on every interface of the host, which is how many Redis servers ended up open to the internet. Either publish on `127.0.0.1` as above and turn protected mode off yourself, or set a password:
+
+```bash
+docker run -d --name kosh -v kosh-data:/data -p 6379:6379 \
+  -v "$PWD/password:/run/secrets/kosh-password:ro" kosh --requirepass-file /run/secrets/kosh-password
+```
+
+The password file must be readable by uid 65532.
 
 ### Benchmark
 
