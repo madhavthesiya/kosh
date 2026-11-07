@@ -112,11 +112,16 @@ void InMemoryStorage::logAOF(std::initializer_list<std::string_view> parts) {
 
 void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
                              const std::vector<std::string>& tail) {
+    logAOF(head, tail.data(), tail.data() + tail.size());
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::string* first, const std::string* last) {
     if(!aof_ || loading_) return;
     aof_->logWith([&](std::string& out) {
-        RespParser::appendLength(out, '*', head.size() + tail.size());
+        RespParser::appendLength(out, '*', head.size() + static_cast<size_t>(last - first));
         for(std::string_view part : head) RespParser::appendBulk(out, part);
-        for(const auto& part : tail) RespParser::appendBulk(out, part);
+        for(const std::string* part = first; part != last; ++part) RespParser::appendBulk(out, *part);
     });
 }
 
@@ -195,31 +200,49 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
 
 // ==================== Key Operations ====================
 
+// One key is a range of one (a single object counts as an array of one)
 Result InMemoryStorage::exists(const std::string& key){
-    std::unique_lock lock(mutex_);
-    CacheEntry* e = data_.find(key);
-    const bool live = e && !isExpired(*e);
-    countRead(live);
-    if(!live) {
-        if(e) expireEntry(e);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    }
-    return Result::ok();
+    return countExisting(&key, &key + 1) ? Result::ok() : Result::fail(ErrorCode::KEY_NOT_FOUND);
 }
 
 Result InMemoryStorage::del(const std::string& key){
+    return deleteKeys(&key, &key + 1) ? Result::ok() : Result::fail(ErrorCode::KEY_NOT_FOUND);
+}
+
+// Each key is a keyspace hit or miss, as in Redis. Unique lock: an expired key is removed.
+size_t InMemoryStorage::countExisting(const std::string* first, const std::string* last){
     std::unique_lock lock(mutex_);
-    CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    // An expired key no longer exists: DEL returns 0, as in Redis. Its removal
-    // is still logged, as an expiration.
-    if(isExpired(*e)) {
-        expireEntry(e);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    size_t found = 0;
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        const bool live = e && !isExpired(*e);
+        countRead(live);
+        if(live) found++;
+        else if(e) expireEntry(e);
     }
-    eraseEntry(e);
-    logAOF({"DEL", key});
-    return Result::ok();
+    return found;
+}
+
+// The record is the command as given, as Redis logs it (probed on 7.0.15),
+// and only if a key was removed. The keys it didn't remove are absent at that
+// point in replay too, so for them the record does nothing.
+size_t InMemoryStorage::deleteKeys(const std::string* first, const std::string* last){
+    std::unique_lock lock(mutex_);
+    size_t removed = 0;
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        if(!e) continue;
+        // An expired key no longer exists: it doesn't count, as in Redis. Its
+        // removal is still logged, as an expiration.
+        if(isExpired(*e)) {
+            expireEntry(e);
+            continue;
+        }
+        eraseEntry(e);
+        removed++;
+    }
+    if(removed > 0) logAOF({"DEL"}, first, last);
+    return removed;
 }
 
 Result InMemoryStorage::type(const std::string& key){

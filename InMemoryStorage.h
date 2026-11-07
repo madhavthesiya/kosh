@@ -78,6 +78,13 @@ class InMemoryStorage final : public StorageInterface {
         // Key operations
         Result del(const std::string& key) override;
         Result exists(const std::string& key) override;
+
+        // DEL and EXISTS with several keys, [first, last): how many were
+        // removed, and how many exist (a key given twice counts twice, as in
+        // Redis). Each under one lock, so no one sees a DEL half done. DEL
+        // writes one AOF record, so after a crash it is all there or not at all.
+        size_t deleteKeys(const std::string* first, const std::string* last);
+        size_t countExisting(const std::string* first, const std::string* last);
         Result type(const std::string& key) override;
         Result expire(const std::string& key, int ttlSeconds) override;
         Result ttl(const std::string& key) override;
@@ -238,6 +245,8 @@ class InMemoryStorage final : public StorageInterface {
         void logAOF(std::initializer_list<std::string_view> parts);
         void logAOF(std::initializer_list<std::string_view> head,
                     const std::vector<std::string>& tail);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::string* first, const std::string* last);
         void logAOF(std::initializer_list<std::string_view> head,
                     const std::vector<std::pair<std::string, std::string>>& pairs);
 

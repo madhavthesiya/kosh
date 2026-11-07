@@ -198,6 +198,18 @@ COUNTER_CASES = {
     "RESP3": H3 + fresh("c") + arr("INCR", "c") + arr("INCRBY", "c", "x"),
 }
 
+DEL_EXISTS_CASES = {
+    "DEL several": fresh("a", "b", "c") + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("DEL", "a", "b", "c") + arr("EXISTS", "a", "b", "c"),
+    "DEL a key twice": fresh("a") + arr("SET", "a", 1) + arr("DEL", "a", "a"),
+    "EXISTS a key twice": fresh("a", "b") + arr("SET", "a", 1) + arr("EXISTS", "a", "a", "b"),
+    "DEL every type": CLEAR + arr("SET", "k", "v") + arr("RPUSH", "l", "a") + arr("SADD", "s", "m") + arr("HSET", "h", "f", "v") + arr("DEL", "k", "l", "s", "h", "x") + arr("EXISTS", "k", "l", "s", "h"),
+    "EXISTS every type": CLEAR + arr("SET", "k", "v") + arr("RPUSH", "l", "a") + arr("SADD", "s", "m") + arr("HSET", "h", "f", "v") + arr("EXISTS", "k", "l", "s", "h", "x") + CLEAR,
+    "DEL, EXISTS, no keys": arr("DEL") + arr("EXISTS"),
+    "DEL, EXISTS, nothing there": fresh("a", "b") + arr("DEL", "a", "b") + arr("EXISTS", "a", "b"),
+    "lower case": fresh("a") + arr("set", "a", 1) + arr("exists", "a", "a") + arr("del", "a", "a"),
+    "inside MULTI": fresh("a", "b") + M + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("DEL", "a", "b", "c") + arr("EXISTS", "a", "b") + E,
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -209,6 +221,7 @@ GROUPS = {
     "PING and error messages": (MESSAGE_CASES, None),
     "Integer arguments": (INTEGER_CASES, None),
     "INCR, DECR, INCRBY, DECRBY": (COUNTER_CASES, None),
+    "DEL and EXISTS with several keys": (DEL_EXISTS_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why
@@ -280,7 +293,8 @@ COUNTED = [("SET", "a", "1"), ("GET", "a"), ("GET", "b"), ("EXISTS", "a"), ("EXI
            ("LRANGE", "l", 0, -1), ("LRANGE", "m", 0, -1), ("HSET", "h", "f", "v"), ("HGET", "h", "f"),
            ("HGET", "h", "g"), ("HGET", "z", "f"), ("HGETALL", "h"), ("SMEMBERS", "s"), ("SADD", "s", "m"),
            ("SISMEMBER", "s", "m"), ("SCARD", "s"), ("LLEN", "l"), ("HLEN", "h"), ("GET", "l"),
-           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("INCR", "n"), ("SET", "e", "v", "PX", 50)]
+           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("EXISTS", "a", "b", "a"), ("INCR", "n"),
+           ("DEL", "x", "y", "z"), ("SET", "e", "v", "PX", 50)]
 COUNTED_AFTER_EXPIRY = [("GET", "e"), ("DEL", "a"), ("LPOP", "l")]
 COUNTERS = ("total_commands_processed", "keyspace_hits", "keyspace_misses", "expired_keys")
 

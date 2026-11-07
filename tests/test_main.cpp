@@ -1779,7 +1779,8 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
         for(int i = 0; i < ops; i++) {
             std::string key = "k" + std::to_string(pick(8));
             std::string value(1, static_cast<char>('a' + pick(4)));
-            switch(pick(19)) {
+            std::string other = "k" + std::to_string(pick(8));
+            switch(pick(21)) {
                 case 0:  executeCommand(ctx, {"SET", key, value}); break;
                 case 1:  executeCommand(ctx, {"SET", key, value, "PX", std::to_string(1 + pick(20))}); break;
                 case 2:  executeCommand(ctx, {"SET", key, value, "EX", "1000"}); break;
@@ -1800,6 +1801,8 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                 case 16: executeCommand(ctx, {"SET", key, std::to_string(pick(5))}); break;   // for INCR
                 case 17: executeCommand(ctx, {"INCR", key}); break;
                 case 18: executeCommand(ctx, {pick(2) ? "INCRBY" : "DECRBY", key, std::to_string(pick(7) - 3)}); break;
+                case 19: executeCommand(ctx, {"DEL", key, other, "k" + std::to_string(pick(8))}); break;
+                case 20: executeCommand(ctx, {"EXISTS", key, other}); break;
             }
             trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -2545,6 +2548,68 @@ TEST(test_aof_incr_is_logged_as_incrby) {
     std::remove(aof_file.c_str());
 }
 
+TEST(test_del_exists_several_keys) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    s.set("a", "1");
+    s.rpush("l", {"x"});
+    s.sadd("s", {"m"});
+    s.hset("h", {{"f", "v"}});
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "a", "l", "s", "h", "missing"}), ":4\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "a", "a", "missing", "a"}), ":3\r\n");    // twice counts twice
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "a", "a", "missing"}), ":1\r\n");           // but is removed once
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "l", "s", "h"}), ":3\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{0});
+    ASSERT_EQ(executeCommand(ctx, {"DEL"}), "-ERR wrong number of arguments for 'del' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS"}), "-ERR wrong number of arguments for 'exists' command\r\n");
+
+    // An expired key doesn't exist: it isn't counted, and is removed
+    s.set("live", "1");
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "live", "gone"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "gone", "live"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{0});
+
+    // Each key EXISTS looks at is a keyspace hit or miss, as in Redis; DEL counts neither
+    auto before = s.stats();
+    s.set("a", "1");
+    executeCommand(ctx, {"EXISTS", "a", "b", "a"});
+    executeCommand(ctx, {"DEL", "a", "b"});
+    ASSERT_EQ(s.stats().keyspace_hits - before.keyspace_hits, uint64_t{2});
+    ASSERT_EQ(s.stats().keyspace_misses - before.keyspace_misses, uint64_t{1});
+}
+
+TEST(test_aof_del_several_keys_is_one_record) {
+    // One record, the command as given (as Redis logs it), so a crash can't
+    // leave half a DEL; none when nothing was removed
+    const std::string aof_file = "test_aof_del_keys.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "a", "1"}, {"SET", "b", "2"}, {"SET", "c", "3"},
+                {"DEL", "a", "missing", "b"}, {"DEL", "x", "y"}, {"DEL", "c"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{5});
+    ASSERT_EQ(records[3], (Record{"DEL", "a", "missing", "b"}));
+    ASSERT_EQ(records[4], (Record{"DEL", "c"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.stats().keys, size_t{0});
+    std::remove(aof_file.c_str());
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3167,6 +3232,8 @@ int main() {
     std::cout << "\n[Counters and Several Keys]\n";
     RUN_TEST(test_incr_decr);
     RUN_TEST(test_aof_incr_is_logged_as_incrby);
+    RUN_TEST(test_del_exists_several_keys);
+    RUN_TEST(test_aof_del_several_keys_is_one_record);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

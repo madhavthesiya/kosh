@@ -437,12 +437,14 @@ void cmdDecrby(CommandContext& ctx, const Args& args, std::string& out) {
 
 // ---- Keys ----
 
+// DEL key [key ...]: how many were removed
 void cmdDel(CommandContext& ctx, const Args& args, std::string& out) {
-    RespParser::appendInteger(out, ctx.storage.del(args[1]).success ? 1 : 0);
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.deleteKeys(args.begin() + 1, args.end())));
 }
 
+// EXISTS key [key ...]: how many exist, a key given twice counted twice
 void cmdExists(CommandContext& ctx, const Args& args, std::string& out) {
-    RespParser::appendInteger(out, ctx.storage.exists(args[1]).success ? 1 : 0);
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.countExisting(args.begin() + 1, args.end())));
 }
 
 void cmdType(CommandContext& ctx, const Args& args, std::string& out) {
@@ -665,8 +667,8 @@ const Command kCommands[] = {
     {"incrby",           3,  kCmdWrite, cmdIncrby},
     {"decrby",           3,  kCmdWrite, cmdDecrby},
 
-    {"del",              2,  kCmdWrite, cmdDel},
-    {"exists",           2,  0,         cmdExists},
+    {"del",             -2,  kCmdWrite, cmdDel},
+    {"exists",          -2,  0,         cmdExists},
     {"type",             2,  0,         cmdType},
     {"expire",           3,  kCmdWrite, cmdExpire},
     {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
