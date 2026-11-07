@@ -26,7 +26,7 @@ jobs:
           - compiler: Clang
             cxx: clang++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Ubuntu 24.04's redis-server is 7.0.15, the version the compatibility
       # test compares against. The client versions are the ones tested locally.
       - name: Install Redis and the client libraries
@@ -61,7 +61,7 @@ jobs:
     name: Sanitizers (ASan + UBSan, TSan)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: ASan + UBSan, every suite
         run: |
           cmake -B asan -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=address,undefined
@@ -84,7 +84,7 @@ jobs:
     name: Windows build (MinGW-w64)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MinGW-w64
         run: |
           sudo apt-get update
@@ -95,7 +95,7 @@ jobs:
           cmake -B build-mingw -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
                 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_EXE_LINKER_FLAGS=-static
           cmake --build build-mingw -j
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kosh-server-windows
           path: build-mingw/kosh-server.exe
@@ -105,8 +105,8 @@ jobs:
     needs: windows-build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: kosh-server-windows
       - name: Port tests
@@ -117,7 +117,7 @@ jobs:
     name: Static analysis (clang-tidy, cppcheck)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install
         run: |
           sudo apt-get update
@@ -136,7 +136,7 @@ jobs:
     name: Fuzz (libFuzzer, ASan + UBSan) and corpus coverage
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # libFuzzer and the sanitizer runtimes are in libclang-rt, which a plain
       # clang install can leave out; clang 18 named, so the tools match
       - name: Install clang 18 with its runtimes
@@ -154,7 +154,7 @@ jobs:
                              -artifact_prefix=crashes/ -print_final_stats=1 found tests/fuzz/corpus
       - name: Upload failing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes
           path: crashes/
@@ -173,7 +173,7 @@ jobs:
           "$llvm/llvm-cov" show cov/fuzz_commands -instr-profile=cov.profdata -format=html \
                            -output-dir=coverage-html "${sources[@]}"
           cp coverage.txt coverage-html/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fuzz-coverage
           path: coverage-html/
@@ -182,7 +182,7 @@ jobs:
     name: Docker image
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: docker build -t kosh .
       - name: Smoke test
