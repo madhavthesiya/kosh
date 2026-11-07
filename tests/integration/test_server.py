@@ -566,6 +566,27 @@ def pipeline(client, commands):
     return [client.read_reply() for _ in commands]
 
 
+class SeveralKeysAndCountersTest(ServerTestCase):
+    """MSET, DEL with several keys and the counters, through a real server and
+    a restart: each command is one AOF record, and replay gives the same data"""
+
+    def test_they_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            first = self.start_server(workdir=workdir)
+            with Client(first.port) as c:
+                self.assertEqual(c.call("MSET", "a", "1", "b", "2", "n", "10"), b"OK")
+                self.assertEqual(c.call("INCR", "n"), 11)
+                self.assertEqual(c.call("DECRBY", "n", "3"), 8)
+                self.assertEqual(c.call("DEL", "a", "missing"), 1)
+                self.assertEqual(c.call("EXISTS", "a", "b", "n"), 2)
+            first.stop()
+            second = self.start_server(workdir=workdir)
+            with Client(second.port) as c:
+                self.assertEqual(c.call("MGET", "a", "b", "n"), [None, b"2", b"8"])
+                self.assertEqual(c.call("INCR", "n"), 9)
+            second.stop()
+
+
 class AofGroupCommitTest(ServerTestCase):
     """The server writes the AOF records of every command in one pass of its
     event loop with one write(), before sending any of their replies. These

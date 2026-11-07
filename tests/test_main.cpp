@@ -1759,7 +1759,7 @@ int64_t wallMinusMonotonicMs() {
 // step. So a mismatch is a failure only if the wall clock held steady; if it
 // was stepped, this returns false and the caller runs the seed again. Measured
 // after every command, so a step anywhere in the run is seen.
-bool checkReplayMatchesLive(unsigned seed, int ops) {
+bool checkReplayMatchesLive(unsigned seed, int ops, EvictionPolicy policy) {
     const std::string aof_file = "test_aof_random.aof";
     std::remove(aof_file.c_str());
     std::mt19937 rng(seed);
@@ -1774,13 +1774,13 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
     };
     {
         AOFLogger aof(aof_file);
-        InMemoryStorage s(5, &aof);
+        InMemoryStorage s(5, &aof, policy);
         CommandContext ctx{s, &aof};
         for(int i = 0; i < ops; i++) {
             std::string key = "k" + std::to_string(pick(8));
             std::string value(1, static_cast<char>('a' + pick(4)));
             std::string other = "k" + std::to_string(pick(8));
-            switch(pick(21)) {
+            switch(pick(23)) {
                 case 0:  executeCommand(ctx, {"SET", key, value}); break;
                 case 1:  executeCommand(ctx, {"SET", key, value, "PX", std::to_string(1 + pick(20))}); break;
                 case 2:  executeCommand(ctx, {"SET", key, value, "EX", "1000"}); break;
@@ -1803,6 +1803,9 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                 case 18: executeCommand(ctx, {pick(2) ? "INCRBY" : "DECRBY", key, std::to_string(pick(7) - 3)}); break;
                 case 19: executeCommand(ctx, {"DEL", key, other, "k" + std::to_string(pick(8))}); break;
                 case 20: executeCommand(ctx, {"EXISTS", key, other}); break;
+                case 21: executeCommand(ctx, {"MSET", key, value, other, std::to_string(i),     // up to 3 new keys
+                                              "k" + std::to_string(pick(8)), value}); break;
+                case 22: executeCommand(ctx, {"MGET", key, other}); break;
             }
             trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -1814,7 +1817,7 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
     }
     {
         AOFLogger aof(aof_file);
-        InMemoryStorage s(5, &aof);
+        InMemoryStorage s(5, &aof, policy);
         auto loaded = replayAOF(s, aof);
         if(!loaded.ok || loaded.truncated_bytes > 0) {
             throw std::runtime_error("seed " + std::to_string(seed) + ": the AOF didn't load cleanly: " + loaded.error);
@@ -1838,7 +1841,8 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                     std::llabs(l->second.expiry - r->second.expiry) <= 50;   // clock reads differ by a ms or so
         if(same) continue;
         if(clock_stepped) return false;     // not a valid run: the caller runs it again
-        throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
+        throw std::runtime_error("seed " + std::to_string(seed) +
+                                 (policy == EvictionPolicy::SIEVE ? " (sieve)" : " (lru)") + ", key " + key + ": live " +
                                  describe(live, key) + ", replayed " + describe(replayed, key));
     }
     return true;
@@ -1848,13 +1852,16 @@ TEST(test_aof_replay_matches_live_randomized) {
     // RANDOM_TEST_SEEDS=<n> runs more seeds than the default 4 (each ~0.2 s)
     unsigned seeds = 4;
     if(const char* n = std::getenv("RANDOM_TEST_SEEDS")) seeds = static_cast<unsigned>(std::atoi(n));
+    // Both policies: which key an eviction picks decides where its DEL lands
+    // in the AOF, and LRU alone hid an ordering bug SIEVE showed (MSET)
+    for(EvictionPolicy policy : {EvictionPolicy::LRU, EvictionPolicy::SIEVE})
     for(unsigned seed = 1; seed <= seeds; seed++) {
         // A run that mismatched while the wall clock was stepped proves nothing
         // either way; the same seed (the same commands) runs again. WSL2 steps
         // the clock every 30 s and a run takes well under a second, so a rerun
         // nearly always has a steady clock.
         int attempts = 1;
-        while(!checkReplayMatchesLive(seed, 2500)) {
+        while(!checkReplayMatchesLive(seed, 2500, policy)) {
             if(++attempts > 5) {
                 throw std::runtime_error("seed " + std::to_string(seed) +
                                          ": the wall clock was stepped during 5 runs in a row");
@@ -2610,6 +2617,106 @@ TEST(test_aof_del_several_keys_is_one_record) {
     std::remove(aof_file.c_str());
 }
 
+TEST(test_mget_mset) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    s.rpush("l", {"x"});
+    executeCommand(ctx, {"SET", "t", "old", "EX", "100"});
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "a", "1", "b", "", "a", "2", "t", "new"}), "+OK\r\n");
+    ASSERT_EQ(s.get("a").value, "2");            // the last value given wins
+    ASSERT_EQ(s.ttl("t").value, "-1");           // as SET: the TTL goes
+    // A list, or nothing: nil, not WRONGTYPE
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "a", "b", "missing", "l", "a"}),
+              "*5\r\n$1\r\n2\r\n$0\r\n\r\n$-1\r\n$-1\r\n$1\r\n2\r\n");
+    ctx.protocol = 3;
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "missing", "a"}), "*2\r\n_\r\n$1\r\n2\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "l", "v"}), "+OK\r\n");            // over a list
+    ASSERT_EQ(s.type("l").value, "string");
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "a", "1", "b"}), "-ERR wrong number of arguments for 'mset' command\r\n");
+    ASSERT_EQ(s.get("a").value, "2");
+    ASSERT_EQ(executeCommand(ctx, {"MGET"}), "-ERR wrong number of arguments for 'mget' command\r\n");
+
+    // Each key MGET reads is a hit or a miss (a hash too, as in Redis); MSET counts neither
+    s.hset("h", {{"f", "v"}});
+    auto before = s.stats();
+    executeCommand(ctx, {"MGET", "a", "nothing", "h"});
+    executeCommand(ctx, {"MSET", "z", "1"});
+    ASSERT_EQ(s.stats().keyspace_hits - before.keyspace_hits, uint64_t{2});
+    ASSERT_EQ(s.stats().keyspace_misses - before.keyspace_misses, uint64_t{1});
+
+    // An expired key is nil, and removed there and then, as GET removes it
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto keys = s.stats().keys;
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "gone"}), "*1\r\n_\r\n");
+    ASSERT_EQ(s.stats().keys, keys - 1);
+}
+
+TEST(test_aof_mset_is_one_record) {
+    const std::string aof_file = "test_aof_mset.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        executeCommand(ctx, {"SET", "a", "0", "EX", "100"});
+        executeCommand(ctx, {"MSET", "a", "1", "b", "2", "a", "3"});
+        executeCommand(ctx, {"MGET", "a", "b"});            // a read: not logged
+        executeCommand(ctx, {"MSET", "a", "1", "b"});        // refused: not logged
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    ASSERT_EQ(records.size(), size_t{2});
+    ASSERT_EQ(records[1], (std::vector<std::string>{"MSET", "a", "1", "b", "2", "a", "3"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.get("a").value, "3");
+    ASSERT_EQ(s.ttl("a").value, "-1");
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_mset_evicts_after_its_record) {
+    // Capacity 2, SIEVE: x was read, so the hand passes it and evicts a, a key
+    // the MSET has just written. Making room before each key logged "DEL a"
+    // before the MSET record: replay then read the DEL first (nothing to
+    // delete), stored a and b, and evicted x once loaded. A restart held
+    // {a, b}; the server had {x, b}. The DELs must follow the record.
+    const std::string aof_file = "test_aof_mset_evict.aof";
+    using Record = std::vector<std::string>;
+    for(EvictionPolicy policy : {EvictionPolicy::SIEVE, EvictionPolicy::LRU}) {
+        std::remove(aof_file.c_str());
+        {
+            AOFLogger aof(aof_file);
+            InMemoryStorage s(2, &aof, policy);
+            CommandContext ctx{s, &aof};
+            s.set("x", "1");
+            s.get("x");
+            executeCommand(ctx, {"MSET", "a", "1", "b", "2"});
+            ASSERT_EQ(s.stats().keys, size_t{2});
+            ASSERT_TRUE(s.exists("b").success);
+            ASSERT_EQ(s.exists("x").success, policy == EvictionPolicy::SIEVE);   // LRU evicts x, the oldest
+        }
+        std::vector<std::string> live = policy == EvictionPolicy::SIEVE ? Record{"x", "b"} : Record{"a", "b"};
+        AOFLogger aof(aof_file);
+        auto records = aofRecords(aof.readRaw());
+        ASSERT_EQ(records.size(), size_t{3});
+        ASSERT_EQ(records[1][0], "MSET");
+        ASSERT_EQ(records[2][0], "DEL");
+        InMemoryStorage s(2, &aof, policy);
+        ASSERT_TRUE(replayAOF(s, aof).ok);
+        ASSERT_EQ(s.stats().keys, size_t{2});
+        for(const auto& key : live) ASSERT_TRUE(s.exists(key).success);
+    }
+    // More new keys than fit: the table goes to the capacity, not past it
+    std::remove(aof_file.c_str());
+    InMemoryStorage s(2);
+    CommandContext ctx{s};
+    executeCommand(ctx, {"MSET", "a", "1", "b", "2", "c", "3"});
+    ASSERT_EQ(s.stats().keys, size_t{2});
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3234,6 +3341,9 @@ int main() {
     RUN_TEST(test_aof_incr_is_logged_as_incrby);
     RUN_TEST(test_del_exists_several_keys);
     RUN_TEST(test_aof_del_several_keys_is_one_record);
+    RUN_TEST(test_mget_mset);
+    RUN_TEST(test_aof_mset_is_one_record);
+    RUN_TEST(test_mset_evicts_after_its_record);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

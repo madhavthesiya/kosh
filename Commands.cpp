@@ -405,6 +405,25 @@ void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
     r.success ? ok(out) : RespParser::appendError(out, "ERR setex failed");
 }
 
+// MGET key [key ...]: each value, or nil where there is no string (a list,
+// say: unlike GET, MGET doesn't fail with WRONGTYPE)
+void cmdMget(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendLength(out, '*', args.size() - 1);
+    ctx.storage.readStrings(args.begin() + 1, args.end(), [&](const std::string* value) {
+        if(value) RespParser::appendBulk(out, *value);
+        else RespParser::appendNull(out, ctx.protocol);
+    });
+}
+
+// MSET key value [key value ...]
+void cmdMset(CommandContext& ctx, const Args& args, std::string& out) {
+    if(args.size() % 2 == 0) {      // a key without a value
+        return RespParser::appendError(out, "ERR wrong number of arguments for 'mset' command");
+    }
+    ctx.storage.mset(args.begin() + 1, args.end());
+    ok(out);
+}
+
 // INCR, DECR, INCRBY, DECRBY. In Redis's order (t_string.c): the increment
 // first, then the key's type, whether its value is an integer, and whether the
 // sum fits in 64 bits. Each error changes nothing.
@@ -662,7 +681,9 @@ const Command kCommands[] = {
     {"set",             -3,  kCmdWrite, cmdSet},
     {"get",              2,  0,         cmdGet},
     {"setex",            4,  kCmdWrite, cmdSetex},
-    {"incr",             2,  kCmdWrite, cmdIncr},
+    {"mget",            -2,  0,         cmdMget},
+    {"mset",            -3,  kCmdWrite, cmdMset},
+    {"incr",            2,  kCmdWrite, cmdIncr},
     {"decr",             2,  kCmdWrite, cmdDecr},
     {"incrby",           3,  kCmdWrite, cmdIncrby},
     {"decrby",           3,  kCmdWrite, cmdDecrby},

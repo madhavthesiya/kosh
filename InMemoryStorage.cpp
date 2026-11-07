@@ -352,9 +352,27 @@ Result InMemoryStorage::incrBy(const std::string& key, int64_t delta){
     return Result::ok(sum);
 }
 
+// Room is made after the keys are stored, not before each one as SET does.
+// An eviction is logged as a DEL when it happens, so one in the middle would
+// come before the MSET record, and its victim could be a key this MSET had
+// just written: replay would read the DEL first, then the MSET, and bring the
+// key back (with SIEVE, the default, it can; test_mset_evicts_after_its_record).
+// So: every key, then the record, then evictions down to the capacity, their
+// DELs after the record, in the order replay reads them. Redis also evicts
+// outside the command, before the next one. An MSET of more new keys than
+// fit leaves the ones the policy keeps.
+void InMemoryStorage::mset(const std::string* first, const std::string* last){
+    std::unique_lock lock(mutex_);
+    for(const std::string* pair = first; pair != last; pair += 2) {
+        setInternal(pair[0], pair[1], std::nullopt, /*make_room=*/false);
+    }
+    logAOF({"MSET"}, first, last);
+    evictDownTo(capacity_);
+}
+
 // SET always overwrites regardless of existing type (same as real Redis)
 Result InMemoryStorage::setInternal(const std::string& key, const std::string& value,
-                                    std::optional<ExpiryTime> expiry){
+                                    std::optional<ExpiryTime> expiry, bool make_room){
     if(CacheEntry* e = data_.find(key)) {
         if(isExpired(*e)) {
             expireEntry(e);
@@ -366,7 +384,7 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
             return Result::ok();
         }
     }
-    makeRoomForNewKey();
+    if(make_room) makeRoomForNewKey();
     setExpiry(insertEntry(key, ValueType(value)), expiry);
     return Result::ok();
 }
@@ -838,18 +856,23 @@ InMemoryStorage::Stats InMemoryStorage::stats() const {
     return s;
 }
 
-// Called before adding a key. Not while loading: replay repeats the live
-// server's evictions from their DEL records instead of choosing its own.
+// Called before adding a key (capacity is at least 1)
 void InMemoryStorage::makeRoomForNewKey(){
-    if(loading_ || data_.size() < capacity_) return;    // no clock read on the common path
+    evictDownTo(capacity_ - 1);
+}
+
+// Not while loading: replay repeats the live server's evictions from their
+// DEL records instead of choosing its own.
+void InMemoryStorage::evictDownTo(size_t limit){
+    if(loading_ || data_.size() <= limit) return;       // no clock read on the common path
     // Expired keys go before any live key, wherever they are in the queue.
     // Only as many as are needed: each insert does a bounded amount of work.
     ExpiryTime now = steadyNowMs();
-    while(data_.size() >= capacity_ && !expiry_index_.empty() &&
+    while(data_.size() > limit && !expiry_index_.empty() &&
           expiry_index_.begin()->first <= now) {
         expireEntry(const_cast<CacheEntry*>(expiry_index_.begin()->second));
     }
-    while(data_.size() >= capacity_) evictOne();
+    while(data_.size() > limit) evictOne();
 }
 
 void InMemoryStorage::setLoading(bool loading){

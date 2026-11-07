@@ -51,7 +51,7 @@ class RedisPyTest(ServerTestCase):
         for protocol in (2, 3):
             with self.subTest(protocol=protocol):
                 r = self.connect(server, protocol)
-                r.delete("k", "t", "l", "s", "h", "c")     # one DEL with several keys
+                r.delete("k", "t", "l", "s", "h", "c", "m1", "m2")     # one DEL with several keys
                 self.assertTrue(r.ping())
                 # Strings and keys
                 self.assertTrue(r.set("k", "v"))
@@ -67,6 +67,8 @@ class RedisPyTest(ServerTestCase):
                 self.assertTrue(r.set("k2", "v"))
                 self.assertEqual(r.exists("t", "k2", "missing"), 2)
                 self.assertEqual(r.delete("t", "k2", "missing"), 2)
+                self.assertTrue(r.mset({"m1": "1", "m2": "2"}))
+                self.assertEqual(r.mget("m1", "missing", "m2"), [b"1", None, b"2"])
                 # Counters: redis-py's incr() and decr() send INCRBY and DECRBY
                 self.assertEqual(r.incr("c"), 1)
                 self.assertEqual(r.incr("c", 5), 6)

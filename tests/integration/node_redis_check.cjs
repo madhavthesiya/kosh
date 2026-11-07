@@ -25,7 +25,7 @@ async function main() {
     }
     await client.connect();
     // Start from no keys: test_clients.py runs this twice (RESP2, RESP3) on one server
-    await client.del(["k", "t", "l", "s", "h", "m", "c"]);
+    await client.del(["k", "t", "l", "s", "h", "m", "c", "m1", "m2"]);
     assert.equal(await client.ping(), "PONG");
 
     // Strings and keys
@@ -42,6 +42,8 @@ async function main() {
     assert.equal(await client.set("k2", "v"), "OK");
     assert.equal(await client.exists(["t", "k2", "missing"]), 2);
     assert.equal(await client.del(["t", "k2", "missing"]), 2);
+    assert.equal(await client.mSet({ m1: "1", m2: "2" }), "OK");
+    assert.deepEqual(await client.mGet(["m1", "missing", "m2"]), ["1", null, "2"]);
 
     // Counters
     assert.equal(await client.incr("c"), 1);

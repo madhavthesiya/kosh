@@ -75,6 +75,20 @@ class InMemoryStorage final : public StorageInterface {
         template<typename Use>
         Result readString(const std::string& key, Use&& use);
 
+        // MGET: calls use(value) for each key in [first, last), in order, with
+        // nullptr where there is no string (no key, or another type: MGET
+        // replies nil, never WRONGTYPE). One lock for all, so no one sees an
+        // MSET half done. Each key is a keyspace hit or miss, as in Redis.
+        // `use` must not call back into this object.
+        template<typename Use>
+        void readStrings(const std::string* first, const std::string* last, Use&& use);
+
+        // MSET: [first, last) holds keys and values, alternately (an even
+        // count). Sets each key as SET does, dropping its old type and TTL,
+        // under one lock and as one AOF record: no one sees some keys set and
+        // others not, before or after a crash.
+        void mset(const std::string* first, const std::string* last);
+
         // Key operations
         Result del(const std::string& key) override;
         Result exists(const std::string& key) override;
@@ -216,7 +230,8 @@ class InMemoryStorage final : public StorageInterface {
         void markUsed(CacheEntry& entry);               // a hit, for the eviction policy
         void evictOne();                                // removes and logs the policy's choice
         CacheEntry* sieveVictim();                      // SIEVE's choice; leaves the hand on it
-        void makeRoomForNewKey();                       // expired keys first, then evictOne()
+        void makeRoomForNewKey();                       // evictDownTo(capacity - 1)
+        void evictDownTo(size_t limit);                 // expired keys first, then evictOne()
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
@@ -227,9 +242,11 @@ class InMemoryStorage final : public StorageInterface {
         DataType getDataType(const CacheEntry& entry) const;
         std::string dataTypeToString(DataType dt) const;
 
-        // Internal set (called by every set variant); no expiry if `expiry` is empty
+        // Internal set (called by every set variant); no expiry if `expiry` is
+        // empty. `make_room` false: a new key may take the table past its
+        // capacity, and the caller evicts afterwards (MSET)
         Result setInternal(const std::string& key, const std::string& value,
-                           std::optional<ExpiryTime> expiry);
+                           std::optional<ExpiryTime> expiry, bool make_room = true);
 
         // Ensures key exists, is not expired, and holds the expected type
         // Returns nullptr if valid, or a Result with the appropriate error
@@ -304,4 +321,23 @@ Result InMemoryStorage::readString(const std::string& key, Use&& use) {
     markUsed(*e);
     use(std::get<std::string>(e->value));
     return Result::ok();
+}
+
+template<typename Use>
+void InMemoryStorage::readStrings(const std::string* first, const std::string* last, Use&& use) {
+    std::unique_lock lock(mutex_);      // as readString: expired keys are removed, hits recorded
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        const bool live = e && !isExpired(*e);
+        countRead(live);
+        if(!live) {
+            if(e) expireEntry(e);
+            use(nullptr);
+        } else if(getDataType(*e) != DataType::STRING) {
+            use(nullptr);
+        } else {
+            markUsed(*e);
+            use(&std::get<std::string>(e->value));
+        }
+    }
 }

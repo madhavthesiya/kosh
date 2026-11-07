@@ -210,6 +210,23 @@ DEL_EXISTS_CASES = {
     "inside MULTI": fresh("a", "b") + M + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("DEL", "a", "b", "c") + arr("EXISTS", "a", "b") + E,
 }
 
+MGET_MSET_CASES = {
+    "MGET": fresh("a", "b", "c") + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("MGET", "a", "b", "c"),
+    "MGET, a list among them": fresh("a", "l") + arr("RPUSH", "l", "x") + arr("SET", "a", 1) + arr("MGET", "a", "l", "a"),
+    "MGET, no keys": arr("MGET"),
+    "MSET, MGET": fresh("a", "b") + arr("MSET", "a", 1, "b", 2) + arr("MGET", "a", "b"),
+    "MSET, a key twice": fresh("a") + arr("MSET", "a", 1, "a", 2) + arr("GET", "a"),
+    "MSET, an odd count": fresh("a") + arr("MSET", "a", 1, "b") + arr("EXISTS", "a"),
+    "MSET, too few": arr("MSET") + arr("MSET", "a"),
+    "MSET over a list": fresh("l") + arr("RPUSH", "l", "x") + arr("MSET", "l", "v") + arr("TYPE", "l") + arr("GET", "l"),
+    "MSET clears a TTL": fresh("a") + arr("SET", "a", 1, "EX", 100) + arr("MSET", "a", 2) + arr("TTL", "a"),
+    "MSET, empty and binary values": fresh("a", "b") + arr("MSET", "a", "", "b", b"\x00\r\n\xff") + arr("MGET", "a", "b"),
+    "lower case": fresh("a") + arr("mset", "a", 1) + arr("mget", "a"),
+    "inside MULTI": fresh("a", "b") + M + arr("MSET", "a", 1, "b", 2) + arr("MGET", "a", "b", "c") + E,
+    "an odd MSET aborts MULTI": fresh("a") + M + arr("SET", "a", 1) + arr("MSET", "a") + E + arr("EXISTS", "a"),
+    "RESP3": H3 + fresh("a", "b") + arr("SET", "b", 2) + arr("MGET", "a", "b"),
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -222,6 +239,7 @@ GROUPS = {
     "Integer arguments": (INTEGER_CASES, None),
     "INCR, DECR, INCRBY, DECRBY": (COUNTER_CASES, None),
     "DEL and EXISTS with several keys": (DEL_EXISTS_CASES, None),
+    "MGET, MSET": (MGET_MSET_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why
@@ -293,8 +311,9 @@ COUNTED = [("SET", "a", "1"), ("GET", "a"), ("GET", "b"), ("EXISTS", "a"), ("EXI
            ("LRANGE", "l", 0, -1), ("LRANGE", "m", 0, -1), ("HSET", "h", "f", "v"), ("HGET", "h", "f"),
            ("HGET", "h", "g"), ("HGET", "z", "f"), ("HGETALL", "h"), ("SMEMBERS", "s"), ("SADD", "s", "m"),
            ("SISMEMBER", "s", "m"), ("SCARD", "s"), ("LLEN", "l"), ("HLEN", "h"), ("GET", "l"),
-           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("EXISTS", "a", "b", "a"), ("INCR", "n"),
-           ("DEL", "x", "y", "z"), ("SET", "e", "v", "PX", 50)]
+           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("MGET", "a", "b", "l"),
+           ("EXISTS", "a", "b", "a"), ("INCR", "n"), ("MSET", "x", 1, "y", 2), ("DEL", "x", "y", "z"),
+           ("SET", "e", "v", "PX", 50)]
 COUNTED_AFTER_EXPIRY = [("GET", "e"), ("DEL", "a"), ("LPOP", "l")]
 COUNTERS = ("total_commands_processed", "keyspace_hits", "keyspace_misses", "expired_keys")
 
