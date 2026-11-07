@@ -173,6 +173,11 @@ if(Python3_FOUND)
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
     endif()
+    # redis-py and node-redis against the server. Each is skipped, saying so,
+    # if it isn't installed; KOSH_REQUIRE_CLIENTS=1 makes that a failure (CI).
+    add_test(NAME client_library_tests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
+                     $<TARGET_FILE:kosh-server>)
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")
 endif()
