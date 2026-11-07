@@ -1,5 +1,6 @@
 #include "Server.h"
 #include "Commands.h"
+#include "Version.h"
 #include <iostream>
 #include <algorithm>
 #include <atomic>
@@ -194,7 +195,7 @@ bool Server::start() {
     poller_->add(listen_socket_);
     running_ = true;
     stats_.started = std::chrono::steady_clock::now();
-    std::cout << "Kosh server listening on " << bind_address_ << ":" << port_ << "\n";
+    std::cout << "Kosh " << kKoshVersion << " listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
     // Who can connect, and whether they need the password (never printed)
     const char* need = password_ ? ", with the password" : "";

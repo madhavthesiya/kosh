@@ -1033,6 +1033,19 @@ class CommandLineTest(ServerTestCase):
         with tempfile.TemporaryDirectory() as workdir:
             return subprocess.run([SERVER_BINARY, *args], cwd=workdir, capture_output=True, timeout=5)
 
+    def test_version_matches_what_the_running_server_reports(self):
+        # One version, from Version.h: --version, INFO and the start-up log must agree
+        for flag in ("--version", "-v"):
+            with self.subTest(flag=flag):
+                result = self.run_server(flag)
+                self.assertEqual(result.returncode, 0)
+                self.assertRegex(result.stdout.decode(), r"^kosh-server \d+\.\d+\.\d+\n$")
+        version = self.run_server("--version").stdout.decode().split()[1]
+        server = self.start_server("--appendonly", "no")
+        with Client(server.port) as c:
+            self.assertEqual(InfoTest.info(c, "server")["kosh_version"], version)
+        self.assertIn(f"Kosh {version} listening on", server.output())
+
     def test_help_exits_zero(self):
         result = self.run_server("--help")
         self.assertEqual(result.returncode, 0)

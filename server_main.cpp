@@ -9,6 +9,7 @@
 #include "AOFLogger.h"
 #include "Commands.h"
 #include "Server.h"
+#include "Version.h"
 
 // Settings that would otherwise mean editing and rebuilding, e.g. a larger
 // key limit for benchmarks or a separate port and AOF file for tests.
@@ -57,6 +58,7 @@ static void printUsage(std::ostream& out) {
            "  --maxclients <n>         Clients served at once; more are refused (default 10000)\n"
            "  --poller <epoll|select>  How to wait for sockets (default: epoll on Linux,\n"
            "                           select elsewhere; select serves about 1,000 clients)\n"
+           "  --version                Print the version and exit\n"
            "  --help                   Show this message\n";
 }
 
@@ -101,12 +103,13 @@ static std::string passwordProblem(const std::string& password) {
     return "";
 }
 
-enum class ParseResult { Run, Help, Error };
+enum class ParseResult { Run, Help, Version, Error };
 
 static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
     for(int i = 1; i < argc; i++) {
         std::string option = argv[i];
         if(option == "--help" || option == "-h") return ParseResult::Help;
+        if(option == "--version" || option == "-v") return ParseResult::Version;
 
         if(option != "--port" && option != "--bind" && option != "--protected-mode" &&
            option != "--requirepass" && option != "--requirepass-file" &&
@@ -196,6 +199,7 @@ int main(int argc, char* argv[]) {
     ServerConfig config;
     switch(parseArgs(argc, argv, config)) {
         case ParseResult::Help:  printUsage(std::cout); return 0;
+        case ParseResult::Version: std::cout << "kosh-server " << kKoshVersion << "\n"; return 0;
         case ParseResult::Error: return 2;
         case ParseResult::Run:   break;
     }
