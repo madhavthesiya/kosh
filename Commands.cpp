@@ -405,6 +405,36 @@ void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
     r.success ? ok(out) : RespParser::appendError(out, "ERR setex failed");
 }
 
+// INCR, DECR, INCRBY, DECRBY. In Redis's order (t_string.c): the increment
+// first, then the key's type, whether its value is an integer, and whether the
+// sum fits in 64 bits. Each error changes nothing.
+void incrementBy(CommandContext& ctx, const std::string& key, int64_t delta, std::string& out) {
+    auto r = ctx.storage.incrBy(key, delta);
+    switch(r.error) {
+        case ErrorCode::NONE:             return RespParser::appendInteger(out, std::stoll(r.value));
+        case ErrorCode::WRONG_TYPE:       return RespParser::appendError(out, kWrongType);
+        case ErrorCode::INTEGER_OVERFLOW: return RespParser::appendError(out, "ERR increment or decrement would overflow");
+        default:                          return RespParser::appendError(out, kNotAnInteger);
+    }
+}
+
+void cmdIncr(CommandContext& ctx, const Args& args, std::string& out) { incrementBy(ctx, args[1], 1, out); }
+void cmdDecr(CommandContext& ctx, const Args& args, std::string& out) { incrementBy(ctx, args[1], -1, out); }
+
+void cmdIncrby(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t delta;
+    if(!parseInt64(args[2], delta)) return RespParser::appendError(out, kNotAnInteger);
+    incrementBy(ctx, args[1], delta, out);
+}
+
+void cmdDecrby(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t delta;
+    if(!parseInt64(args[2], delta)) return RespParser::appendError(out, kNotAnInteger);
+    // Its negation doesn't fit in 64 bits
+    if(delta == INT64_MIN) return RespParser::appendError(out, "ERR decrement would overflow");
+    incrementBy(ctx, args[1], -delta, out);
+}
+
 // ---- Keys ----
 
 void cmdDel(CommandContext& ctx, const Args& args, std::string& out) {
@@ -630,6 +660,10 @@ const Command kCommands[] = {
     {"set",             -3,  kCmdWrite, cmdSet},
     {"get",              2,  0,         cmdGet},
     {"setex",            4,  kCmdWrite, cmdSetex},
+    {"incr",             2,  kCmdWrite, cmdIncr},
+    {"decr",             2,  kCmdWrite, cmdDecr},
+    {"incrby",           3,  kCmdWrite, cmdIncrby},
+    {"decrby",           3,  kCmdWrite, cmdDecrby},
 
     {"del",              2,  kCmdWrite, cmdDel},
     {"exists",           2,  0,         cmdExists},

@@ -167,6 +167,37 @@ INTEGER_CASES = {
     "HELLO 03": arr("HELLO", "03"),
 }
 
+COUNTER_CASES = {
+    "INCR a new key": fresh("c") + arr("INCR", "c") + arr("INCR", "c") + arr("GET", "c"),
+    "DECR a new key": fresh("c") + arr("DECR", "c") + arr("GET", "c"),
+    "INCRBY, DECRBY": fresh("c") + arr("INCRBY", "c", 10) + arr("DECRBY", "c", 3) + arr("INCRBY", "c", -20) + arr("DECRBY", "c", -1) + arr("GET", "c"),
+    "INCR then GET, TYPE": fresh("c") + arr("SET", "c", "41") + arr("INCR", "c") + arr("GET", "c") + arr("TYPE", "c"),
+    "INCR abc": fresh("c") + arr("SET", "c", "abc") + arr("INCR", "c") + arr("GET", "c"),
+    "INCR an empty string": fresh("c") + arr("SET", "c", "") + arr("INCR", "c"),
+    "INCR 05": fresh("c") + arr("SET", "c", "05") + arr("INCR", "c") + arr("GET", "c"),
+    "INCR -0": fresh("c") + arr("SET", "c", "-0") + arr("INCR", "c"),
+    "INCR +1": fresh("c") + arr("SET", "c", "+1") + arr("INCR", "c"),
+    "INCR ' 1' and '1 '": fresh("c", "d") + arr("SET", "c", " 1") + arr("INCR", "c") + arr("SET", "d", "1 ") + arr("INCR", "d"),
+    "INCR 1.5": fresh("c") + arr("SET", "c", "1.5") + arr("INCR", "c"),
+    "INCR, 21 digits": fresh("c") + arr("SET", "c", "1" + "0" * 20) + arr("INCR", "c"),
+    "INCR a list": fresh("l") + arr("RPUSH", "l", "a") + arr("INCR", "l") + arr("DECRBY", "l", 1),
+    "INCR at the maximum": fresh("c") + arr("SET", "c", "9223372036854775807") + arr("INCR", "c") + arr("GET", "c"),
+    "DECR at the minimum": fresh("c") + arr("SET", "c", "-9223372036854775808") + arr("DECR", "c") + arr("GET", "c"),
+    "INCRBY up to the maximum": fresh("c") + arr("SET", "c", "9223372036854775806") + arr("INCRBY", "c", 1) + arr("INCRBY", "c", 1),
+    "INCRBY down to the minimum": fresh("c") + arr("INCRBY", "c", "-9223372036854775808") + arr("GET", "c") + arr("DECR", "c"),
+    "INCRBY 2^63": fresh("c") + arr("INCRBY", "c", "9223372036854775808"),
+    "INCRBY abc, 1.5, 01, +1, empty": fresh("c") + arr("INCRBY", "c", "abc") + arr("INCRBY", "c", "1.5") + arr("INCRBY", "c", "01") + arr("INCRBY", "c", "+1") + arr("INCRBY", "c", ""),
+    "DECRBY the minimum": fresh("c") + arr("DECRBY", "c", "-9223372036854775808") + arr("EXISTS", "c"),
+    "DECRBY the minimum on a list": fresh("l") + arr("RPUSH", "l", "a") + arr("DECRBY", "l", "-9223372036854775808"),
+    "INCRBY abc on a list": fresh("l") + arr("RPUSH", "l", "a") + arr("INCRBY", "l", "abc"),
+    "INCR keeps the TTL": fresh("c") + arr("SET", "c", "1", "EX", 100) + arr("INCR", "c") + arr("TTL", "c"),
+    "INCRBY 0": fresh("c") + arr("INCRBY", "c", 0) + arr("GET", "c"),
+    "wrong arity": arr("INCR") + arr("INCR", "a", "b") + arr("DECR") + arr("INCRBY", "c") + arr("DECRBY", "c", 1, 2),
+    "lower case": fresh("c") + arr("incr", "c") + arr("incrby", "c", 5) + arr("decr", "c") + arr("decrby", "c", 2),
+    "inside MULTI": fresh("c") + M + arr("INCR", "c") + arr("INCRBY", "c", "x") + arr("INCRBY", "c", 2) + E,
+    "RESP3": H3 + fresh("c") + arr("INCR", "c") + arr("INCRBY", "c", "x"),
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -177,6 +208,7 @@ GROUPS = {
     "Transactions, password set": (TRANSACTION_PASSWORD_CASES, "secret"),
     "PING and error messages": (MESSAGE_CASES, None),
     "Integer arguments": (INTEGER_CASES, None),
+    "INCR, DECR, INCRBY, DECRBY": (COUNTER_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why
@@ -248,7 +280,7 @@ COUNTED = [("SET", "a", "1"), ("GET", "a"), ("GET", "b"), ("EXISTS", "a"), ("EXI
            ("LRANGE", "l", 0, -1), ("LRANGE", "m", 0, -1), ("HSET", "h", "f", "v"), ("HGET", "h", "f"),
            ("HGET", "h", "g"), ("HGET", "z", "f"), ("HGETALL", "h"), ("SMEMBERS", "s"), ("SADD", "s", "m"),
            ("SISMEMBER", "s", "m"), ("SCARD", "s"), ("LLEN", "l"), ("HLEN", "h"), ("GET", "l"),
-           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("SET", "e", "v", "PX", 50)]
+           ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("INCR", "n"), ("SET", "e", "v", "PX", 50)]
 COUNTED_AFTER_EXPIRY = [("GET", "e"), ("DEL", "a"), ("LPOP", "l")]
 COUNTERS = ("total_commands_processed", "keyspace_hits", "keyspace_misses", "expired_keys")
 

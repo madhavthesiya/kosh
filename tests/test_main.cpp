@@ -1779,7 +1779,7 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
         for(int i = 0; i < ops; i++) {
             std::string key = "k" + std::to_string(pick(8));
             std::string value(1, static_cast<char>('a' + pick(4)));
-            switch(pick(16)) {
+            switch(pick(19)) {
                 case 0:  executeCommand(ctx, {"SET", key, value}); break;
                 case 1:  executeCommand(ctx, {"SET", key, value, "PX", std::to_string(1 + pick(20))}); break;
                 case 2:  executeCommand(ctx, {"SET", key, value, "EX", "1000"}); break;
@@ -1797,6 +1797,9 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                 case 13: executeCommand(ctx, {"HSET", key, value, std::to_string(i)}); break;
                 case 14: executeCommand(ctx, {"HDEL", key, value}); break;
                 case 15: if(pick(25) == 0) executeCommand(ctx, {"BGREWRITEAOF"}); break;
+                case 16: executeCommand(ctx, {"SET", key, std::to_string(pick(5))}); break;   // for INCR
+                case 17: executeCommand(ctx, {"INCR", key}); break;
+                case 18: executeCommand(ctx, {pick(2) ? "INCRBY" : "DECRBY", key, std::to_string(pick(7) - 3)}); break;
             }
             trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -2182,7 +2185,8 @@ TEST(test_dispatch_write_flags) {
     // Replay runs only commands flagged as writes, so the flags decide what an AOF
     // can contain: every command that changes data needs one, no read may have one
     for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "PEXPIREAT", "LPUSH", "RPUSH",
-                            "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
+                            "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL",
+                            "INCR", "DECR", "INCRBY", "DECRBY"}) {
         ASSERT_TRUE(lookupCommand(name) && (lookupCommand(name)->flags & kCmdWrite));
         ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
     }
@@ -2446,6 +2450,98 @@ TEST(test_aof_replay_drops_an_incomplete_transaction) {
         ASSERT_FALSE(loaded.ok);
         ASSERT_TRUE(loaded.error.find("damaged") != std::string::npos);
     }
+    std::remove(aof_file.c_str());
+}
+
+// ==================== Counters and Several Keys (C5) ====================
+
+TEST(test_incr_decr) {
+    // Redis 7.0.15's replies (compare_with_redis.py checks them byte for byte)
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    const std::string overflow = "-ERR increment or decrement would overflow\r\n";
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "c"}), ":1\r\n");            // a missing key counts from 0
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "c", "41"}), ":42\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECR", "c"}), ":41\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "c", "-9"}), ":50\r\n");
+    ASSERT_EQ(s.get("c").value, "50");
+    ASSERT_EQ(s.type("c").value, "string");
+
+    // A value is a number only in its canonical form; anything else is left alone
+    for(const char* value : {"abc", "", "05", "-0", "+1", " 1", "1 ", "1.5", "100000000000000000000"}) {
+        s.set("v", value);
+        ASSERT_EQ(executeCommand(ctx, {"INCR", "v"}), not_int);
+        ASSERT_EQ(s.get("v").value, value);
+    }
+    // So is the increment, which is checked before the key
+    s.rpush("l", {"a"});
+    for(const char* bad : {"abc", "1.5", "01", "+1", "", "9223372036854775808"}) {
+        ASSERT_EQ(executeCommand(ctx, {"INCRBY", "c", bad}), not_int);
+        ASSERT_EQ(executeCommand(ctx, {"DECRBY", "l", bad}), not_int);
+    }
+    ASSERT_EQ(s.get("c").value, "50");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "l"}),
+              "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+
+    // The edges of int64_t: a sum that doesn't fit changes nothing
+    s.set("m", "9223372036854775806");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "m"}), ":9223372036854775807\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "m"}), overflow);
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "m", "-9223372036854775808"}), ":-1\r\n");
+    s.set("m", "-9223372036854775807");
+    ASSERT_EQ(executeCommand(ctx, {"DECR", "m"}), ":-9223372036854775808\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "m", "1"}), overflow);
+    ASSERT_EQ(s.get("m").value, "-9223372036854775808");
+    // DECRBY's own check: the negation of the smallest int64_t doesn't fit
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "n", "-9223372036854775808"}), "-ERR decrement would overflow\r\n");
+    ASSERT_FALSE(s.exists("n").success);
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "n", "-9223372036854775808"}), ":-9223372036854775808\r\n");
+
+    // The value changes in place: the TTL stays. An expired key counts from 0, without one.
+    executeCommand(ctx, {"SET", "t", "1", "EX", "100"});
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "t"}), ":2\r\n");
+    ASSERT_EQ(s.ttl("t").value, "100");
+    executeCommand(ctx, {"SET", "e", "7", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "e"}), ":1\r\n");
+    ASSERT_EQ(s.ttl("e").value, "-1");
+}
+
+TEST(test_aof_incr_is_logged_as_incrby) {
+    // All four are logged as INCRBY with the delta, and a failed one not at
+    // all; replay reaches the same values, and keeps the TTL
+    const std::string aof_file = "test_aof_incr.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"INCR", "c"}, {"DECR", "c"}, {"INCRBY", "c", "10"}, {"DECRBY", "c", "3"},
+                {"SET", "t", "5", "EX", "100"}, {"INCR", "t"},
+                {"SET", "w", "abc"}, {"INCR", "w"},                         // not an integer
+                {"INCRBY", "c", "9223372036854775807"},                    // overflow
+                {"DECRBY", "c", "-9223372036854775808"}, {"INCRBY", "c", "x"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    ASSERT_EQ(records.size(), size_t{7});
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records[0], (Record{"INCRBY", "c", "1"}));
+    ASSERT_EQ(records[1], (Record{"INCRBY", "c", "-1"}));
+    ASSERT_EQ(records[2], (Record{"INCRBY", "c", "10"}));
+    ASSERT_EQ(records[3], (Record{"INCRBY", "c", "-3"}));
+    ASSERT_EQ(records[5], (Record{"INCRBY", "t", "1"}));
+    ASSERT_EQ(records[6], (Record{"SET", "w", "abc"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.get("c").value, "7");
+    ASSERT_EQ(s.get("t").value, "6");
+    ASSERT_EQ(s.ttl("t").value, "100");
+    ASSERT_EQ(s.get("w").value, "abc");
     std::remove(aof_file.c_str());
 }
 
@@ -3067,6 +3163,10 @@ int main() {
     RUN_TEST(test_transactions_abort);
     RUN_TEST(test_transactions_in_the_aof);
     RUN_TEST(test_aof_replay_drops_an_incomplete_transaction);
+
+    std::cout << "\n[Counters and Several Keys]\n";
+    RUN_TEST(test_incr_decr);
+    RUN_TEST(test_aof_incr_is_logged_as_incrby);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

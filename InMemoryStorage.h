@@ -116,6 +116,14 @@ class InMemoryStorage final : public StorageInterface {
         // The wall clock now, as Unix time in milliseconds
         static int64_t unixTimeMs();
 
+        // INCRBY (and INCR, DECR, DECRBY): adds `delta` to the integer in the
+        // string at `key`, 0 if there is no key, and returns the sum as text.
+        // A read, an add and a write under one lock, so concurrent increments
+        // can't lose one another's. The value changes in place, so a TTL stays,
+        // as in Redis. Fails with WRONG_TYPE, NOT_AN_INTEGER (see Integer.h)
+        // or INTEGER_OVERFLOW, and then changes nothing.
+        Result incrBy(const std::string& key, int64_t delta);
+
         // AOF operations
         std::vector<std::string> dumpState() const;   // serialize current state as commands
 

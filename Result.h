@@ -8,6 +8,8 @@ enum class ErrorCode{
     INVALID_KEY,
     FILE_ERROR,
     WRONG_TYPE,
+    NOT_AN_INTEGER,     // INCR: the value isn't an integer (see Integer.h)
+    INTEGER_OVERFLOW,   // INCR: the result wouldn't fit in 64 bits (not OVERFLOW: a macro in Windows' math.h)
 };
 
 struct Result{

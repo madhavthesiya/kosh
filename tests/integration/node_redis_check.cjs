@@ -26,7 +26,7 @@ async function main() {
     await client.connect();
     // Start from no keys: test_clients.py runs this twice (RESP2, RESP3) on one server.
     // One key at a time: DEL takes one key (C5).
-    for (const key of ["k", "t", "l", "s", "h", "m"]) await client.del(key);
+    for (const key of ["k", "t", "l", "s", "h", "m", "c"]) await client.del(key);
     assert.equal(await client.ping(), "PONG");
 
     // Strings and keys
@@ -40,6 +40,13 @@ async function main() {
     assert.equal(await client.type("k"), "string");
     assert.equal(await client.expire("k", 50), 1);
     assert.equal(await client.del("k"), 1);
+
+    // Counters
+    assert.equal(await client.incr("c"), 1);
+    assert.equal(await client.incrBy("c", 5), 6);
+    assert.equal(await client.decr("c"), 5);
+    assert.equal(await client.decrBy("c", 2), 3);
+    assert.equal(await client.get("c"), "3");
 
     // Lists
     assert.equal(await client.rPush("l", ["a", "b"]), 2);

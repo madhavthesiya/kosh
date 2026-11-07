@@ -1,4 +1,5 @@
 #include "InMemoryStorage.h"
+#include "Integer.h"
 #include "RespParser.h"
 #include <cassert>
 #include <cstring>
@@ -293,6 +294,39 @@ Result InMemoryStorage::setExpiringAt(const std::string& key, const std::string&
     auto r = setInternal(key, value, toExpiryTime(unixTimeMs));
     if(r.success) logAOF({"SET", key, value, "PXAT", std::to_string(unixTimeMs)});
     return r;
+}
+
+// Logged as INCRBY with the delta, whichever of the four commands it was: the
+// operation, as Redis logs it, not the result. Integer arithmetic is exact,
+// so replay, from the same state, reaches the same value. Logging the result
+// (SET) would have to carry the TTL too, converted from the monotonic clock at
+// every increment; this record leaves the expiry's own record untouched.
+Result InMemoryStorage::incrBy(const std::string& key, int64_t delta){
+    std::unique_lock lock(mutex_);
+    CacheEntry* e = data_.find(key);
+    if(e && isExpired(*e)) {
+        expireEntry(e);
+        e = nullptr;
+    }
+    int64_t value = 0;
+    if(e) {
+        if(getDataType(*e) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
+        if(!parseInt64(std::get<std::string>(e->value), value)) return Result::fail(ErrorCode::NOT_AN_INTEGER);
+    }
+    // Checked before adding: signed overflow is undefined behaviour
+    if((delta > 0 && value > INT64_MAX - delta) || (delta < 0 && value < INT64_MIN - delta)) {
+        return Result::fail(ErrorCode::INTEGER_OVERFLOW);
+    }
+    std::string sum = std::to_string(value + delta);
+    if(e) {
+        std::get<std::string>(e->value) = sum;
+        markUsed(*e);
+    } else {
+        makeRoomForNewKey();
+        insertEntry(key, ValueType(sum));
+    }
+    logAOF({"INCRBY", key, std::to_string(delta)});
+    return Result::ok(sum);
 }
 
 // SET always overwrites regardless of existing type (same as real Redis)
