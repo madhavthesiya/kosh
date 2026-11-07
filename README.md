@@ -728,7 +728,7 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on GitHub
 | Fuzz | 2 minutes of coverage-guided libFuzzer under ASan + UBSan, with a [RESP dictionary](tests/fuzz/resp.dict) ([measured](bench/results/fuzz-dictionary/README.md): 0.1–1.8% more code edges at 50,000 inputs, every seed; small because, most likely, the seed inputs already contain all 43 command names); then the coverage of the corpus, uploaded as an HTML report |
 | Docker | Builds the image; checks `--version`, protected mode refusing by default, `PING` with `--protected-mode no`, the non-root user, and a clean `docker stop` |
 
-Each job was first run in a local copy of GitHub's Ubuntu 24.04 runner, and each check was shown to fail when its fix is undone. That first run found two bugs: a test race (a test could start before the server had dropped the connection that checked it was up; 22 of 200 runs failed) and a CI step that failed at random (`ctest -N | grep -q` under `pipefail`: `grep` exits at the first match and `ctest` gets `SIGPIPE`).
+Each job was first run in a local copy of GitHub's Ubuntu 24.04 runner. The checks new with CI (static analysis, the Docker smoke test) were each shown to fail when a fix is undone, as the test suites were when they were written. That first run found two bugs: a test race (a test could start before the server had dropped the connection that checked it was up; 22 of 200 runs failed) and a CI step that failed at random (`ctest -N | grep -q` under `pipefail`: `grep` exits at the first match and `ctest` gets `SIGPIPE`).
 
 Not in CI: clang's static analyzer, which ran past 10 minutes on `InMemoryStorage.cpp` and on `Commands.cpp` without finishing (it found nothing in the other sources).
 
