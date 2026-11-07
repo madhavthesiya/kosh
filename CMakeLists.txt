@@ -178,6 +178,14 @@ if(Python3_FOUND)
     add_test(NAME client_library_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
                      $<TARGET_FILE:kosh-server>)
+    # The same commands to real Redis and to Kosh, replies compared byte for
+    # byte; registered only where redis-server is installed
+    find_program(REDIS_SERVER redis-server)
+    if(REDIS_SERVER)
+        add_test(NAME redis_compatibility
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
+                         --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
+    endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")
 endif()

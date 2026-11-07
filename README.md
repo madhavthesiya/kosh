@@ -476,6 +476,42 @@ The last one is the lesson: a rehash frees thousands of small blocks at once. gl
 
 ---
 
+## Compatibility with Redis
+
+Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compare_with_redis.py) sends the same command sequences to Redis 7.0.15 and to Kosh, and compares the replies byte for byte. `ctest` runs it wherever `redis-server` is installed.
+
+| What | Identical to Redis 7.0.15 |
+|---|---:|
+| `AUTH`, without and with a password | 19 of 19, and 19 of 19 |
+| RESP3, `HELLO`, `CLIENT` | 39 of 39 |
+| `HELLO` with a password | 5 of 5 |
+| Transactions (`MULTI`, `EXEC`, `DISCARD`) | 17 of 18; the other uses `WATCH`, not supported |
+| Transactions with a password | 2 of 2 |
+| `PING` and error messages | 12 of 12 |
+| `INFO`'s counters after the same commands | 4 of 4 |
+
+`HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
+
+**Client libraries**, tested through their own APIs ([`tests/integration/test_clients.py`](tests/integration/test_clients.py)):
+
+| Client | Version | RESP2 | RESP3 | With a password |
+|---|---|:-:|:-:|:-:|
+| redis-py | 8.1.0 | ✅ | ✅ | ✅ |
+| node-redis | 6.3.1 | ✅ | ✅ | ✅ |
+| `redis-cli`, `redis-benchmark` | 7.0.15 | ✅ | — | — |
+
+Both libraries open every connection with `HELLO 3`, and gave up on Kosh before it had one; redis-py's `pipeline()` needs `MULTI`/`EXEC`.
+
+**Different from Redis on purpose:**
+- Kosh listens on 127.0.0.1 by default; Redis, without a config file, listens on every interface.
+- `INFO` has no `redis_version`.
+- Keys are limited by `--maxkeys`, not `maxmemory`. The AOF is the only persistence: there are no RDB snapshots.
+- `BGREWRITEAOF` is refused inside `MULTI`.
+
+**Not supported yet:** `WATCH`, `SCAN`, `INCR`/`DECR`, `MGET`/`MSET`, `DEL` and `EXISTS` with several keys, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
+
+---
+
 ## Full Command Reference
 
 ### String Commands
@@ -640,7 +676,7 @@ The randomized replay test runs 4 seeds by default; `RANDOM_TEST_SEEDS=300 ./bui
 - The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
 - Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which is planned for CI.
 
-All six `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer, the client libraries' included. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
+All seven `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer, the client libraries' and the comparison with Redis included. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
 
 ---
 
@@ -680,6 +716,8 @@ kosh/
     │   ├── test_clients.py        # redis-py and node-redis against it
     │   └── node_redis_check.cjs   # The node-redis half, run by test_clients.py
     ├── fuzz/                      # Fuzz target for the parser and commands, its driver, seed corpus
+    ├── compat/
+    │   └── compare_with_redis.py  # The same commands to Redis and Kosh, replies compared
     └── windows/
         └── port_test.ps1          # How the server takes its port, run on Windows
 ```
