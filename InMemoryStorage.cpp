@@ -197,9 +197,10 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
 Result InMemoryStorage::exists(const std::string& key){
     std::unique_lock lock(mutex_);
     CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(*e)) {
-        expireEntry(e);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) {
+        if(e) expireEntry(e);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     return Result::ok();
@@ -223,7 +224,9 @@ Result InMemoryStorage::del(const std::string& key){
 Result InMemoryStorage::type(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok("none");
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok("none");
     return Result::ok(dataTypeToString(getDataType(*e)));
 }
 
@@ -249,7 +252,9 @@ Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
 Result InMemoryStorage::ttl(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(!e->has_expiry) return Result::ok("-1");
     int64_t remaining_ms = addSaturating(e->expiry_time.time_since_epoch().count(),
                                          -steadyNowMs().time_since_epoch().count());
@@ -377,9 +382,11 @@ Result InMemoryStorage::rpop(const std::string& key){
 Result InMemoryStorage::lrange(const std::string& key, int start, int stop){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
-    
+
     const auto& list = boxed<ListValue>(e->value);
     int len = static_cast<int>(list.size());
     
@@ -399,7 +406,9 @@ Result InMemoryStorage::lrange(const std::string& key, int start, int stop){
 Result InMemoryStorage::llen(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<ListValue>(e->value).size()));
 }
@@ -442,7 +451,9 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
 Result InMemoryStorage::smembers(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& set = boxed<SetValue>(e->value);
     return Result::ok(std::vector<std::string>(set.begin(), set.end()));
@@ -451,7 +462,9 @@ Result InMemoryStorage::smembers(const std::string& key){
 Result InMemoryStorage::sismember(const std::string& key, const std::string& member){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& set = boxed<SetValue>(e->value);
     return Result::ok(set.count(member) > 0 ? 1 : 0);
@@ -460,7 +473,9 @@ Result InMemoryStorage::sismember(const std::string& key, const std::string& mem
 Result InMemoryStorage::scard(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<SetValue>(e->value).size()));
 }
@@ -484,7 +499,9 @@ Result InMemoryStorage::hset(const std::string& key, const std::vector<std::pair
 Result InMemoryStorage::hget(const std::string& key, const std::string& field){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    const bool live = e && !isExpired(*e);
+    countRead(live);        // the key's hit or miss, whether or not the field is there
+    if(!live) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& hash = boxed<HashValue>(e->value);
     auto fit = hash.find(field);
@@ -515,7 +532,9 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
 Result InMemoryStorage::hgetall(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& hash = boxed<HashValue>(e->value);
     // Return as alternating field, value pairs (same as real Redis)
@@ -530,7 +549,9 @@ Result InMemoryStorage::hgetall(const std::string& key){
 Result InMemoryStorage::hlen(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<HashValue>(e->value).size()));
 }
@@ -737,12 +758,27 @@ void InMemoryStorage::evictOne(){
     std::string key(victim->key());    // a copy: erasing frees the original
     eraseEntry(victim);
     logAOF({"DEL", key});
+    evicted_keys_++;
 }
 
 void InMemoryStorage::expireEntry(CacheEntry* entry){
     std::string key(entry->key());     // a copy, as above
     eraseEntry(entry);
     logAOF({"DEL", key});
+    expired_keys_++;
+}
+
+InMemoryStorage::Stats InMemoryStorage::stats() const {
+    std::shared_lock lock(mutex_);
+    Stats s;
+    s.keyspace_hits = keyspace_hits_.load(std::memory_order_relaxed);
+    s.keyspace_misses = keyspace_misses_.load(std::memory_order_relaxed);
+    s.expired_keys = expired_keys_;
+    s.evicted_keys = evicted_keys_;
+    s.keys = data_.size();
+    s.expires = expiry_index_.size();
+    s.max_keys = capacity_;
+    return s;
 }
 
 // Called before adding a key. Not while loading: replay repeats the live

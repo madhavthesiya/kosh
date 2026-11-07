@@ -846,6 +846,36 @@ class Resp3Test(ServerTestCase):
             self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", b"worker-2"))
 
 
+class InfoTest(ServerTestCase):
+    """INFO's server counters, which only a running server has."""
+
+    @staticmethod
+    def info(client, section="all"):
+        text = client.call("INFO", section).decode()
+        return dict(line.split(":", 1) for line in text.split("\r\n") if ":" in line and not line.startswith("#"))
+
+    def test_server_counters(self):
+        server = self.start_server("--appendonly", "no", "--maxclients", "2")
+        with Client(server.port) as a, Client(server.port) as b:
+            # A third client is refused, and counted
+            self.assertEqual(exchange_raw(server.port, b""), b"-ERR max number of clients reached\r\n")
+            info = self.info(a)
+            self.assertEqual(info["rejected_connections"], "1")
+            self.assertGreaterEqual(int(info["total_connections_received"]), 3)   # a, b, and the start-up probe
+            self.assertEqual((info["connected_clients"], info["maxclients"]), ("2", "2"))
+            self.assertEqual(info["tcp_port"], str(server.port))
+            self.assertEqual(info["aof_enabled"], "0")
+            # A burst of commands over about half a second shows in the rate
+            for _ in range(10):
+                a.sock.sendall(Client.encode(["PING"]) * 500)
+                for _ in range(500):
+                    a.read_reply()
+                time.sleep(0.05)
+            self.assertGreater(int(self.info(a, "stats")["instantaneous_ops_per_sec"]), 0)
+            b.call("GET", "missing")
+            self.assertEqual(self.info(b, "stats")["keyspace_misses"], "1")
+
+
 class TransactionTest(ServerTestCase):
     """MULTI/EXEC/DISCARD over real connections (redis-py's pipeline() uses them by default)."""
 

@@ -6,8 +6,14 @@
 #include <charconv>
 #include <climits>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <unordered_map>
+#ifdef _WIN32
+#include <process.h>    // _getpid
+#else
+#include <unistd.h>     // getpid, sysconf
+#endif
 
 namespace {
 
@@ -250,10 +256,112 @@ void cmdConfig(CommandContext& ctx, const Args& args, std::string& out) {
     RespParser::appendError(out, "ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
 }
 
-void cmdInfo(CommandContext& ctx, const Args&, std::string& out) {
-    RespParser::appendVerbatim(out, std::string("# Server\r\nkosh_version:") + kKoshVersion + "\r\n"
-                               "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n",
-                               ctx.protocol);
+// Resident memory in bytes (Linux, from /proc); 0 where it isn't known.
+// Not glibc's allocator count, which would miss the key table's mmap'ed arrays.
+size_t residentBytes() {
+#if defined(__linux__)
+    std::ifstream statm("/proc/self/statm");
+    size_t total_pages = 0, resident_pages = 0;
+    if(statm >> total_pages >> resident_pages) {
+        return resident_pages * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    }
+#endif
+    return 0;
+}
+
+uint64_t processId() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(_getpid());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+// INFO [section ...]: the server's state in Redis's format and with Redis's
+// field names, so what reads Redis's INFO (redis-py's info(), dashboards)
+// reads Kosh's: "# Section" lines, name:value lines, a blank line between
+// sections. Sections are chosen by name, in any case; none, "all", "default"
+// or "everything" means all of them, and an unknown one gives nothing, as in
+// Redis. Left out rather than made up:
+// - redis_version: Kosh isn't a complete Redis of any version, and tools
+//   decide what to send by it;
+// - used_memory (glibc's count would miss the key table), and avg_ttl, which
+//   Kosh doesn't track. Kosh's limit is maxkeys, not maxmemory.
+void cmdInfo(CommandContext& ctx, const Args& args, std::string& out) {
+    auto wanted = [&](const char* section) {
+        if(args.size() == 1) return true;
+        for(size_t i = 1; i < args.size(); i++) {
+            if(equalsIgnoreCase(args[i], section) || equalsIgnoreCase(args[i], "all") ||
+               equalsIgnoreCase(args[i], "default") || equalsIgnoreCase(args[i], "everything")) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const ServerStats no_server{};
+    const ServerStats& server = ctx.server ? *ctx.server : no_server;
+    const InMemoryStorage::Stats keys = ctx.storage.stats();
+    std::string text;
+    auto section = [&](const char* name) {
+        if(!text.empty()) text += "\r\n";
+        text += "# ";
+        text += name;
+        text += "\r\n";
+    };
+    auto field = [&](const char* name, std::string_view value) {
+        text += name;
+        text += ':';
+        text += value;
+        text += "\r\n";
+    };
+    auto number = [&](const char* name, uint64_t value) { field(name, std::to_string(value)); };
+
+    if(wanted("server")) {
+        section("Server");
+        field("kosh_version", kKoshVersion);
+        number("process_id", processId());
+        number("tcp_port", static_cast<uint64_t>(server.tcp_port));
+        uint64_t uptime = 0;
+        if(ctx.server) {
+            uptime = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - server.started).count());
+        }
+        number("uptime_in_seconds", uptime);
+        number("uptime_in_days", uptime / 86400);
+    }
+    if(wanted("clients")) {
+        section("Clients");
+        number("connected_clients", ctx.clients);
+        number("maxclients", server.max_clients);
+    }
+    if(wanted("memory")) {
+        section("Memory");
+        if(size_t rss = residentBytes()) number("used_memory_rss", rss);
+        number("maxkeys", keys.max_keys);
+    }
+    if(wanted("persistence")) {
+        section("Persistence");
+        number("aof_enabled", ctx.aof ? 1 : 0);
+        field("aof_last_write_status", ctx.aof && ctx.aof->failing() ? "err" : "ok");
+    }
+    if(wanted("stats")) {
+        section("Stats");
+        number("total_connections_received", server.connections_received);
+        number("total_commands_processed", server.commands_processed);
+        number("instantaneous_ops_per_sec", server.ops_per_sec);
+        number("rejected_connections", server.rejected_connections);
+        number("expired_keys", keys.expired_keys);
+        number("evicted_keys", keys.evicted_keys);
+        number("keyspace_hits", keys.keyspace_hits);
+        number("keyspace_misses", keys.keyspace_misses);
+    }
+    if(wanted("keyspace")) {
+        section("Keyspace");
+        if(keys.keys > 0) {
+            field("db0", "keys=" + std::to_string(keys.keys) + ",expires=" + std::to_string(keys.expires));
+        }
+    }
+    RespParser::appendVerbatim(out, text, ctx.protocol);
 }
 
 // ---- Strings ----
@@ -685,6 +793,10 @@ void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
         return RespParser::appendSimpleString(out, "QUEUED");
     }
     cmd->handler(ctx, args, out);
+    // As Redis counts total_commands_processed: once a command has run (so an
+    // INFO doesn't count itself), EXEC and each command it runs included;
+    // refused or queued ones not
+    if(ctx.server) ctx.server->commands_processed++;
 }
 
 void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out) {

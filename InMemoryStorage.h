@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -131,6 +132,22 @@ class InMemoryStorage final : public StorageInterface {
         // with the keys (tests check it)
         size_t bucketCount() const;
 
+        // What INFO reports, counted as Redis counts it: a read command that
+        // finds a live key is a keyspace hit (even if it then fails with
+        // WRONGTYPE), one that doesn't is a miss, and writes count as neither.
+        // A key removed because its TTL passed is expired; one removed to make
+        // room for another, evicted.
+        struct Stats {
+            uint64_t keyspace_hits = 0;
+            uint64_t keyspace_misses = 0;
+            uint64_t expired_keys = 0;
+            uint64_t evicted_keys = 0;
+            size_t keys = 0;        // held, expired ones not yet removed included
+            size_t expires = 0;     // of those, the keys with a TTL
+            size_t max_keys = 0;    // the capacity (--maxkeys)
+        };
+        Stats stats() const;
+
         ~InMemoryStorage() override;
         InMemoryStorage(const InMemoryStorage&) = delete;
         InMemoryStorage& operator=(const InMemoryStorage&) = delete;
@@ -243,15 +260,27 @@ class InMemoryStorage final : public StorageInterface {
         mutable std::shared_mutex mutex_;
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
         bool loading_ = false;              // replaying the AOF (see setLoading)
+
+        // For stats(). Reads run under the shared lock, several at once, so
+        // theirs are atomic (relaxed: they are counts, not synchronisation);
+        // expiries and evictions happen under the exclusive lock.
+        mutable std::atomic<uint64_t> keyspace_hits_{0};
+        mutable std::atomic<uint64_t> keyspace_misses_{0};
+        uint64_t expired_keys_ = 0;
+        uint64_t evicted_keys_ = 0;
+        void countRead(bool found) const {
+            (found ? keyspace_hits_ : keyspace_misses_).fetch_add(1, std::memory_order_relaxed);
+        }
 };
 
 template<typename Use>
 Result InMemoryStorage::readString(const std::string& key, Use&& use) {
     std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the hit is recorded
     CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(*e)) {
-        expireEntry(e);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) {
+        if(e) expireEntry(e);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     if(getDataType(*e) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);

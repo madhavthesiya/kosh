@@ -75,6 +75,8 @@ Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
                std::unique_ptr<Poller> poller, size_t max_clients)
     : port_(port), storage_(storage), aof_(aof), poller_(std::move(poller)),
       max_clients_(max_clients) {
+    stats_.tcp_port = port;
+    stats_.max_clients = max_clients;
     if(!poller_) poller_ = makePoller(defaultPollerName());
     if(!poller_) poller_ = makePoller("select");    // epoll_create1() failed: select() always works
     if(aof_) aof_->setDeferred(true);
@@ -191,6 +193,7 @@ bool Server::start() {
 
     poller_->add(listen_socket_);
     running_ = true;
+    stats_.started = std::chrono::steady_clock::now();
     std::cout << "Kosh server listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
     // Who can connect, and whether they need the password (never printed)
@@ -270,6 +273,7 @@ void Server::run() {
             if(running_) std::cerr << poller_->name() << " error: " << socketErrorText(error) << "\n";
             continue;
         }
+        sampleOpsPerSec();
 
         // 1. Read from every ready client and run its commands. Their replies
         //    wait in each client's output buffer, their AOF records in the AOF's.
@@ -307,6 +311,27 @@ void Server::run() {
     if(stop_requested) std::cout << "Received a stop signal: shutting down\n";
 }
 
+// After each wakeup of the event loop, at most every 100 ms. While the
+// server is idle, the loop still wakes once a second (the poller's timeout),
+// so the rate falls back to 0 within the 16 samples.
+void Server::sampleOpsPerSec() {
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    if(op_samples_taken_ > 0) {
+        const OpSample& last = op_samples_[(op_sample_next_ + kOpSamples - 1) % kOpSamples];
+        if(now - last.time < milliseconds(100)) return;
+    }
+    op_samples_[op_sample_next_] = {now, stats_.commands_processed};
+    op_sample_next_ = (op_sample_next_ + 1) % kOpSamples;
+    if(op_samples_taken_ < kOpSamples) op_samples_taken_++;
+    // The oldest sample kept: the first while the ring fills, then the next to be overwritten
+    const OpSample& oldest = op_samples_[op_samples_taken_ < kOpSamples ? 0 : op_sample_next_];
+    double seconds = duration<double>(now - oldest.time).count();
+    stats_.ops_per_sec = seconds > 0
+        ? static_cast<uint64_t>(static_cast<double>(stats_.commands_processed - oldest.commands) / seconds + 0.5)
+        : 0;
+}
+
 // ==================== Connection Management ====================
 
 // Accepts every waiting connection rather than one per pass of the loop, up to
@@ -332,6 +357,7 @@ void Server::acceptNewClients() {
                 socket_t extra = accept(listen_socket_, nullptr, nullptr);
                 if(extra != INVALID_SOCKET) {
                     refuseClient(extra, kServerFull);
+                    stats_.rejected_connections++;
                     std::cout << "Client refused: the server is out of file descriptors\n";
                 }
                 reserve_fd_ = open("/dev/null", O_RDONLY);
@@ -361,12 +387,14 @@ void Server::acceptNewClients() {
         // "server full" would only retry.
         if(protected_mode_ && !password_ && !isLoopback(client_addr.sin_addr)) {
             refuseClient(client, kDenied);
+            stats_.rejected_connections++;
             std::cout << "Client refused: " << ip << " is not on this machine (protected mode)\n";
             continue;
         }
         // As Redis does at maxclients
         if(clients_.size() >= max_clients_) {
             refuseClient(client, kServerFull);
+            stats_.rejected_connections++;
             std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
             continue;
         }
@@ -374,6 +402,7 @@ void Server::acceptNewClients() {
         // fd_set (Linux) or silently never serve it (Windows)
         if(!poller_->canWatch(client)) {
             refuseClient(client, kServerFull);
+            stats_.rejected_connections++;
             std::cout << "Client refused: the server is at its " << poller_->name() << " limit ("
                       << clients_.size() << " clients)\n";
             continue;
@@ -393,6 +422,7 @@ void Server::acceptNewClients() {
         added.id = ++last_client_id_;
         poller_->add(client);
 
+        stats_.connections_received++;
         std::cout << "Client connected: " << ip << ":"
                   << ntohs(client_addr.sin_port)
                   << " (total: " << clients_.size() << ")\n";
@@ -514,6 +544,7 @@ void Server::runCommands(Client& client) {
     ctx.client_id = client.id;
     ctx.client_name = &client.name;
     ctx.transaction = &client.transaction;
+    ctx.server = &stats_;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
         // Into args_, whose strings are reused from command to command. Until
         // the client authenticates, smaller limits apply (see RespParser); an

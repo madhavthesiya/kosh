@@ -126,6 +126,20 @@ private:
     std::unordered_map<socket_t, Client> clients_;
     uint64_t last_client_id_ = 0;       // never reused, as in Redis
 
+    // What INFO reports. instantaneous_ops_per_sec comes from samples of the
+    // command count, taken at most every 100 ms: the rate between the oldest
+    // and newest of the last kOpSamples (as Redis does, over 16 samples)
+    ServerStats stats_;
+    struct OpSample {
+        std::chrono::steady_clock::time_point time;
+        uint64_t commands = 0;
+    };
+    static constexpr size_t kOpSamples = 16;
+    OpSample op_samples_[kOpSamples];
+    size_t op_sample_next_ = 0;
+    size_t op_samples_taken_ = 0;
+    void sampleOpsPerSec();
+
     // Clients with replies to send in this pass of the loop, in order. They are
     // served after the pass's AOF records are written (group commit).
     std::vector<socket_t> to_serve_;

@@ -2423,6 +2423,92 @@ TEST(test_aof_replay_drops_an_incomplete_transaction) {
     std::remove(aof_file.c_str());
 }
 
+// ==================== INFO ====================
+
+TEST(test_storage_counts_as_redis_does) {
+    // The same counts Redis 7.0.15 gives for the same commands: a read that
+    // finds a live key is a hit (WRONGTYPE too), and writes count neither
+    InMemoryStorage s(4);
+    s.set("a", "1");                            // writes: not counted
+    s.lpush("l", {"x"});
+    s.hset("h", {{"f", "v"}});
+    s.sadd("s", {"m"});
+    s.get("a"); s.exists("a"); s.type("a"); s.ttl("a");           // 4 hits
+    s.lrange("l", 0, -1); s.llen("l");                              // 2
+    s.hget("h", "f"); s.hget("h", "missing-field"); s.hgetall("h"); s.hlen("h");    // 4
+    s.smembers("s"); s.sismember("s", "m"); s.scard("s");           // 3
+    s.get("l");                                 // WRONGTYPE: still a hit
+    for(const char* key : {"x1", "x2"}) {       // every read path's miss
+        s.get(key); s.exists(key); s.type(key); s.ttl(key); s.lrange(key, 0, -1); s.llen(key);
+        s.hget(key, "f"); s.hgetall(key); s.hlen(key); s.smembers(key); s.sismember(key, "m"); s.scard(key);
+    }
+    s.lpop("l"); s.del("missing");              // writes again
+    auto st = s.stats();
+    ASSERT_EQ(st.keyspace_hits, uint64_t{14});
+    ASSERT_EQ(st.keyspace_misses, uint64_t{24});
+    ASSERT_EQ(st.expired_keys, uint64_t{0});
+    ASSERT_EQ(st.evicted_keys, uint64_t{0});
+    ASSERT_EQ(st.keys, size_t{3});              // a, h, s (the list emptied, so it went)
+    ASSERT_EQ(st.max_keys, size_t{4});
+
+    // Expired, found on a read: a miss and an expiry; to make room: an eviction
+    s.setExpiringAt("e", "v", InMemoryStorage::unixTimeMs() - 1);
+    ASSERT_EQ(s.stats().expires, size_t{1});
+    s.get("e");
+    st = s.stats();
+    ASSERT_EQ(st.keyspace_misses, uint64_t{25});
+    ASSERT_EQ(st.expired_keys, uint64_t{1});
+    ASSERT_EQ(st.expires, size_t{0});
+    s.set("n1", "1");                           // the fourth key fits
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{0});
+    s.set("n2", "1");                           // a fifth: one evicted
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});     // an eviction isn't an expiry
+}
+
+TEST(test_info_sections_and_command_count) {
+    InMemoryStorage s(10);
+    ServerStats server;
+    server.tcp_port = 6380;
+    server.max_clients = 7;
+    server.started = std::chrono::steady_clock::now();
+    Transaction tx;
+    CommandContext ctx{s, nullptr, 2};
+    ctx.server = &server;
+    ctx.transaction = &tx;
+
+    std::string all = executeCommand(ctx, {"INFO"});
+    for(const char* line : {"# Server\r\nkosh_version:3.0.0\r\n", "tcp_port:6380\r\n", "connected_clients:2\r\n",
+                            "maxclients:7\r\n", "maxkeys:10\r\n", "aof_enabled:0\r\n",
+                            "total_commands_processed:0\r\n", "keyspace_hits:0\r\n", "# Keyspace\r\n"}) {
+        ASSERT_TRUE(all.find(line) != std::string::npos);
+    }
+    ASSERT_TRUE(all.find("db0:") == std::string::npos);     // no keys, no db0 line
+    ASSERT_TRUE(all.find("redis_version") == std::string::npos);
+    // Sections by name, in any case; unknown ones give nothing, as in Redis
+    std::string stats = executeCommand(ctx, {"INFO", "STATS"});
+    ASSERT_TRUE(stats.find("# Stats\r\n") != std::string::npos);
+    ASSERT_TRUE(stats.find("# Server") == std::string::npos);
+    std::string two = executeCommand(ctx, {"info", "server", "keyspace"});
+    ASSERT_TRUE(two.find("# Server") != std::string::npos && two.find("# Keyspace") != std::string::npos);
+    ASSERT_TRUE(two.find("# Clients") == std::string::npos);
+    ASSERT_EQ(executeCommand(ctx, {"INFO", "nosuch"}), "$0\r\n\r\n");
+    ASSERT_TRUE(executeCommand(ctx, {"INFO", "everything"}).find("# Memory") != std::string::npos);
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_TRUE(executeCommand(ctx, {"INFO", "keyspace"}).find("db0:keys=1,expires=0\r\n") != std::string::npos);
+
+    // Commands are counted once they have run: EXEC and what it runs, not
+    // refused or queued ones
+    uint64_t before = server.commands_processed;
+    executeCommand(ctx, {"NOPE"});
+    executeCommand(ctx, {"GET"});
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"PING"});
+    executeCommand(ctx, {"PING"});
+    executeCommand(ctx, {"EXEC"});
+    ASSERT_EQ(server.commands_processed - before, uint64_t{4});     // MULTI, EXEC, 2 PINGs
+}
+
 // ==================== RESP3 and HELLO ====================
 // Expected bytes are Redis 7.0.15's for the same commands
 
@@ -2954,6 +3040,10 @@ int main() {
     RUN_TEST(test_transactions_abort);
     RUN_TEST(test_transactions_in_the_aof);
     RUN_TEST(test_aof_replay_drops_an_incomplete_transaction);
+
+    std::cout << "\n[INFO]\n";
+    RUN_TEST(test_storage_counts_as_redis_does);
+    RUN_TEST(test_info_sections_and_command_count);
 
     std::cout << "\n[RESP3 and HELLO]\n";
     RUN_TEST(test_resp3_reply_types);

@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -23,6 +24,18 @@ struct Transaction {
     std::vector<std::vector<std::string>> queued;
 };
 
+// What INFO reports about the server, which keeps it (see Server.cpp)
+struct ServerStats {
+    int tcp_port = 0;
+    size_t max_clients = 0;
+    // On the monotonic clock, so a step of the wall clock doesn't change the uptime
+    std::chrono::steady_clock::time_point started{};
+    uint64_t connections_received = 0;      // accepted and served
+    uint64_t rejected_connections = 0;      // refused: maxclients, protected mode, out of files
+    uint64_t commands_processed = 0;        // commands that ran (executeCommand counts them)
+    uint64_t ops_per_sec = 0;               // commands per second, recently (see Server.cpp)
+};
+
 // What a command can use besides its arguments
 struct CommandContext {
     InMemoryStorage& storage;
@@ -40,6 +53,7 @@ struct CommandContext {
     uint64_t client_id = 0;                 // CLIENT ID, HELLO
     std::string* client_name = nullptr;     // CLIENT SETNAME/GETNAME; nullptr: no connection
     Transaction* transaction = nullptr;     // MULTI/EXEC; nullptr: no connection
+    ServerStats* server = nullptr;          // INFO, and counting commands; nullptr: no server
 };
 
 // A command's arguments (args[0] is its name): a view of strings the caller
