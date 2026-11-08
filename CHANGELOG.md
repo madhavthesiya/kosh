@@ -10,6 +10,8 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-08
+
 ### Added
 
 - `PTTL`, `PEXPIRE`, `PERSIST` and `DBSIZE`, with Redis 7.0.15's replies.
@@ -96,5 +98,6 @@ The first release under the name Kosh, and the first meant for others to run.
   writes, absolute expiry times in the AOF.
 - **`v0-baseline`** (2026-10-31): the project before any of this work.
 
-[Unreleased]: https://github.com/madhavthesiya/kosh/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/madhavthesiya/kosh/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/madhavthesiya/kosh/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...v3.0.0

@@ -28,6 +28,7 @@
 #include "../Commands.h"
 #include "../Integer.h"
 #include "../Glob.h"
+#include "../Version.h"
 
 int passed = 0;
 int failed = 0;
@@ -3090,7 +3091,8 @@ TEST(test_info_sections_and_command_count) {
     ctx.transaction = &tx;
 
     std::string all = executeCommand(ctx, {"INFO"});
-    for(const char* line : {"# Server\r\nkosh_version:3.0.0\r\n", "tcp_port:6380\r\n", "connected_clients:2\r\n",
+    ASSERT_TRUE(all.find(std::string("# Server\r\nkosh_version:") + kKoshVersion + "\r\n") != std::string::npos);
+    for(const char* line : {"tcp_port:6380\r\n", "connected_clients:2\r\n",
                             "maxclients:7\r\n", "maxkeys:10\r\n", "aof_enabled:0\r\n",
                             "total_commands_processed:0\r\n", "keyspace_hits:0\r\n", "# Keyspace\r\n"}) {
         ASSERT_TRUE(all.find(line) != std::string::npos);
@@ -3156,7 +3158,9 @@ TEST(test_hello) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
     ctx.client_id = 7;
-    const std::string fields = "$6\r\nserver\r\n$4\r\nkosh\r\n$7\r\nversion\r\n$5\r\n3.0.0\r\n$5\r\nproto\r\n";
+    const std::string version = kKoshVersion;   // from Version.h, so a release doesn't edit tests
+    const std::string fields = "$6\r\nserver\r\n$4\r\nkosh\r\n$7\r\nversion\r\n$" + std::to_string(version.size()) +
+                               "\r\n" + version + "\r\n$5\r\nproto\r\n";
     const std::string rest = "$2\r\nid\r\n:7\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n"
                              "$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n";
     // HELLO 3 switches to RESP3 and answers with a map; HELLO 2 back, with an array
