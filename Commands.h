@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 #include "InMemoryStorage.h"
+#include "Router.h"
 
 // The command table, shared by the server and AOF replay.
 //
@@ -153,5 +154,7 @@ struct AofLoadResult {
 // table. An incomplete last record (the server stopped while writing it) is
 // cut off the file, so new records start at a record boundary. Damage before
 // the end, or a command the server never logs, is an error: loading only the
-// part before it would silently drop everything after.
-AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof);
+// part before it would silently drop everything after. With `router`, the file
+// is thread number `shard`'s, and a record whose key belongs to another thread
+// is damage too: the files were mixed up, or the routing key is wrong.
+AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof, const Router* router = nullptr, size_t shard = 0);

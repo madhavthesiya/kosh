@@ -47,7 +47,7 @@ jobs:
         # under pipefail (grep exits at the first match, ctest gets SIGPIPE)
         run: |
           registered="$(ctest --test-dir build -N)"
-          for t in unit_tests thread_safety_tests spsc_ring_tests router_tests wakeup_tests threads_integration_tests fuzz_corpus integration_tests integration_tests_select \
+          for t in unit_tests thread_safety_tests spsc_ring_tests router_tests wakeup_tests threads_integration_tests shard_aof_tests fuzz_corpus integration_tests integration_tests_select \
                    client_library_tests redis_compatibility loadgen_unit_tests loadgen_integration_tests; do
             grep -q " $t\$" <<< "$registered" || { echo "missing test: $t"; exit 1; }
           done
@@ -81,6 +81,7 @@ jobs:
           setarch "$(uname -m)" -R tsan/test_spsc_ring
           setarch "$(uname -m)" -R tsan/test_wakeup 60000
           setarch "$(uname -m)" -R python3 tests/integration/test_threads.py tsan/kosh-server
+          setarch "$(uname -m)" -R python3 tests/integration/test_shard_aof.py tsan/kosh-server
           setarch "$(uname -m)" -R python3 tests/integration/test_server.py tsan/kosh-server
 
   windows-build:

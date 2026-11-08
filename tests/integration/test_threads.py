@@ -637,16 +637,17 @@ def test_the_key_limit_is_shared_out():
 
 def test_options_for_shards():
     for options, message in ((["--threads", "4", "--maxkeys", "3", "--appendonly", "no"], "at least --threads"),
-                             (["--threads", "2", "--appendonly", "yes"], "--appendonly no")):
+                             ):
         result = subprocess.run([SERVER, "--port", "1", *options], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, timeout=20)
         check(result.returncode == 2 and message in result.stdout, f"{options} is refused: {result.stdout!r}")
 
 
-for name, test in list(globals().items()):
-    if name.startswith("test_"):
-        test()
-if failures:
-    print(f"{len(failures)} checks FAILED")
-    sys.exit(1)
-print("threads integration: all checks passed")
+if __name__ == "__main__":
+    for name, test in list(globals().items()):
+        if name.startswith("test_"):
+            test()
+    if failures:
+        print(f"{len(failures)} checks FAILED")
+        sys.exit(1)
+    print("threads integration: all checks passed")

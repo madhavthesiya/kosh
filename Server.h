@@ -23,9 +23,11 @@ public:
     // select() elsewhere) if none is given. Beyond `max_clients` clients, or
     // what the poller can watch, a new client gets "-ERR max number of clients
     // reached" and is disconnected. `shards`: one storage per thread; each
-    // thread owns the keys of its shard (above 1 needs epoll).
-    Server(int port, const std::vector<InMemoryStorage*>& shards, AOFLogger* aof = nullptr,
-           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
+    // thread owns the keys of its shard (above 1 needs epoll). `aofs`: one log
+    // per thread, or none if the AOF is off. `router`: which thread owns a key.
+    Server(int port, const std::vector<InMemoryStorage*>& shards, const std::vector<AOFLogger*>& aofs,
+           const Router& router, std::unique_ptr<Poller> poller = nullptr,
+           size_t max_clients = kDefaultMaxClients);
     ~Server();
 
     // Set these before start().

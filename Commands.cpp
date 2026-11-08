@@ -955,7 +955,7 @@ std::string executeCommand(CommandContext& ctx, const std::vector<std::string>& 
 
 // Runs every complete command in the AOF through the command table. While
 // loading, the storage doesn't log the commands again (see setLoading).
-AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
+AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof, const Router* router, size_t shard) {
     AofLoadResult result;
     const std::string buffer = aof.readRaw();
     CommandContext ctx{storage};
@@ -970,6 +970,15 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
                        " bytes before it are intact: to start with them, cut the file there"
                        " (truncate -s " + std::to_string(at) + " " + aof.getFilename() + ")";
         return result;
+    };
+
+    auto belongsHere = [&](const Command& cmd, const Args& args) {
+        if(!router || cmd.first_key == 0) return true;
+        const size_t last = cmd.last_key < 0 ? args.size() - 1 : static_cast<size_t>(cmd.last_key);
+        for(size_t i = static_cast<size_t>(cmd.first_key); i <= last; i += static_cast<size_t>(cmd.key_step)) {
+            if(router->shardOf(args[i]) != shard) return false;
+        }
+        return true;
     };
 
     // A transaction's records, from its MULTI on: applied together at its
@@ -1016,6 +1025,7 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
                 if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
                     return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
                 }
+                if(!belongsHere(*cmd, args)) return damaged(pos, "a key that belongs to another thread's file");
                 if(in_transaction) transaction.emplace_back(args.begin(), args.end());
                 else run(*cmd, args);
             }

@@ -208,6 +208,9 @@ if(Python3_FOUND)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+        add_test(NAME shard_aof_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_shard_aof.py
+                         $<TARGET_FILE:kosh-server>)
         add_test(NAME threads_integration_tests
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_threads.py
                          $<TARGET_FILE:kosh-server>)

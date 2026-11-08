@@ -1,5 +1,6 @@
 // Router: which shard owns a key, and the command table's record of where keys are.
 
+#include "../AofManifest.h"
 #include "../Commands.h"
 #include "../Router.h"
 
@@ -110,6 +111,21 @@ void testCommandTable() {
     }
 }
 
+void testManifest() {
+    SipKey key;
+    key.k0 = 0x0123456789abcdefull;
+    key.k1 = 0xfedcba9876543210ull;
+    const std::string text = formatManifest(4, key);
+    size_t shards = 0;
+    SipKey parsed;
+    check(parseManifest(text, shards, parsed), "a manifest parses");
+    check(shards == 4 && parsed.k0 == key.k0 && parsed.k1 == key.k1, "and says what was written");
+    for(const std::string& bad : {std::string(""), std::string("nonsense\n"), text.substr(0, text.size() - 1),
+                                  text + "x", "kosh-aof 2" + text.substr(10), formatManifest(1, key), formatManifest(257, key)}) {
+        check(!parseManifest(bad, shards, parsed), "a damaged manifest is refused: " + bad);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -120,6 +136,7 @@ int main() {
     testKeyedPerRouter();
     testShardKeysFillTheTable();
     testCommandTable();
+    testManifest();
     if(failures == 0) {
         std::cout << "Router: all checks passed\n";
         return 0;

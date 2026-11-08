@@ -9,6 +9,7 @@
 #include <vector>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
+#include "AofManifest.h"
 #include "Commands.h"
 #include "Server.h"
 #include "Version.h"
@@ -195,10 +196,6 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         std::cerr << "--maxkeys must be at least --threads: each thread holds its share of the keys\n";
         return ParseResult::Error;
     }
-    if(config.threads > 1 && config.appendOnly) {
-        std::cerr << "--threads above 1 needs --appendonly no for now\n";
-        return ParseResult::Error;
-    }
     return ParseResult::Run;
 }
 
@@ -227,16 +224,43 @@ int main(int argc, char* argv[]) {
 
     // AOF persistence is optional. Every write reaches the OS before its reply,
     // so it survives a process crash; --appendfsync decides when it reaches
-    // the disk, which is what survives a power cut.
-    std::optional<AOFLogger> aof;
+    // the disk, which is what survives a power cut. With several threads each
+    // has a file of its own: see AofManifest.h.
+    SipKey routingKey = SipKey::random();
+    bool writeManifest = false;
     if(config.appendOnly) {
-        aof.emplace(config.appendFilename);
-        if(!aof->isOpen()) {
-            std::cerr << "Cannot open AOF file '" << config.appendFilename << "'\n";
+        AofLayout layout = checkAofLayout(config.appendFilename, config.threads);
+        if(!layout.error.empty()) {
+            std::cerr << "Cannot start: " << layout.error << "\n";
+            return 1;
+        }
+        if(config.threads > 1) routingKey = layout.routing_key;
+        writeManifest = layout.fresh;
+    }
+    const Router router(config.threads, routingKey);
+
+    std::vector<std::unique_ptr<AOFLogger>> aofs;
+    std::vector<AOFLogger*> aofPointers;
+    if(config.appendOnly) {
+        for(size_t i = 0; i < config.threads; i++) {
+            const std::string path = config.threads == 1 ? config.appendFilename : shardAofPath(config.appendFilename, i);
+            aofs.push_back(std::make_unique<AOFLogger>(path));
+            if(!aofs.back()->isOpen()) {
+                std::cerr << "Cannot open AOF file '" << path << "'\n";
+                return 1;
+            }
+            aofPointers.push_back(aofs.back().get());
+        }
+    }
+    // Last, so that a manifest always means every file exists
+    if(writeManifest) {
+        const std::string problem = AOFLogger::writeFileAtomically(manifestPath(config.appendFilename),
+                                                                   formatManifest(config.threads, routingKey));
+        if(!problem.empty()) {
+            std::cerr << "Cannot start: " << problem << "\n";
             return 1;
         }
     }
-    AOFLogger* aofLogger = aof ? &*aof : nullptr;
 
     // One storage per thread. The limit is split so that the shares add up to
     // exactly --maxkeys.
@@ -244,37 +268,46 @@ int main(int argc, char* argv[]) {
     std::vector<InMemoryStorage*> shardPointers;
     for(size_t i = 0; i < config.threads; i++) {
         const size_t share = config.maxKeys / config.threads + (i < config.maxKeys % config.threads ? 1 : 0);
-        shards.push_back(std::make_unique<InMemoryStorage>(share, aofLogger, config.eviction));
+        shards.push_back(std::make_unique<InMemoryStorage>(share, aofPointers.empty() ? nullptr : aofPointers[i], config.eviction));
         shardPointers.push_back(shards.back().get());
     }
-    InMemoryStorage& storage = *shards[0];
 
-    // Restore state from previous session
-    if(aofLogger) {
-        AofLoadResult loaded = replayAOF(storage, *aofLogger);
-        if(!loaded.ok) {
-            std::cerr << "Cannot start: " << loaded.error << "\n";
-            return 1;
+    // Restore state from previous session. Each file holds only its own
+    // thread's keys, so the order of the files doesn't matter.
+    if(config.appendOnly) {
+        size_t loadedCommands = 0;
+        for(size_t i = 0; i < config.threads; i++) {
+            AofLoadResult loaded = replayAOF(*shards[i], *aofs[i], config.threads > 1 ? &router : nullptr, i);
+            if(!loaded.ok) {
+                std::cerr << "Cannot start: " << loaded.error << "\n";
+                return 1;
+            }
+            if(loaded.truncated_bytes > 0) {
+                std::cerr << "Warning: the AOF ended with an incomplete record or transaction (the "
+                             "server stopped while writing it); cut off its " << loaded.truncated_bytes
+                          << " bytes";
+                if(config.threads > 1) std::cerr << " from " << aofs[i]->getFilename();
+                std::cerr << "\n";
+            }
+            loadedCommands += loaded.commands;
         }
-        if(loaded.truncated_bytes > 0) {
-            std::cerr << "Warning: the AOF ended with an incomplete record or transaction (the "
-                         "server stopped while writing it); cut off its " << loaded.truncated_bytes
-                      << " bytes\n";
-        }
-        std::cout << "Loaded " << loaded.commands
-                  << (loaded.commands == 1 ? " command" : " commands") << " from the AOF\n";
+        std::cout << "Loaded " << loadedCommands
+                  << (loadedCommands == 1 ? " command" : " commands") << " from the AOF\n";
         // After the replay, which writes nothing worth syncing
-        aofLogger->setFsyncPolicy(config.appendFsync);
+        for(auto& aof : aofs) aof->setFsyncPolicy(config.appendFsync);
     }
 
     const char* fsync_name = config.appendFsync == AOFLogger::FsyncPolicy::Always ? "always"
                            : config.appendFsync == AOFLogger::FsyncPolicy::EverySecond ? "everysec" : "no";
     std::cout << "Max keys: " << config.maxKeys
               << " (eviction: " << (config.eviction == EvictionPolicy::SIEVE ? "sieve" : "lru") << ")"
-              << " | AOF: "
-              << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
+              << " | AOF: ";
+    if(!config.appendOnly) std::cout << "disabled";
+    else if(config.threads == 1) std::cout << config.appendFilename << " (fsync: " << fsync_name << ")";
+    else std::cout << config.appendFilename << ".shard-0 to -" << config.threads - 1 << " (fsync: " << fsync_name << ")";
+    std::cout << "\n";
 
-    Server server(config.port, shardPointers, aofLogger, makePoller(config.poller), config.maxClients);
+    Server server(config.port, shardPointers, aofPointers, router, makePoller(config.poller), config.maxClients);
     server.setBindAddress(config.bindAddress);
     server.setProtectedMode(config.protectedMode);
     if(config.password) {
