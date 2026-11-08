@@ -525,6 +525,14 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
 
+**Redis's whole command set**, by version: CI runs tair-opensource's [resp-compatibility](https://github.com/tair-opensource/resp-compatibility) suite (pinned at `5e90c25`) against Kosh on every push. It measures how much of each Redis version a server covers, so most of it tests commands Kosh doesn't have:
+
+| Redis version | 1.0.0 | 2.8.0 | 3.2.0 | 4.0.0 | 5.0.0 | 6.0.0 | 6.2.0 | 7.0.0 | 7.2.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Tests passed | 28 of 50 | 48 of 150 | 48 of 184 | 51 of 196 | 51 of 220 | 51 of 228 | 54 of 295 | 54 of 350 | 54 of 352 |
+
+Every failure was checked. All but 13 test commands Kosh doesn't have (sorted sets, streams, Pub/Sub, `KEYS`, `RENAME` and more). The 13 that test a command Kosh has use an option it doesn't support (`EXPIRE`/`PEXPIRE`/`PEXPIREAT` with `NX`/`XX`/`GT`/`LT`; `SET` with `NX`/`XX`/`GET`/`KEEPTTL`; `LPOP`/`RPOP` with a count), or set up their key with a missing command (`scan with TYPE` starts with `GEOADD`). All are listed under Known Limitations.
+
 **Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
 
 **Client libraries**, tested through their own APIs ([`tests/integration/test_clients.py`](tests/integration/test_clients.py)):
@@ -976,7 +984,8 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
-| `EXPIRE` and `PEXPIRE` take no options (Redis 7.0's `NX`, `XX`, `GT`, `LT`): a third argument gets "wrong number of arguments", where Redis would apply the option or say "Unsupported option". | Implement them, with tests |
+| `EXPIRE`, `PEXPIRE` and `PEXPIREAT` take no options (Redis 7.0's `NX`, `XX`, `GT`, `LT`): a third argument gets "wrong number of arguments", where Redis would apply the option or say "Unsupported option". | Implement them, with tests |
+| `LPOP` and `RPOP` take no count (Redis 6.2's `LPOP key count`, popping several at once). | Implement it, with tests |
 | `WATCH` (optimistic locking for transactions) is not supported: it gets "unknown command", which inside `MULTI` aborts the transaction. | A hook that sees every change to a watched key: writes, deletes, expiry and eviction |
 | `BGREWRITEAOF` is refused inside `MULTI`, which Redis allows. | A background rewrite, which would also lift this |
 | The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
