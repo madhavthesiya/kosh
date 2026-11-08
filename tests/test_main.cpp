@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <set>
 #include <random>
 #include <algorithm>
 #include <memory>
@@ -25,6 +27,7 @@
 #include "../RespParser.h"
 #include "../Commands.h"
 #include "../Integer.h"
+#include "../Glob.h"
 
 int passed = 0;
 int failed = 0;
@@ -294,6 +297,66 @@ TEST(test_keytable_rehash_is_incremental) {
         }
     }
     for(const auto& e : pool) ASSERT_TRUE(t.find(e->key) == e.get());
+}
+
+TEST(test_keytable_scan) {
+    // SCAN's guarantee, as Redis's: a key present for the whole scan comes
+    // back at least once, however the table grows between steps. A table that
+    // doesn't change gives every key exactly once, even caught mid-rehash.
+    auto fullScan = [](const KeyTable<TableEntry, TableKeyOf>& t, std::map<std::string, int>& seen,
+                       const std::function<void()>& between) {
+        size_t cursor = 0;
+        int steps = 0;
+        do {
+            cursor = t.scan(cursor, [&](const TableEntry& e) { seen[e.key]++; });
+            between();
+            ASSERT_TRUE(++steps < 1'000'000);
+        } while(cursor != 0);
+    };
+    for(int n : {0, 1, 27, 28, 29, 1000, 5000}) {
+        KeyTable<TableEntry, TableKeyOf> t;
+        std::vector<std::unique_ptr<TableEntry>> pool;
+        for(int i = 0; i < n; i++) {
+            pool.push_back(std::make_unique<TableEntry>(TableEntry{"k" + std::to_string(i)}));
+            t.insert(pool.back().get());
+        }
+        for(bool midRehash : {false, true}) {
+            if(midRehash) {             // add keys until a rehash is in progress
+                int extra = 0;
+                while(!t.rehashing()) {
+                    pool.push_back(std::make_unique<TableEntry>(TableEntry{"x" + std::to_string(extra++)}));
+                    t.insert(pool.back().get());
+                }
+            }
+            std::map<std::string, int> seen;
+            fullScan(t, seen, [] {});
+            ASSERT_EQ(seen.size(), pool.size());
+            for(const auto& [key, count] : seen) ASSERT_EQ(count, 1);
+        }
+    }
+    // Growing during the scan: from 1,000 keys, each step adds some (several
+    // doublings, rehashes in progress between steps) and erases some of the new
+    for(int perStep : {1, 7, 50}) {
+        KeyTable<TableEntry, TableKeyOf> t;
+        std::vector<std::unique_ptr<TableEntry>> original, added;
+        for(int i = 0; i < 1000; i++) {
+            original.push_back(std::make_unique<TableEntry>(TableEntry{"k" + std::to_string(i)}));
+            t.insert(original.back().get());
+        }
+        std::map<std::string, int> seen;
+
+        int next = 0, stepsMidRehash = 0;
+        fullScan(t, seen, [&] {
+            for(int j = 0; j < perStep; j++) {
+                added.push_back(std::make_unique<TableEntry>(TableEntry{"n" + std::to_string(next++)}));
+                t.insert(added.back().get());
+            }
+            if(added.size() % 3 == 0) t.erase(added[added.size() / 2].get());
+            if(t.rehashing()) stepsMidRehash++;
+        });
+        ASSERT_TRUE(stepsMidRehash > 0);             // the scan crossed at least one rehash
+        for(const auto& e : original) ASSERT_TRUE(seen.count(e->key) == 1);
+    }
 }
 
 TEST(test_keytable_big_table_given_back) {
@@ -2800,6 +2863,122 @@ TEST(test_aof_persist_and_past_expiry) {
     std::remove(aof_file.c_str());
 }
 
+TEST(test_glob_match) {
+    // The same pairs compare_with_redis.py sends through SCAN MATCH; Redis
+    // 7.0.15 gives the same answers (checked byte for byte there)
+    struct Case { std::string pattern, key; bool match; };
+    const std::vector<Case> cases = {
+        {"h?llo", "hello", true}, {"h?llo", "hllo", false}, {"h*llo", "hllo", true},
+        {"h*llo", "heeeello", true}, {"h[ae]llo", "hallo", true}, {"h[ae]llo", "hillo", false},
+        {"h[^e]llo", "hallo", true}, {"h[^e]llo", "hello", false}, {"h[a-b]llo", "hbllo", true},
+        {"h[b-a]llo", "hbllo", true},                        // a range given backwards is turned round
+        {"h\\*llo", "h*llo", true}, {"h\\*llo", "hello", false},
+        {"[", "[", false}, {"a[", "a", false}, {"a[^", "ab", true},     // unclosed brackets, as Redis
+        {"[\\]]", "]", true}, {"[a-]", "-", false}, {"[a-]", "a", true}, // "a-]" is a range a..]
+        {"a*", "a", true}, {"a**", "a", true}, {"*a", "a", true}, {"**", "x", true},
+        {"a*b*c", "abc", true}, {"a*b*c", "aXbYc", true}, {"a*b*c", "acb", false},
+        {"\\", "\\", true}, {"abc\\", "abc\\", true},
+        {"[a-\xff]", "\x80", false},                         // bytes compared as signed chars
+        {std::string("a?c"), std::string("a\0c", 3), true},  // NUL is a byte like any other
+        {"", "x", false}, {"*x*", "axb", true},
+        {"[]a]", "a", false},                                // ']' first closes the class
+        {"[!a]", "!", true},                                 // '!' isn't negation, '^' is
+        {"*", "", false},                                    // Redis's own quirk (SCAN skips MATCH *)
+    };
+    for(const auto& c : cases) {
+        if(globMatch(c.pattern, c.key) != c.match) {
+            std::cout << "pattern '" << c.pattern << "' on '" << c.key << "' ";
+            ASSERT_EQ(globMatch(c.pattern, c.key), c.match);
+        }
+    }
+    // Exponential patterns end quickly (skip longer matches, CVE-2022-36021)
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_FALSE(globMatch("a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b", std::string(5000, 'a')));
+    ASSERT_TRUE(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+    // Nesting stops at kMaxGlobNesting, as in the Redis 7.0.15 Ubuntu ships
+    // (measured: "a*" x 1001 matches 1001 'a's on both, x 1002 doesn't).
+    // 100,000 levels would recurse 100,000 frames deep without the limit.
+    auto stars = [](int n) {
+        std::string p;
+        for(int i = 0; i < n; i++) p += "a*";
+        return p;
+    };
+    ASSERT_TRUE(globMatch(stars(1001), std::string(1001, 'a')));
+    ASSERT_FALSE(globMatch(stars(1002), std::string(1002, 'a')));
+    ASSERT_FALSE(globMatch(stars(100000), std::string(100000, 'a')));
+}
+
+TEST(test_scan_command) {
+    InMemoryStorage s(1000);
+    CommandContext ctx{s};
+    // The keys of one SCAN reply: *2 $cursor *n $key...
+    auto scanStep = [&](const std::string& cursor, std::vector<std::string> extra, std::set<std::string>& seen) {
+        std::vector<std::string> command = {"SCAN", cursor};
+        command.insert(command.end(), extra.begin(), extra.end());
+        std::string reply = executeCommand(ctx, command);
+        ASSERT_TRUE(reply.rfind("*2\r\n$", 0) == 0);
+        size_t pos = reply.find("\r\n", 4) + 2;                 // after the cursor's length
+        size_t end = reply.find("\r\n", pos);
+        std::string next = reply.substr(pos, end - pos);
+        pos = end + 2;
+        size_t n = std::stoul(reply.substr(pos + 1, reply.find("\r\n", pos) - pos - 1));
+        pos = reply.find("\r\n", pos) + 2;
+        for(size_t i = 0; i < n; i++) {
+            size_t len = std::stoul(reply.substr(pos + 1, reply.find("\r\n", pos) - pos - 1));
+            pos = reply.find("\r\n", pos) + 2;
+            seen.insert(reply.substr(pos, len));
+            pos += len + 2;
+        }
+        ASSERT_EQ(pos, reply.size());
+        return next;
+    };
+    for(int i = 0; i < 300; i++) s.set("key:" + std::to_string(i), "v");
+    s.rpush("list:1", {"a"});
+    // A full iteration with COUNT 7 returns every key
+    std::set<std::string> seen;
+    std::string cursor = "0";
+    int calls = 0;
+    do {
+        cursor = scanStep(cursor, {"COUNT", "7"}, seen);
+        ASSERT_TRUE(++calls < 10000);
+    } while(cursor != "0");
+    ASSERT_EQ(seen.size(), size_t{301});
+    ASSERT_TRUE(calls > 1);                                    // it took several calls
+    // COUNT is how many keys a call gathers before it stops (Redis steps
+    // the table until it has them): at least 7 here, and all 301 in one call
+    seen.clear();
+    ASSERT_TRUE(scanStep("0", {"COUNT", "7"}, seen) != "0");
+    ASSERT_TRUE(seen.size() >= 7);
+    seen.clear();
+    ASSERT_EQ(scanStep("0", {"COUNT", "1000"}, seen), "0");
+    ASSERT_EQ(seen.size(), size_t{301});
+    // MATCH and TYPE filter
+    seen.clear();
+    cursor = "0";
+    do { cursor = scanStep(cursor, {"MATCH", "key:1?", "COUNT", "50"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen.size(), size_t{10});                        // key:10 .. key:19
+    seen.clear();
+    cursor = "0";
+    uint64_t hits = s.stats().keyspace_hits;
+    do { cursor = scanStep(cursor, {"TYPE", "LIST", "COUNT", "1000"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen, (std::set<std::string>{"list:1"}));
+    ASSERT_EQ(s.stats().keyspace_hits - hits, uint64_t{301});  // each type check is a read, as in Redis
+    // An expired key isn't returned, and is removed when met, counted as an expiry
+    s.set("soon", "v");
+    s.expireAt("soon", InMemoryStorage::unixTimeMs() + 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    seen.clear();
+    cursor = "0";
+    do { cursor = scanStep(cursor, {"COUNT", "1000"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen.count("soon"), size_t{0});
+    ASSERT_EQ(s.stats().keys, size_t{301});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});
+    // The cursor as Redis reads it
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", " 0"}), "-ERR invalid cursor\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", "18446744073709551616"}), "-ERR invalid cursor\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", "0", "COUNT", "0"}), "-ERR syntax error\r\n");
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3300,6 +3479,7 @@ int main() {
     RUN_TEST(test_keytable_one_long_chain);
     RUN_TEST(test_keytable_matches_unordered_map);
     RUN_TEST(test_keytable_rehash_is_incremental);
+    RUN_TEST(test_keytable_scan);
     RUN_TEST(test_keytable_big_table_given_back);
     RUN_TEST(test_siphash24_reference_vectors);
     RUN_TEST(test_siphash13_matches_cpython);
@@ -3431,6 +3611,10 @@ int main() {
     std::cout << "\n[PTTL, PEXPIRE, PERSIST, DBSIZE]\n";
     RUN_TEST(test_pttl_pexpire_persist_dbsize);
     RUN_TEST(test_aof_persist_and_past_expiry);
+
+    std::cout << "\n[SCAN]\n";
+    RUN_TEST(test_glob_match);
+    RUN_TEST(test_scan_command);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

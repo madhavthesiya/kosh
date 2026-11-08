@@ -250,6 +250,42 @@ EXPIRY_CASES = {
     "RESP3": H3 + ALL + arr("PTTL", "k") + arr("SET", "k", "v") + arr("PERSIST", "k") + arr("DBSIZE"),
 }
 
+# Kosh and Redis hash keys differently, so SCAN returns keys in a different
+# order; each case keeps at most one key that could come back. Glob cases
+# set one key and ask whether MATCH lets it through.
+GLOB_PAIRS = [
+    ("h?llo", "hello"), ("h?llo", "hllo"), ("h*llo", "hllo"), ("h*llo", "heeeello"),
+    ("h[ae]llo", "hallo"), ("h[ae]llo", "hillo"), ("h[^e]llo", "hallo"), ("h[^e]llo", "hello"),
+    ("h[a-b]llo", "hbllo"), ("h[b-a]llo", "hbllo"), ("h\\*llo", "h*llo"), ("h\\*llo", "hello"),
+    ("[", "["), ("a[", "a"), ("a[^", "ab"), ("[\\]]", "]"), ("[a-]", "-"), ("[a-]", "a"),
+    ("a*", "a"), ("a**", "a"), ("*a", "a"), ("**", "x"), ("a*b*c", "abc"), ("a*b*c", "aXbYc"),
+    ("a*b*c", "acb"), ("\\", "\\"), ("abc\\", "abc\\"), (b"[a-\xff]", b"\x80"), (b"a?c", b"a\x00c"),
+    ("a*a*a*a*a*a*a*a*a*b", "a" * 40), ("", "x"), ("*x*", "axb"), ("[]a]", "a"), ("[!a]", "!"),
+    # The nesting limit: matches at 1,001 levels, not at 1,002 (Ubuntu's 7.0.15)
+    ("a*" * 1001, "a" * 1001), ("a*" * 1002, "a" * 1002),
+]
+GLOB_KEYS = list(dict.fromkeys([k for _, k in GLOB_PAIRS] + ["k", "l", "s"]))
+SCAN_CLEAR = fresh(*GLOB_KEYS)
+SCAN_CASES = {
+    "empty": SCAN_CLEAR + arr("SCAN", 0) + arr("SCAN", 0, "COUNT", 1000),
+    "one key": SCAN_CLEAR + arr("SET", "k", "v") + arr("SCAN", 0, "COUNT", 100),
+    "cursor forms": SCAN_CLEAR + arr("SCAN", "+0") + arr("SCAN", "-1") + arr("SCAN", "") + arr("SCAN", "18446744073709551615"),
+    "invalid cursors": arr("SCAN", "abc") + arr("SCAN", " 0") + arr("SCAN", "0 ") + arr("SCAN", "1x") + arr("SCAN", "18446744073709551616") + arr("SCAN", "0.5"),
+    "COUNT": SCAN_CLEAR + arr("SCAN", 0, "COUNT", 0) + arr("SCAN", 0, "COUNT", -1) + arr("SCAN", 0, "COUNT", "abc") + arr("SCAN", 0, "COUNT", "9223372036854775807") + arr("SCAN", 0, "COUNT"),
+    "unknown option, missing value": arr("SCAN", 0, "BOGUS", 1) + arr("SCAN", 0, "MATCH") + arr("SCAN", 0, "TYPE") + arr("SCAN", 0, "COUNT", 5, "MATCH"),
+    "options in any case and order": SCAN_CLEAR + arr("SET", "k", "v") + arr("scan", 0, "count", 50, "match", "k", "type", "STRING") + arr("SCAN", 0, "TYPE", "string", "MATCH", "nomatch", "MATCH", "k"),
+    "MATCH *": SCAN_CLEAR + arr("SET", "k", "v") + arr("SCAN", 0, "MATCH", "*", "COUNT", 100),
+    "TYPE": SCAN_CLEAR + arr("RPUSH", "l", "a") + arr("SCAN", 0, "TYPE", "list", "COUNT", 100) + arr("SCAN", 0, "TYPE", "LIST", "COUNT", 100) + arr("SCAN", 0, "TYPE", "string", "COUNT", 100) + arr("SCAN", 0, "TYPE", "bogus", "COUNT", 100),
+    "TYPE set and hash": SCAN_CLEAR + arr("SADD", "s", "m") + arr("SCAN", 0, "TYPE", "set", "COUNT", 100) + arr("SCAN", 0, "TYPE", "hash", "COUNT", 100),
+    "wrong arity": arr("SCAN"),
+    "inside MULTI": SCAN_CLEAR + M + arr("SET", "k", "v") + arr("SCAN", 0, "COUNT", 100) + arr("SCAN", "x") + E,
+    "RESP3": H3 + SCAN_CLEAR + arr("SET", "k", "v") + arr("SCAN", 0, "COUNT", 100),
+}
+for pattern, key in GLOB_PAIRS:
+    name = f"MATCH {pattern!r:.30} ({len(pattern)} bytes) on {key!r:.20} ({len(key)} bytes)"
+    assert name not in SCAN_CASES, name
+    SCAN_CASES[name] = SCAN_CLEAR + arr("SET", key, "v") + arr("SCAN", 0, "MATCH", pattern, "COUNT", 100)
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -264,6 +300,7 @@ GROUPS = {
     "DEL and EXISTS with several keys": (DEL_EXISTS_CASES, None),
     "MGET, MSET": (MGET_MSET_CASES, None),
     "PTTL, PEXPIRE, PERSIST, DBSIZE": (EXPIRY_CASES, None),
+    "SCAN": (SCAN_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why
@@ -339,7 +376,7 @@ COUNTED = [("SET", "a", "1"), ("GET", "a"), ("GET", "b"), ("EXISTS", "a"), ("EXI
            ("SISMEMBER", "s", "m"), ("SCARD", "s"), ("LLEN", "l"), ("HLEN", "h"), ("GET", "l"),
            ("NOPE",), ("GET",), ("MULTI",), ("GET", "a"), ("EXEC",), ("MGET", "a", "b", "l"),
            ("EXISTS", "a", "b", "a"), ("INCR", "n"), ("MSET", "x", 1, "y", 2), ("DEL", "x", "y", "z"),
-           ("SET", "e", "v", "PX", 50)]
+           ("SET", "e", "v", "PX", 50), ("SCAN", 0, "TYPE", "string", "COUNT", 100)]
 COUNTED_AFTER_EXPIRY = [("GET", "e"), ("DEL", "a"), ("LPOP", "l")]
 COUNTERS = ("total_commands_processed", "keyspace_hits", "keyspace_misses", "expired_keys")
 

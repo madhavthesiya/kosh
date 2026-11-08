@@ -117,14 +117,39 @@ class KeyTable {
         void forEach(F&& f) const {
             for(const Table* t : {&t0_, &t1_}) {
                 size_t first = (t == &t0_ && rehashing()) ? rehash_index_ : 0;
-                for(size_t i = first; t->buckets && i <= t->mask; i++) {
-                    for(const Bucket* b = &t->buckets[i]; b; b = childOf(b)) {
-                        for(unsigned s = 0; s < kSlots; s++) {
-                            if(b->meta >> s & 1) f(*static_cast<Entry*>(b->slots[s]));
-                        }
-                    }
-                }
+                for(size_t i = first; t->buckets && i <= t->mask; i++) visitChain(&t->buckets[i], f);
             }
+        }
+
+        // One step of SCAN, after Redis's dictScan (dict.c): calls f(Entry&)
+        // for each entry in the bucket chain the cursor names and, during a
+        // rehash, in every bucket of the new table that chain's keys go to.
+        // Returns the next cursor; 0 when the scan is complete.
+        //
+        // The cursor counts with its bits reversed, high bit first. Doubling
+        // the table adds one bit to the bucket index, at the top; counting
+        // from the top, the buckets already visited stay exactly the ones
+        // below the cursor, in the old table or the new. So an entry present
+        // for the whole scan is returned at least once, however the table
+        // grows between calls; an entry can come twice. Changes nothing, so it
+        // is safe under a shared lock.
+        template<typename F>
+        size_t scan(size_t cursor, F&& f) const {
+            if(!t0_.buckets) return 0;
+            if(!rehashing()) {
+                visitChain(&t0_.buckets[cursor & t0_.mask], f);
+                return nextCursor(cursor, t0_.mask);
+            }
+            // The table only grows, so t0_ is the smaller one
+            const size_t small = t0_.mask, large = t1_.mask;
+            const size_t i = cursor & small;
+            if(i >= rehash_index_) visitChain(&t0_.buckets[i], f);  // else moved (and maybe given back)
+            // Every bucket of t1_ whose low bits are i: the high bits count up
+            do {
+                visitChain(&t1_.buckets[cursor & large], f);
+                cursor = (((cursor | small) + 1) & ~small) | (cursor & small);
+            } while(cursor & (small ^ large));
+            return nextCursor(cursor, small);
         }
 
     private:
@@ -187,6 +212,34 @@ class KeyTable {
                 spares_ = static_cast<Bucket*>(b->slots[0]);
                 delete b;
             }
+        }
+
+        template<typename F>
+        static void visitChain(const Bucket* b, F& f) {
+            for(; b; b = childOf(b)) {
+                for(unsigned s = 0; s < kSlots; s++) {
+                    if(b->meta >> s & 1) f(*static_cast<Entry*>(b->slots[s]));
+                }
+            }
+        }
+
+        // The cursor after this one: add 1 at the top of the index bits.
+        // Setting the bits above the mask first makes the carry run off the
+        // end once every index has been visited, leaving 0.
+        static size_t nextCursor(size_t cursor, size_t mask) {
+            cursor |= ~mask;
+            cursor = reverseBits(cursor);
+            cursor++;
+            return reverseBits(cursor);
+        }
+        static size_t reverseBits(size_t v) {
+            size_t bits = 8 * sizeof(v);
+            size_t mask = ~size_t{0};
+            while((bits >>= 1) > 0) {
+                mask ^= mask << bits;
+                v = ((v >> bits) & mask) | ((v << bits) & ~mask);
+            }
+            return v;
         }
 
         static uint8_t tagOf(size_t h) { return static_cast<uint8_t>(h >> (8 * sizeof(size_t) - 8)); }

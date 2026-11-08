@@ -1,7 +1,10 @@
 #include "InMemoryStorage.h"
+#include "Glob.h"
 #include "Integer.h"
 #include "RespParser.h"
 #include <cassert>
+#include <cctype>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <new>
@@ -315,6 +318,50 @@ Result InMemoryStorage::persist(const std::string& key){
     setExpiry(e, std::nullopt);
     logAOF({"PERSIST", key});
     return Result::ok();
+}
+
+InMemoryStorage::ScanResult InMemoryStorage::scan(uint64_t cursor, long long count,
+                                                  const std::string* pattern, const std::string* type){
+    std::unique_lock lock(mutex_);      // it may remove expired keys
+    ScanResult result{0, {}};
+    // The keys are copied first and filtered after, as Redis does: removing an
+    // expired key changes the table, which mustn't happen mid-step
+    std::vector<std::string> keys;
+    long long steps = count > LLONG_MAX / 10 ? LLONG_MAX : count * 10;
+    size_t c = static_cast<size_t>(cursor);
+    do {
+        c = data_.scan(c, [&](const CacheEntry& e) { keys.emplace_back(e.key()); });
+    } while(c != 0 && steps-- && static_cast<long long>(keys.size()) < count);
+    result.cursor = c;
+
+    auto sameIgnoringCase = [](std::string_view a, std::string_view b) {
+        if(a.size() != b.size()) return false;
+        for(size_t i = 0; i < a.size(); i++) {
+            if(std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+        }
+        return true;
+    };
+    for(auto& key : keys) {
+        if(pattern && !globMatch(*pattern, key)) continue;
+        CacheEntry* e = data_.find(key);
+        if(type) {
+            // Redis looks the key up to read its type: a read, counted as a
+            // hit or a miss, and an expired key is removed on the way
+            const bool live = e && !isExpired(*e);
+            countRead(live);
+            if(e && !live) {
+                expireEntry(e);
+                e = nullptr;
+            }
+            if(!sameIgnoringCase(*type, e ? dataTypeToString(getDataType(*e)) : "none")) continue;
+        }
+        if(e && isExpired(*e)) {
+            expireEntry(e);
+            continue;
+        }
+        result.keys.push_back(std::move(key));
+    }
+    return result;
 }
 
 size_t InMemoryStorage::dbsize(){
