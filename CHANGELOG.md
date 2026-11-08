@@ -20,6 +20,11 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
   table grows between calls. `MATCH` takes Redis's glob patterns, matched
   as Redis matches them, with the same 1,000-level depth limit as the Redis
   7.0.15 Ubuntu ships.
+- `FLUSHALL` and `FLUSHDB` (`[ASYNC|SYNC]`; one database, so the same; served
+  synchronously), written to the AOF.
+- CI runs tair-opensource's resp-compatibility suite against Kosh, as a report.
+- GitHub Actions pinned by commit and Docker base images by digest, kept
+  current by Dependabot.
 
 ### Changed
 

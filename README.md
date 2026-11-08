@@ -520,6 +520,7 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 | `MGET`, `MSET` | 14 of 14 |
 | `PTTL`, `PEXPIRE`, `PERSIST`, `DBSIZE` (times already past, bad numbers, inside `MULTI`, RESP3) | 14 of 15; the other gives `PEXPIRE` an option, not supported |
 | `SCAN`: 36 `MATCH` patterns (ranges, escapes, unclosed brackets, NUL and high bytes, the depth limit), cursor forms, `COUNT`, `TYPE`, errors | 49 of 49 |
+| `FLUSHALL`, `FLUSHDB`: `SYNC`/`ASYNC`, bad arguments, an empty server, inside `MULTI`, RESP3 | 9 of 9 |
 | `INFO`'s counters after the same commands | 4 of 4 |
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
@@ -542,7 +543,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 - Keys are limited by `--maxkeys`, not `maxmemory`. The AOF is the only persistence: there are no RDB snapshots.
 - `BGREWRITEAOF` is refused inside `MULTI`.
 
-**Not supported yet:** `WATCH`, `KEYS`, `SSCAN`/`HSCAN`, `FLUSHALL`, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
+**Not supported yet:** `WATCH`, `KEYS`, `SSCAN`/`HSCAN`, `SELECT` (one database), sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
 
 ---
 
@@ -611,6 +612,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `HELLO` | `HELLO [2\|3] [AUTH default password] [SETNAME name]`: picks the connection's protocol, RESP2 (the default) or RESP3, can authenticate and name it, and describes the server. In RESP3, a missing value is `_`, `HGETALL` and `CONFIG GET` reply with maps, `SMEMBERS` with a set, and `INFO` with a verbatim string, as in Redis. |
 | `CLIENT` | `ID`, `GETNAME`, `SETNAME name`, `HELP`. Other subcommands get Redis's "unknown subcommand" error, which clients skip. |
 | `INFO` | `INFO [section ...]`: the server's state, in Redis's format and with its field names: Server, Clients, Memory (resident memory, the key limit), Persistence, Stats (connections, commands processed, ops per second, keyspace hits and misses, expired and evicted keys) and Keyspace. The counters count what Redis counts (checked on the same commands). There's no `redis_version`: Kosh isn't a complete Redis of any version, and tools decide what to send by it. |
+| `FLUSHALL`, `FLUSHDB` | `FLUSHALL [ASYNC\|SYNC]`: removes every key and gives the key table's memory back. Kosh has one database, so `FLUSHDB` does the same. Always at once: `ASYNC` is accepted and served synchronously. Written to the AOF, so a restart replays it. |
 | `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
 
@@ -654,7 +656,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**140 unit tests** (`tests/test_main.cpp`):
+**142 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -678,13 +680,14 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
 [Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
 [PTTL, PEXPIRE, PERSIST, DBSIZE] 2 tests ✅  (Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed)
-[SCAN]                  2 tests    ✅  (glob patterns as Redis matches them, an exponential pattern ending fast, a 100,000-deep pattern stopped, not crashing; a full iteration, MATCH, TYPE counted as reads, expired keys removed)
+[SCAN]                  2 tests    ✅  (glob patterns as Redis matches them, an exponential pattern ending fast, the 1,000-level depth limit; a full iteration, COUNT, MATCH, TYPE counted as reads, expired keys removed)
+[FLUSHALL, FLUSHDB]     2 tests    ✅  (Redis's replies; eviction works after, under SIEVE and LRU; logged as given and replayed)
 [INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 140 passed, 0 failed
+Results: 142 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -780,7 +783,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 140 unit tests
+    ├── test_main.cpp              # 142 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary
