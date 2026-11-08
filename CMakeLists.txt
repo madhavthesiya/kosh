@@ -82,6 +82,10 @@ add_executable(test_threads
 )
 target_link_libraries(test_threads Threads::Threads)
 
+# The queue between threads: exact behaviour, then two threads at full speed
+add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
+target_link_libraries(test_spsc_ring Threads::Threads)
+
 # Prints sizeof() of the storage types and the heap cost of one key (see bench/README.md)
 add_executable(memory_layout
     bench/memory_layout.cpp
@@ -141,6 +145,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(kosh-loadgen bench/loadgen.cpp)
     target_link_libraries(kosh-loadgen Threads::Threads)
     add_executable(test_loadgen tests/test_loadgen.cpp)
+    # What a cross-thread queue costs, and what each part of SpscRing buys (see bench/README.md)
+    add_executable(ring_bench bench/ring_bench.cpp)
+    target_link_libraries(ring_bench Threads::Threads)
 endif()
 
 # Fuzz target: client bytes through the parser and the command table
@@ -162,6 +169,7 @@ target_link_libraries(fuzz_commands Threads::Threads)
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+add_test(NAME spsc_ring_tests COMMAND test_spsc_ring)
 if(TARGET test_loadgen)
     add_test(NAME loadgen_unit_tests COMMAND test_loadgen)
 endif()
