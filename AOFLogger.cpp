@@ -264,7 +264,8 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
     }
     bool written = true;
     for(const auto& cmd : commands) {
-        if(!(written = writeAll(out, cmd.data(), cmd.size()) == cmd.size())) break;
+        written = writeAll(out, cmd.data(), cmd.size()) == cmd.size();
+        if(!written) break;
     }
     if(written) written = syncFile(out);
     int error = errno;

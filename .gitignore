@@ -3,7 +3,8 @@ build/
 build-*/
 *.o
 *.exe
-mini_redis
+kosh-cli
+kosh-server
 
 # IDE files
 .vscode/

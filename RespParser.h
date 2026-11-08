@@ -13,13 +13,21 @@
 
 // RESP (Redis Serialization Protocol) parser and serializer.
 //
-// RESP is a simple text-based protocol with 5 types:
+// RESP2 is a simple text-based protocol with 5 types:
 //   +OK\r\n              → Simple String
 //   -ERR message\r\n     → Error
 //   :42\r\n              → Integer
 //   $6\r\nfoobar\r\n     → Bulk String (length-prefixed binary-safe string)
 //   $-1\r\n              → Null Bulk String
 //   *3\r\n...            → Array of N elements
+//
+// RESP3, which a client asks for with HELLO 3, adds types for replies that
+// RESP2 spells as arrays and bulk strings (Kosh uses these):
+//   _\r\n                → Null
+//   %1\r\n<key><value>   → Map of N key/value pairs (HGETALL, CONFIG GET, HELLO)
+//   ~2\r\n...            → Set of N elements (SMEMBERS)
+//   =9\r\ntxt:hello\r\n  → Verbatim string: text meant for people (INFO)
+// Requests are the same arrays of bulk strings in both.
 //
 // Client sends commands as RESP arrays of bulk strings:
 //   SET name madhav  →  *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nmadhav\r\n
@@ -49,11 +57,20 @@ public:
 
     // Limits, matching Redis's defaults, so one client can't make the server
     // wait for or buffer an unbounded amount of data.
-    static constexpr size_t kMaxBulkLength = 512 * 1024 * 1024;  // proto-max-bulk-len
-    static constexpr size_t kMaxInlineLength = 64 * 1024;        // PROTO_INLINE_MAX_SIZE
+    static constexpr size_t kMaxBulkLength = size_t{512} * 1024 * 1024;  // proto-max-bulk-len
+    static constexpr size_t kMaxInlineLength = size_t{64} * 1024;        // PROTO_INLINE_MAX_SIZE
     // "*" or "$", a 64-bit number and "\r\n" need at most 23 bytes, so a longer
     // header line without "\r\n" is an error, not something to wait for.
     static constexpr size_t kMaxHeaderLength = 32;
+
+    // Until a client has given the password, its commands may have at most 10
+    // arguments of at most 16 KB, more than AUTH needs. Without these limits a
+    // client that doesn't know the password could still make the server
+    // buffer up to the 1 GB query limit for it, on every connection. Redis has
+    // the same two limits (added in 6.2.6, the release that fixed
+    // CVE-2021-32675, a denial of service from many-element requests).
+    static constexpr size_t kMaxUnauthenticatedArgs = 10;
+    static constexpr size_t kMaxUnauthenticatedBulk = size_t{16} * 1024;
 
     // What parseInto() found; the arguments themselves are in the caller's vector
     struct Parsed {
@@ -72,21 +89,26 @@ public:
     // too long for the small-string buffer: 3 allocations for "GET <16-byte
     // key>".) Arguments are copied only once the whole command has arrived, so
     // a command that arrives in many pieces isn't copied again each time.
-    static Parsed parseInto(std::string_view buffer, std::vector<std::string>& args) {
+    //
+    // `authenticated`: false while the client still owes the password, which
+    // applies the kMaxUnauthenticated* limits, checked as each header arrives.
+    // (An inline command is at most 64 KB either way.)
+    static Parsed parseInto(std::string_view buffer, std::vector<std::string>& args,
+                            bool authenticated = true) {
         if(buffer.empty()) return needMore();
 
         // RESP commands start with '*' (array). Anything else is inline.
         if(buffer[0] == '*') {
-            return parseRespInto(buffer, args);
+            return parseRespInto(buffer, args, authenticated);
         }
         return parseInlineInto(buffer, args);
     }
 
     // The same, with the arguments in a vector of their own (exactly argc of
     // them): for tests and tools, where an allocation doesn't matter.
-    static ParseResult parse(std::string_view buffer) {
+    static ParseResult parse(std::string_view buffer, bool authenticated = true) {
         std::vector<std::string> args;
-        Parsed parsed = parseInto(buffer, args);
+        Parsed parsed = parseInto(buffer, args, authenticated);
         ParseResult r;
         r.status = parsed.status;
         r.consumed = parsed.consumed;
@@ -190,8 +212,29 @@ public:
         out += "\r\n";
     }
 
-    static void appendNull(std::string& out) {
-        out += "$-1\r\n";
+    // The replies whose type depends on the connection's protocol (2 or 3).
+    // There is deliberately no form without it: a reply written without
+    // asking which protocol the client speaks would be wrong for one of them.
+    static void appendNull(std::string& out, int protocol) {
+        out += protocol == 3 ? "_\r\n" : "$-1\r\n";
+    }
+    // A map of `pairs` keys and values follows; RESP2 sends them as a flat
+    // array of 2 * pairs elements
+    static void appendMapLength(std::string& out, size_t pairs, int protocol) {
+        if(protocol == 3) appendLength(out, '%', pairs);
+        else appendLength(out, '*', 2 * pairs);
+    }
+    static void appendSetLength(std::string& out, size_t n, int protocol) {
+        appendLength(out, protocol == 3 ? '~' : '*', n);
+    }
+    // Text for people: RESP3's verbatim string, whose payload starts with the
+    // 3-letter format "txt" and a colon; a bulk string in RESP2
+    static void appendVerbatim(std::string& out, std::string_view text, int protocol) {
+        if(protocol != 3) return appendBulk(out, text);
+        appendLength(out, '=', text.size() + 4);
+        out += "txt:";
+        out.append(text);
+        out += "\r\n";
     }
 
 private:
@@ -246,7 +289,8 @@ private:
     }
 
     // Parse a RESP array: *N\r\n followed by N bulk strings
-    static Parsed parseRespInto(std::string_view buffer, std::vector<std::string>& args) {
+    static Parsed parseRespInto(std::string_view buffer, std::vector<std::string>& args,
+                                bool authenticated) {
         // Step 1: Read array header  *N\r\n
         long long count = 0;
         size_t pos = 0;
@@ -254,6 +298,9 @@ private:
         if(header == ParseStatus::NeedMore) return needMore();
         if(header == ParseStatus::Error || count > INT_MAX) {
             return protocolError("invalid multibulk length");
+        }
+        if(!authenticated && count > static_cast<long long>(kMaxUnauthenticatedArgs)) {
+            return protocolError("unauthenticated multibulk length");
         }
         if(count <= 0) {   // "*0" or "*-1": nothing to run; Redis ignores these too
             return ok(0, pos);
@@ -275,6 +322,9 @@ private:
             if(header == ParseStatus::Error || len < 0 ||
                static_cast<unsigned long long>(len) > kMaxBulkLength) {
                 return protocolError("invalid bulk length");
+            }
+            if(!authenticated && static_cast<unsigned long long>(len) > kMaxUnauthenticatedBulk) {
+                return protocolError("unauthenticated bulk length");
             }
 
             // Check we have enough data: len bytes + \r\n

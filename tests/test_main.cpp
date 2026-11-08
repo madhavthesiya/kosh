@@ -19,10 +19,12 @@
 #endif
 #include "../Poller.h"
 #include "../KeyTable.h"
+#include "../SipHash.h"
 #include "../InMemoryStorage.h"
 #include "../RedisLite.h"
 #include "../RespParser.h"
 #include "../Commands.h"
+#include "../Integer.h"
 
 int passed = 0;
 int failed = 0;
@@ -315,6 +317,113 @@ TEST(test_keytable_big_table_given_back) {
         checked = true;
     }
     ASSERT_TRUE(checked);
+}
+
+// ==================== SipHash ====================
+
+TEST(test_siphash24_reference_vectors) {
+    // The 64 test vectors of the reference implementation (github.com/veorq/
+    // SipHash, vectors.h): key 00 01 .. 0f, message i = bytes 00 01 .. i-1
+    static const uint64_t expected[64] = {
+        0x726fdb47dd0e0e31ull, 0x74f839c593dc67fdull, 0x0d6c8009d9a94f5aull,
+        0x85676696d7fb7e2dull, 0xcf2794e0277187b7ull, 0x18765564cd99a68dull,
+        0xcbc9466e58fee3ceull, 0xab0200f58b01d137ull, 0x93f5f5799a932462ull,
+        0x9e0082df0ba9e4b0ull, 0x7a5dbbc594ddb9f3ull, 0xf4b32f46226bada7ull,
+        0x751e8fbc860ee5fbull, 0x14ea5627c0843d90ull, 0xf723ca908e7af2eeull,
+        0xa129ca6149be45e5ull, 0x3f2acc7f57c29bdbull, 0x699ae9f52cbe4794ull,
+        0x4bc1b3f0968dd39cull, 0xbb6dc91da77961bdull, 0xbed65cf21aa2ee98ull,
+        0xd0f2cbb02e3b67c7ull, 0x93536795e3a33e88ull, 0xa80c038ccd5ccec8ull,
+        0xb8ad50c6f649af94ull, 0xbce192de8a85b8eaull, 0x17d835b85bbb15f3ull,
+        0x2f2e6163076bcfadull, 0xde4daaaca71dc9a5ull, 0xa6a2506687956571ull,
+        0xad87a3535c49ef28ull, 0x32d892fad841c342ull, 0x7127512f72f27cceull,
+        0xa7f32346f95978e3ull, 0x12e0b01abb051238ull, 0x15e034d40fa197aeull,
+        0x314dffbe0815a3b4ull, 0x027990f029623981ull, 0xcadcd4e59ef40c4dull,
+        0x9abfd8766a33735cull, 0x0e3ea96b5304a7d0ull, 0xad0c42d6fc585992ull,
+        0x187306c89bc215a9ull, 0xd4a60abcf3792b95ull, 0xf935451de4f21df2ull,
+        0xa9538f0419755787ull, 0xdb9acddff56ca510ull, 0xd06c98cd5c0975ebull,
+        0xe612a3cb9ecba951ull, 0xc766e62cfcadaf96ull, 0xee64435a9752fe72ull,
+        0xa192d576b245165aull, 0x0a8787bf8ecb74b2ull, 0x81b3e73d20b49b6full,
+        0x7fa8220ba3b2eceaull, 0x245731c13ca42499ull, 0xb78dbfaf3a8d83bdull,
+        0xea1ad565322a1a0bull, 0x60e61c23a3795013ull, 0x6606d7e446282b93ull,
+        0x6ca4ecb15c5f91e1ull, 0x9f626da15c9625f3ull, 0xe51b38608ef25f57ull,
+        0x958a324ceb064572ull,
+    };
+    const uint64_t k0 = 0x0706050403020100ull, k1 = 0x0f0e0d0c0b0a0908ull;
+    unsigned char message[64];
+    for(int i = 0; i < 64; i++) message[i] = static_cast<unsigned char>(i);
+    for(int len = 0; len < 64; len++) {
+        ASSERT_EQ((sipHash<2, 4>(k0, k1, message, static_cast<size_t>(len))), expected[len]);
+    }
+}
+
+TEST(test_siphash13_matches_cpython) {
+    // CPython hashes bytes with SipHash-1-3, and PYTHONHASHSEED=0 makes its key
+    // all zeros: these are hash(b) & (2**64 - 1) from Python 3.12, an
+    // implementation independent of this one. (Python hashes b"" to 0 without
+    // SipHash, so it isn't compared. And python3 -I or -E would ignore
+    // PYTHONHASHSEED and hash with a random key: values from such a run
+    // differ every time.)
+    unsigned char bytes[63];
+    for(int i = 0; i < 63; i++) bytes[i] = static_cast<unsigned char>(i);
+    const std::string hundred(100, 'x');
+    struct Case { const void* data; size_t len; uint64_t expected; };
+    const Case cases[] = {
+        {"a", 1, 0x407448d2b89b1813ull},
+        {"abc", 3, 0xc03bc3a0042630f2ull},
+        {"key:000000000001", 16, 0x789c96b712070d0aull},
+        {bytes, 7, 0x2f098ab0c751325aull},
+        {bytes, 8, 0xead411e67ebe2eeaull},
+        {bytes, 15, 0xf30eb725bb91c9eaull},
+        {bytes, 63, 0x385d3e39e5f37359ull},
+        {hundred.data(), 100, 0x12de6d6e12e5750cull},
+    };
+    for(const auto& c : cases) ASSERT_EQ((sipHash<1, 3>(0, 0, c.data, c.len)), c.expected);
+}
+
+TEST(test_keyed_hash_depends_on_the_key) {
+    // Different keys scatter the same strings differently; the same key
+    // always gives the same hash
+    SipKey a = SipKey::random(), b = SipKey::random();
+    ASSERT_TRUE(a.k0 != b.k0 || a.k1 != b.k1);   // 128 random bits each
+    KeyedHash ha{a}, hb{b}, ha_again{a};
+    int same = 0;
+    for(int i = 0; i < 100; i++) {
+        std::string key = "key:" + std::to_string(i);
+        ASSERT_EQ(ha(key), ha_again(key));
+        same += ha(key) == hb(key);
+    }
+    ASSERT_EQ(same, 0);
+
+    // And a table works with it
+    KeyTable<TableEntry, TableKeyOf, KeyedHash> t(ha);
+    std::vector<TableEntry> entries(1000);
+    for(int i = 0; i < 1000; i++) {
+        entries[i].key = "k" + std::to_string(i);
+        t.insert(&entries[i]);
+    }
+    for(int i = 0; i < 1000; i++) ASSERT_TRUE(t.find(entries[i].key) == &entries[i]);
+}
+
+TEST(test_tables_hash_with_their_own_key) {
+    // A table hashes with the hasher it was given, not a default-constructed
+    // one (which, for KeyedHash, would be the all-zero key every process shares)
+    SipKey key = SipKey::random();
+    KeyTable<TableEntry, TableKeyOf, KeyedHash> t{KeyedHash{key}};
+    ASSERT_EQ(t.hashOf("some key"), KeyedHash{key}("some key"));
+    ASSERT_TRUE(t.hashOf("some key") != KeyedHash{}("some key"));
+
+    // Every storage draws its own random key, so no one can precompute a
+    // collision that works on all of them
+    InMemoryStorage a(10), b(10);
+    int same = 0;
+    for(int i = 0; i < 100; i++) {
+        std::string k = "key:" + std::to_string(i);
+        ASSERT_EQ(a.hashOf(k), a.hashOf(k));
+        same += a.hashOf(k) == b.hashOf(k);
+        ASSERT_TRUE(a.hashOf(k) != KeyedHash{}(k));
+        ASSERT_TRUE(a.hashOf(k) != std::hash<std::string_view>{}(k));
+    }
+    ASSERT_EQ(same, 0);
 }
 
 // ==================== SIEVE Eviction ====================
@@ -1410,18 +1519,15 @@ TEST(test_aof_logs_absolute_expiry_times) {
     std::remove(aof_file.c_str());
 }
 
-TEST(test_aof_expiry_is_absolute) {
-    // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
-    // so every restart gave keys their full TTL again, even keys that had
-    // already expired. They must expire at the same moment after a restart.
-    //
-    // The AOF holds wall-clock times, but this test waits on the monotonic
-    // clock, so a step of the wall clock during the wait shifts the result.
-    // WSL2 steps it when it resyncs with Windows (its journal logs "Time
-    // jumped backwards"). With 1 s TTLs and a 1.1 s wait, a step back of over
-    // 100 ms made this fail once; 200 ms TTLs leave a 900 ms margin.
+int64_t wallMinusMonotonicMs();     // defined with the randomized replay test below
+
+// One run of test_aof_expiry_is_absolute. False if the wall clock was stepped
+// during it: the AOF holds wall-clock times, but the wait is on the monotonic
+// clock, so a step shifts the result and the run proves nothing.
+bool absoluteExpiryHolds() {
     const std::string aof_file = "test_aof_absolute.aof";
     std::remove(aof_file.c_str());
+    const int64_t offset = wallMinusMonotonicMs();
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
@@ -1434,6 +1540,11 @@ TEST(test_aof_expiry_is_absolute) {
         s.set("long", "v", 100);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // As in checkReplayMatchesLive: beyond 10 ms, the wall clock was stepped
+    if(std::llabs(wallMinusMonotonicMs() - offset) > 10) {
+        std::remove(aof_file.c_str());
+        return false;
+    }
     {
         AOFLogger aof(aof_file);
         InMemoryStorage s(10, &aof);
@@ -1447,6 +1558,23 @@ TEST(test_aof_expiry_is_absolute) {
         ASSERT_TRUE(remaining >= 97 && remaining <= 99);
     }
     std::remove(aof_file.c_str());
+    return true;
+}
+
+TEST(test_aof_expiry_is_absolute) {
+    // TTLs used to be logged as relative seconds ("SETEX k 1 v", "EXPIRE k 1"),
+    // so every restart gave keys their full TTL again, even keys that had
+    // already expired. They must expire at the same moment after a restart.
+    //
+    // WSL2 steps the wall clock when it resyncs (its journal logs "Time
+    // jumped backwards", and systemd-timesyncd steps it right after WSL
+    // starts). 200 ms TTLs and a 1.1 s wait left a 900 ms margin, and a step
+    // still broke it once, on 2026-11-04, a minute after WSL started. So a
+    // run during which the clock was stepped doesn't count, and runs again.
+    for(int attempt = 0; attempt < 5; attempt++) {
+        if(absoluteExpiryHolds()) return;
+    }
+    throw std::runtime_error("the wall clock was stepped during 5 runs in a row");
 }
 
 TEST(test_aof_old_relative_records_still_load) {
@@ -1631,7 +1759,7 @@ int64_t wallMinusMonotonicMs() {
 // step. So a mismatch is a failure only if the wall clock held steady; if it
 // was stepped, this returns false and the caller runs the seed again. Measured
 // after every command, so a step anywhere in the run is seen.
-bool checkReplayMatchesLive(unsigned seed, int ops) {
+bool checkReplayMatchesLive(unsigned seed, int ops, EvictionPolicy policy) {
     const std::string aof_file = "test_aof_random.aof";
     std::remove(aof_file.c_str());
     std::mt19937 rng(seed);
@@ -1646,12 +1774,13 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
     };
     {
         AOFLogger aof(aof_file);
-        InMemoryStorage s(5, &aof);
+        InMemoryStorage s(5, &aof, policy);
         CommandContext ctx{s, &aof};
         for(int i = 0; i < ops; i++) {
             std::string key = "k" + std::to_string(pick(8));
             std::string value(1, static_cast<char>('a' + pick(4)));
-            switch(pick(16)) {
+            std::string other = "k" + std::to_string(pick(8));
+            switch(pick(23)) {
                 case 0:  executeCommand(ctx, {"SET", key, value}); break;
                 case 1:  executeCommand(ctx, {"SET", key, value, "PX", std::to_string(1 + pick(20))}); break;
                 case 2:  executeCommand(ctx, {"SET", key, value, "EX", "1000"}); break;
@@ -1669,6 +1798,14 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                 case 13: executeCommand(ctx, {"HSET", key, value, std::to_string(i)}); break;
                 case 14: executeCommand(ctx, {"HDEL", key, value}); break;
                 case 15: if(pick(25) == 0) executeCommand(ctx, {"BGREWRITEAOF"}); break;
+                case 16: executeCommand(ctx, {"SET", key, std::to_string(pick(5))}); break;   // for INCR
+                case 17: executeCommand(ctx, {"INCR", key}); break;
+                case 18: executeCommand(ctx, {pick(2) ? "INCRBY" : "DECRBY", key, std::to_string(pick(7) - 3)}); break;
+                case 19: executeCommand(ctx, {"DEL", key, other, "k" + std::to_string(pick(8))}); break;
+                case 20: executeCommand(ctx, {"EXISTS", key, other}); break;
+                case 21: executeCommand(ctx, {"MSET", key, value, other, std::to_string(i),     // up to 3 new keys
+                                              "k" + std::to_string(pick(8)), value}); break;
+                case 22: executeCommand(ctx, {"MGET", key, other}); break;
             }
             trackClock();
             if(i % 40 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -1680,7 +1817,7 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
     }
     {
         AOFLogger aof(aof_file);
-        InMemoryStorage s(5, &aof);
+        InMemoryStorage s(5, &aof, policy);
         auto loaded = replayAOF(s, aof);
         if(!loaded.ok || loaded.truncated_bytes > 0) {
             throw std::runtime_error("seed " + std::to_string(seed) + ": the AOF didn't load cleanly: " + loaded.error);
@@ -1704,7 +1841,8 @@ bool checkReplayMatchesLive(unsigned seed, int ops) {
                     std::llabs(l->second.expiry - r->second.expiry) <= 50;   // clock reads differ by a ms or so
         if(same) continue;
         if(clock_stepped) return false;     // not a valid run: the caller runs it again
-        throw std::runtime_error("seed " + std::to_string(seed) + ", key " + key + ": live " +
+        throw std::runtime_error("seed " + std::to_string(seed) +
+                                 (policy == EvictionPolicy::SIEVE ? " (sieve)" : " (lru)") + ", key " + key + ": live " +
                                  describe(live, key) + ", replayed " + describe(replayed, key));
     }
     return true;
@@ -1714,13 +1852,16 @@ TEST(test_aof_replay_matches_live_randomized) {
     // RANDOM_TEST_SEEDS=<n> runs more seeds than the default 4 (each ~0.2 s)
     unsigned seeds = 4;
     if(const char* n = std::getenv("RANDOM_TEST_SEEDS")) seeds = static_cast<unsigned>(std::atoi(n));
+    // Both policies: which key an eviction picks decides where its DEL lands
+    // in the AOF, and LRU alone hid an ordering bug SIEVE showed (MSET)
+    for(EvictionPolicy policy : {EvictionPolicy::LRU, EvictionPolicy::SIEVE})
     for(unsigned seed = 1; seed <= seeds; seed++) {
         // A run that mismatched while the wall clock was stepped proves nothing
         // either way; the same seed (the same commands) runs again. WSL2 steps
         // the clock every 30 s and a run takes well under a second, so a rerun
         // nearly always has a steady clock.
         int attempts = 1;
-        while(!checkReplayMatchesLive(seed, 2500)) {
+        while(!checkReplayMatchesLive(seed, 2500, policy)) {
             if(++attempts > 5) {
                 throw std::runtime_error("seed " + std::to_string(seed) +
                                          ": the wall clock was stepped during 5 runs in a row");
@@ -1866,10 +2007,26 @@ TEST(test_dispatch_checks_arity) {
 TEST(test_dispatch_unknown_command) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
-    ASSERT_EQ(executeCommand(ctx, {"NOPE", "x"}), "-ERR unknown command 'NOPE'\r\n");
+    // Redis 7.0.15's replies to the same commands, byte for byte
+    const std::string prefix = "-ERR unknown command '";
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), prefix + "NOPE', with args beginning with: \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", "a", "b"}), prefix + "NOPE', with args beginning with: 'a' 'b' \r\n");
     // Longer than any command: rejected without upper-casing a copy; 128 bytes quoted
     ASSERT_EQ(executeCommand(ctx, {std::string(1000, 'x')}),
-              "-ERR unknown command '" + std::string(128, 'x') + "'\r\n");
+              prefix + std::string(128, 'x') + "', with args beginning with: \r\n");
+    // Arguments are quoted until 128 bytes of them are written
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", std::string(200, 'x')}),
+              prefix + "NOPE', with args beginning with: '" + std::string(128, 'x') + "' \r\n");
+    std::vector<std::string> many(21, "abcdefghij");
+    many[0] = "NOPE";
+    std::string ten;
+    for(int i = 0; i < 10; i++) ten += "'abcdefghij' ";
+    ASSERT_EQ(executeCommand(ctx, many), prefix + "NOPE', with args beginning with: " + ten + "\r\n");
+    // Each part stops at a NUL byte, as C's %s does; line breaks become spaces
+    ASSERT_EQ(executeCommand(ctx, {std::string("NO\0PE", 5), std::string("a\0b", 3)}),
+              prefix + "NO', with args beginning with: 'a' \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"NOPE", "line\r\nbreak"}),
+              prefix + "NOPE', with args beginning with: 'line  break' \r\n");
     ASSERT_TRUE(lookupCommand("\xff\xfe") == nullptr);
 }
 
@@ -1899,7 +2056,17 @@ TEST(test_dispatch_appends_replies) {
     executeCommand(ctx, {"NOSUCH"}, out);
     ASSERT_EQ(out, "+earlier reply\r\n+OK\r\n$100\r\n" + std::string(100, 'v') + "\r\n$-1\r\n"
                    "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-                   "-ERR unknown command 'NOSUCH'\r\n");
+                   "-ERR unknown command 'NOSUCH', with args beginning with: \r\n");
+}
+
+TEST(test_dispatch_ping) {
+    // Redis 7.0.15's replies: a message comes back as a bulk string
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", "hi"}), "$2\r\nhi\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", ""}), "$0\r\n\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PING", "a", "b"}), "-ERR wrong number of arguments for 'ping' command\r\n");
 }
 
 TEST(test_dispatch_quit_closes_connection) {
@@ -1950,10 +2117,34 @@ TEST(test_dispatch_set_rejects_bad_options) {
     ASSERT_FALSE(s.exists("k").success);        // nothing was stored
 }
 
+TEST(test_parse_int64_reads_as_redis) {
+    // Redis's string2ll: only the canonical form of a number is one
+    int64_t v = 42;
+    for(const char* ok : {"0", "5", "-5", "10", "9223372036854775807", "-9223372036854775808"}) {
+        if(!parseInt64(ok, v) || std::to_string(v) != ok) throw std::runtime_error(std::string("rejected ") + ok);
+    }
+    for(const char* bad : {"", "-", "05", "-0", "00", "-05", "+5", " 5", "5 ", "5x", "1.5", "--5", "0x10",
+                           "9223372036854775808", "-9223372036854775809", "00000000000000000009",
+                           "100000000000000000000"}) {
+        if(parseInt64(bad, v)) throw std::runtime_error(std::string("accepted '") + bad + "'");
+    }
+    // A long argument is refused by its length, before any digit is read
+    ASSERT_FALSE(parseInt64(std::string(1 << 20, '1'), v));
+}
+
 TEST(test_dispatch_strict_integer_arguments) {
     InMemoryStorage s(10);
     CommandContext ctx{s};
     const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    // Non-canonical forms are refused, as Redis 7.0.15 refuses them (from_chars accepted them)
+    executeCommand(ctx, {"SET", "k", "v"});
+    for(const char* bad : {"010", "-0", "+5", " 5"}) {
+        ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "k", bad}), not_int);
+        ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v", "EX", bad}), not_int);
+    }
+    ASSERT_EQ(s.ttl("k").value, "-1");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "03"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    executeCommand(ctx, {"DEL", "k"});
     // SETEX: a TTL of 0 used to store the key without one; std::stoi read "10abc" as 10
     ASSERT_EQ(executeCommand(ctx, {"SETEX", "k", "0", "v"}),
               "-ERR invalid expire time in 'setex' command\r\n");
@@ -1972,6 +2163,7 @@ TEST(test_dispatch_strict_integer_arguments) {
 
     executeCommand(ctx, {"RPUSH", "l", "a", "b"});
     ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "1x"}), not_int);
+    ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "01", "1"}), not_int);
     ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "99999999999"}),     // past INT_MAX
               "*2\r\n$1\r\na\r\n$1\r\nb\r\n");
 }
@@ -2003,14 +2195,728 @@ TEST(test_dispatch_write_flags) {
     // Replay runs only commands flagged as writes, so the flags decide what an AOF
     // can contain: every command that changes data needs one, no read may have one
     for(const char* name : {"SET", "SETEX", "DEL", "EXPIRE", "PEXPIREAT", "LPUSH", "RPUSH",
-                            "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL"}) {
+                            "LPOP", "RPOP", "SADD", "SREM", "HSET", "HDEL",
+                            "INCR", "DECR", "INCRBY", "DECRBY"}) {
         ASSERT_TRUE(lookupCommand(name) && (lookupCommand(name)->flags & kCmdWrite));
+        ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
     }
     for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
                             "SISMEMBER", "SCARD", "HGET", "HGETALL", "HLEN", "PING", "INFO",
-                            "BGREWRITEAOF"}) {
+                            "BGREWRITEAOF", "AUTH", "QUIT"}) {
         ASSERT_TRUE(lookupCommand(name) && !(lookupCommand(name)->flags & kCmdWrite));
     }
+    // Only these run without the password; a data command flagged by mistake
+    // would be open to anyone who can connect
+    for(const char* name : {"GET", "EXISTS", "TYPE", "TTL", "LRANGE", "LLEN", "SMEMBERS",
+                            "SISMEMBER", "SCARD", "HGET", "HGETALL", "HLEN", "PING", "INFO",
+                            "BGREWRITEAOF", "COMMAND", "CLIENT", "CONFIG"}) {
+        ASSERT_FALSE(lookupCommand(name)->flags & kCmdNoAuth);
+    }
+    ASSERT_TRUE(lookupCommand("AUTH")->flags & kCmdNoAuth);
+    ASSERT_TRUE(lookupCommand("HELLO")->flags & kCmdNoAuth);   // it can carry the AUTH
+    ASSERT_TRUE(lookupCommand("QUIT")->flags & kCmdNoAuth);
+}
+
+// ==================== Authentication ====================
+
+const std::string kNoAuth = "-NOAUTH Authentication required.\r\n";
+const std::string kWrongPass = "-WRONGPASS invalid username-password pair or user is disabled.\r\n";
+
+TEST(test_constant_time_equals) {
+    ASSERT_TRUE(constantTimeEquals("s3cret", "s3cret"));
+    ASSERT_FALSE(constantTimeEquals("x3cret", "s3cret"));    // first byte differs
+    ASSERT_FALSE(constantTimeEquals("s3cres", "s3cret"));    // last byte differs
+    ASSERT_FALSE(constantTimeEquals("s3cre", "s3cret"));     // a prefix
+    ASSERT_FALSE(constantTimeEquals("s3cret!", "s3cret"));   // longer
+    ASSERT_FALSE(constantTimeEquals("", "s3cret"));
+    // Zero padding can't make different lengths equal
+    ASSERT_FALSE(constantTimeEquals(std::string("s3cret\0", 7), "s3cret"));
+    const std::string longest(kMaxPasswordLength, 'p');
+    ASSERT_TRUE(constantTimeEquals(longest, longest));
+    ASSERT_FALSE(constantTimeEquals(longest + "p", longest));
+    std::string last_differs = longest;
+    last_differs.back() = 'q';
+    ASSERT_FALSE(constantTimeEquals(last_differs, longest));
+    // Every byte value counts, including those above 0x7f
+    ASSERT_FALSE(constantTimeEquals("\xff", "\x7f"));
+}
+
+TEST(test_auth_required_before_commands) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), kNoAuth);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), kNoAuth);
+    ASSERT_FALSE(s.exists("k").success);                 // nothing ran
+    ASSERT_EQ(executeCommand(ctx, {"CONFIG", "GET", "x"}), kNoAuth);
+    // As in Redis, unknown commands and wrong arities are reported first
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE', with args beginning with: \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET"}), "-ERR wrong number of arguments for 'get' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH"}), "-ERR wrong number of arguments for 'auth' command\r\n");
+
+    // Wrong passwords and users, Redis's replies word for word
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "s3cre"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "s3cret!"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "nobody", "s3cret"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "DEFAULT", "s3cret"}), kWrongPass);   // case-sensitive
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "s3cret", "x"}), "-ERR syntax error\r\n");
+    ASSERT_FALSE(ctx.authenticated);
+
+    ASSERT_EQ(executeCommand(ctx, {"auth", "s3cret"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), "+OK\r\n");
+    // A failed AUTH afterwards changes nothing, as in Redis
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "k"}), "$1\r\nv\r\n");
+
+    // The form with a user name
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "s3cret"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+}
+
+TEST(test_quit_needs_no_auth) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    ASSERT_EQ(executeCommand(ctx, {"QUIT"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.close_connection);
+}
+
+TEST(test_auth_without_a_password) {
+    // No password: every client is authenticated, and AUTH answers as Redis does
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "x"}),
+              "-ERR AUTH <password> called without any password configured for the default "
+              "user. Are you sure your configuration is correct?\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "default", "anything"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"AUTH", "nobody", "x"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), "+PONG\r\n");
+}
+
+// ==================== Transactions ====================
+// Expected bytes are Redis 7.0.15's for the same commands
+
+TEST(test_transactions_queue_and_run) {
+    InMemoryStorage s(10);
+    Transaction tx;
+    CommandContext ctx{s};
+    ctx.transaction = &tx;
+    ASSERT_EQ(executeCommand(ctx, {"MULTI"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SET", "k", "v"}), "+QUEUED\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"GET", "k"}), "+QUEUED\r\n");
+    ASSERT_FALSE(s.exists("k").success);                    // nothing ran yet
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*2\r\n+OK\r\n$1\r\nv\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"multi"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"exec"}), "*0\r\n");     // empty
+    // A command that fails as it runs doesn't stop the others: no rollback
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "l", "x"});
+    executeCommand(ctx, {"LPUSH", "l", "a"});
+    executeCommand(ctx, {"GET", "l"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*3\r\n+OK\r\n-WRONGTYPE Operation against a key holding "
+                                             "the wrong kind of value\r\n$1\r\nx\r\n");
+    // DISCARD drops the queue
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "d", "1"});
+    ASSERT_EQ(executeCommand(ctx, {"DISCARD"}), "+OK\r\n");
+    ASSERT_FALSE(s.exists("d").success);
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DISCARD"}), "-ERR DISCARD without MULTI\r\n");
+    // HELLO runs at EXEC, and the replies after it in the same EXEC are RESP3
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"HELLO", "3"});
+    executeCommand(ctx, {"GET", "missing"});
+    std::string replies = executeCommand(ctx, {"EXEC"});
+    ASSERT_EQ(replies.substr(0, 8), "*2\r\n%7\r\n");
+    ASSERT_EQ(replies.substr(replies.size() - 3), "_\r\n");
+    // QUIT runs at once, even inside MULTI
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"QUIT"}), "+OK\r\n");
+    ASSERT_TRUE(ctx.close_connection);
+}
+
+TEST(test_transactions_abort) {
+    InMemoryStorage s(10);
+    Transaction tx;
+    CommandContext ctx{s};
+    ctx.transaction = &tx;
+    const std::string execabort = "-EXECABORT Transaction discarded because of previous errors.\r\n";
+    // A command refused while queuing aborts the whole transaction
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_EQ(executeCommand(ctx, {"NOPE"}), "-ERR unknown command 'NOPE', with args beginning with: \r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    ASSERT_FALSE(s.exists("k").success);
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");    // and it's gone
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"GET"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"MULTI", "x"}), "-ERR wrong number of arguments for 'multi' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    // Not allowed inside a transaction (in Kosh: a foreground rewrite would split it in the AOF)
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"BGREWRITEAOF"}), "-ERR Command not allowed inside a transaction\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), execabort);
+    // A nested MULTI is an error, but doesn't abort
+    executeCommand(ctx, {"MULTI"});
+    ASSERT_EQ(executeCommand(ctx, {"MULTI"}), "-ERR MULTI calls can not be nested\r\n");
+    executeCommand(ctx, {"PING"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "*1\r\n+PONG\r\n");
+    // An EXEC refused itself discards, saying why
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_EQ(executeCommand(ctx, {"EXEC", "x"}),
+              "-EXECABORT Transaction discarded because of: ERR wrong number of arguments for 'exec' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXEC"}), "-ERR EXEC without MULTI\r\n");
+    ASSERT_FALSE(s.exists("k").success);
+
+    // Before AUTH: MULTI is refused, and EXEC says why
+    const std::string password = "s3cret";
+    CommandContext locked{s};
+    locked.transaction = &tx;
+    locked.password = &password;
+    locked.authenticated = false;
+    ASSERT_EQ(executeCommand(locked, {"MULTI"}), kNoAuth);
+    ASSERT_EQ(executeCommand(locked, {"EXEC"}),
+              "-EXECABORT Transaction discarded because of: NOAUTH Authentication required.\r\n");
+}
+
+TEST(test_transactions_in_the_aof) {
+    // A transaction that writes is logged between MULTI and EXEC; one that
+    // only reads isn't logged at all
+    const std::string aof_file = "test_aof_transactions.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        Transaction tx;
+        CommandContext ctx{s, &aof};
+        ctx.transaction = &tx;
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"MULTI"}, {"SET", "a", "1"}, {"SET", "b", "2"}, {"EXEC"},
+                {"MULTI"}, {"GET", "a"}, {"EXEC"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    std::string bytes;
+    {
+        AOFLogger aof(aof_file);
+        bytes = aof.readRaw();
+    }
+    ASSERT_EQ(bytes, "*1\r\n$5\r\nMULTI\r\n"
+                     "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"
+                     "*1\r\n$4\r\nEXEC\r\n");
+    AOFLogger aof(aof_file);
+    InMemoryStorage s(10, &aof);
+    auto loaded = replayAOF(s, aof);
+    ASSERT_TRUE(loaded.ok);
+    ASSERT_EQ(loaded.commands, size_t{2});
+    ASSERT_EQ(s.get("a").value, "1");
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_aof_replay_drops_an_incomplete_transaction) {
+    // The server stopped while writing a transaction: replay applies none of
+    // it, and cuts it off the file, as an incomplete record
+    auto record = [](std::initializer_list<std::string_view> words) {
+        std::string r;
+        RespParser::appendArray(r, words);
+        return r;
+    };
+    const std::string before = record({"SET", "x", "1"});
+    const std::string multi = record({"MULTI"});
+    const std::string set_a = record({"SET", "a", "1"});
+    const std::string set_b = record({"SET", "b", "1"});
+    const std::string aof_file = "test_aof_incomplete_tx.aof";
+    // Cut after a whole record, and in the middle of one
+    for(const std::string& tail : {multi + set_a + set_b, multi + set_a + set_b.substr(0, 9)}) {
+        std::remove(aof_file.c_str());
+        { std::ofstream(aof_file, std::ios::binary) << before << tail; }
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_TRUE(loaded.ok);
+        ASSERT_EQ(loaded.truncated_bytes, tail.size());
+        ASSERT_EQ(s.get("x").value, "1");
+        ASSERT_FALSE(s.exists("a").success);
+        ASSERT_EQ(aof.readRaw(), before);
+    }
+    // A transaction's markers out of place mean damage, not a cut-short write
+    for(const std::string& bad : {before + record({"EXEC"}), before + multi + multi + record({"EXEC"})}) {
+        std::remove(aof_file.c_str());
+        { std::ofstream(aof_file, std::ios::binary) << bad; }
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        auto loaded = replayAOF(s, aof);
+        ASSERT_FALSE(loaded.ok);
+        ASSERT_TRUE(loaded.error.find("damaged") != std::string::npos);
+    }
+    std::remove(aof_file.c_str());
+}
+
+// ==================== Counters and Several Keys (C5) ====================
+
+TEST(test_incr_decr) {
+    // Redis 7.0.15's replies (compare_with_redis.py checks them byte for byte)
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    const std::string not_int = "-ERR value is not an integer or out of range\r\n";
+    const std::string overflow = "-ERR increment or decrement would overflow\r\n";
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "c"}), ":1\r\n");            // a missing key counts from 0
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "c", "41"}), ":42\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECR", "c"}), ":41\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "c", "-9"}), ":50\r\n");
+    ASSERT_EQ(s.get("c").value, "50");
+    ASSERT_EQ(s.type("c").value, "string");
+
+    // A value is a number only in its canonical form; anything else is left alone
+    for(const char* value : {"abc", "", "05", "-0", "+1", " 1", "1 ", "1.5", "100000000000000000000"}) {
+        s.set("v", value);
+        ASSERT_EQ(executeCommand(ctx, {"INCR", "v"}), not_int);
+        ASSERT_EQ(s.get("v").value, value);
+    }
+    // So is the increment, which is checked before the key
+    s.rpush("l", {"a"});
+    for(const char* bad : {"abc", "1.5", "01", "+1", "", "9223372036854775808"}) {
+        ASSERT_EQ(executeCommand(ctx, {"INCRBY", "c", bad}), not_int);
+        ASSERT_EQ(executeCommand(ctx, {"DECRBY", "l", bad}), not_int);
+    }
+    ASSERT_EQ(s.get("c").value, "50");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "l"}),
+              "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+
+    // The edges of int64_t: a sum that doesn't fit changes nothing
+    s.set("m", "9223372036854775806");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "m"}), ":9223372036854775807\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "m"}), overflow);
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "m", "-9223372036854775808"}), ":-1\r\n");
+    s.set("m", "-9223372036854775807");
+    ASSERT_EQ(executeCommand(ctx, {"DECR", "m"}), ":-9223372036854775808\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "m", "1"}), overflow);
+    ASSERT_EQ(s.get("m").value, "-9223372036854775808");
+    // DECRBY's own check: the negation of the smallest int64_t doesn't fit
+    ASSERT_EQ(executeCommand(ctx, {"DECRBY", "n", "-9223372036854775808"}), "-ERR decrement would overflow\r\n");
+    ASSERT_FALSE(s.exists("n").success);
+    ASSERT_EQ(executeCommand(ctx, {"INCRBY", "n", "-9223372036854775808"}), ":-9223372036854775808\r\n");
+
+    // The value changes in place: the TTL stays. An expired key counts from 0, without one.
+    executeCommand(ctx, {"SET", "t", "1", "EX", "100"});
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "t"}), ":2\r\n");
+    ASSERT_EQ(s.ttl("t").value, "100");
+    executeCommand(ctx, {"SET", "e", "7", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"INCR", "e"}), ":1\r\n");
+    ASSERT_EQ(s.ttl("e").value, "-1");
+}
+
+TEST(test_aof_incr_is_logged_as_incrby) {
+    // All four are logged as INCRBY with the delta, and a failed one not at
+    // all; replay reaches the same values, and keeps the TTL
+    const std::string aof_file = "test_aof_incr.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"INCR", "c"}, {"DECR", "c"}, {"INCRBY", "c", "10"}, {"DECRBY", "c", "3"},
+                {"SET", "t", "5", "EX", "100"}, {"INCR", "t"},
+                {"SET", "w", "abc"}, {"INCR", "w"},                         // not an integer
+                {"INCRBY", "c", "9223372036854775807"},                    // overflow
+                {"DECRBY", "c", "-9223372036854775808"}, {"INCRBY", "c", "x"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    ASSERT_EQ(records.size(), size_t{7});
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records[0], (Record{"INCRBY", "c", "1"}));
+    ASSERT_EQ(records[1], (Record{"INCRBY", "c", "-1"}));
+    ASSERT_EQ(records[2], (Record{"INCRBY", "c", "10"}));
+    ASSERT_EQ(records[3], (Record{"INCRBY", "c", "-3"}));
+    ASSERT_EQ(records[5], (Record{"INCRBY", "t", "1"}));
+    ASSERT_EQ(records[6], (Record{"SET", "w", "abc"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.get("c").value, "7");
+    ASSERT_EQ(s.get("t").value, "6");
+    ASSERT_EQ(s.ttl("t").value, "100");
+    ASSERT_EQ(s.get("w").value, "abc");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_del_exists_several_keys) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    s.set("a", "1");
+    s.rpush("l", {"x"});
+    s.sadd("s", {"m"});
+    s.hset("h", {{"f", "v"}});
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "a", "l", "s", "h", "missing"}), ":4\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "a", "a", "missing", "a"}), ":3\r\n");    // twice counts twice
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "a", "a", "missing"}), ":1\r\n");           // but is removed once
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "l", "s", "h"}), ":3\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{0});
+    ASSERT_EQ(executeCommand(ctx, {"DEL"}), "-ERR wrong number of arguments for 'del' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS"}), "-ERR wrong number of arguments for 'exists' command\r\n");
+
+    // An expired key doesn't exist: it isn't counted, and is removed
+    s.set("live", "1");
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"EXISTS", "live", "gone"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(executeCommand(ctx, {"DEL", "gone", "live"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{0});
+
+    // Each key EXISTS looks at is a keyspace hit or miss, as in Redis; DEL counts neither
+    auto before = s.stats();
+    s.set("a", "1");
+    executeCommand(ctx, {"EXISTS", "a", "b", "a"});
+    executeCommand(ctx, {"DEL", "a", "b"});
+    ASSERT_EQ(s.stats().keyspace_hits - before.keyspace_hits, uint64_t{2});
+    ASSERT_EQ(s.stats().keyspace_misses - before.keyspace_misses, uint64_t{1});
+}
+
+TEST(test_aof_del_several_keys_is_one_record) {
+    // One record, the command as given (as Redis logs it), so a crash can't
+    // leave half a DEL; none when nothing was removed
+    const std::string aof_file = "test_aof_del_keys.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "a", "1"}, {"SET", "b", "2"}, {"SET", "c", "3"},
+                {"DEL", "a", "missing", "b"}, {"DEL", "x", "y"}, {"DEL", "c"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{5});
+    ASSERT_EQ(records[3], (Record{"DEL", "a", "missing", "b"}));
+    ASSERT_EQ(records[4], (Record{"DEL", "c"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.stats().keys, size_t{0});
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_mget_mset) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    s.rpush("l", {"x"});
+    executeCommand(ctx, {"SET", "t", "old", "EX", "100"});
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "a", "1", "b", "", "a", "2", "t", "new"}), "+OK\r\n");
+    ASSERT_EQ(s.get("a").value, "2");            // the last value given wins
+    ASSERT_EQ(s.ttl("t").value, "-1");           // as SET: the TTL goes
+    // A list, or nothing: nil, not WRONGTYPE
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "a", "b", "missing", "l", "a"}),
+              "*5\r\n$1\r\n2\r\n$0\r\n\r\n$-1\r\n$-1\r\n$1\r\n2\r\n");
+    ctx.protocol = 3;
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "missing", "a"}), "*2\r\n_\r\n$1\r\n2\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "l", "v"}), "+OK\r\n");            // over a list
+    ASSERT_EQ(s.type("l").value, "string");
+    ASSERT_EQ(executeCommand(ctx, {"MSET", "a", "1", "b"}), "-ERR wrong number of arguments for 'mset' command\r\n");
+    ASSERT_EQ(s.get("a").value, "2");
+    ASSERT_EQ(executeCommand(ctx, {"MGET"}), "-ERR wrong number of arguments for 'mget' command\r\n");
+
+    // Each key MGET reads is a hit or a miss (a hash too, as in Redis); MSET counts neither
+    s.hset("h", {{"f", "v"}});
+    auto before = s.stats();
+    executeCommand(ctx, {"MGET", "a", "nothing", "h"});
+    executeCommand(ctx, {"MSET", "z", "1"});
+    ASSERT_EQ(s.stats().keyspace_hits - before.keyspace_hits, uint64_t{2});
+    ASSERT_EQ(s.stats().keyspace_misses - before.keyspace_misses, uint64_t{1});
+
+    // An expired key is nil, and removed there and then, as GET removes it
+    executeCommand(ctx, {"SET", "gone", "1", "PX", "1"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto keys = s.stats().keys;
+    ASSERT_EQ(executeCommand(ctx, {"MGET", "gone"}), "*1\r\n_\r\n");
+    ASSERT_EQ(s.stats().keys, keys - 1);
+}
+
+TEST(test_aof_mset_is_one_record) {
+    const std::string aof_file = "test_aof_mset.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        executeCommand(ctx, {"SET", "a", "0", "EX", "100"});
+        executeCommand(ctx, {"MSET", "a", "1", "b", "2", "a", "3"});
+        executeCommand(ctx, {"MGET", "a", "b"});            // a read: not logged
+        executeCommand(ctx, {"MSET", "a", "1", "b"});        // refused: not logged
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    ASSERT_EQ(records.size(), size_t{2});
+    ASSERT_EQ(records[1], (std::vector<std::string>{"MSET", "a", "1", "b", "2", "a", "3"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.get("a").value, "3");
+    ASSERT_EQ(s.ttl("a").value, "-1");
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_mset_evicts_after_its_record) {
+    // Capacity 2, SIEVE: x was read, so the hand passes it and evicts a, a key
+    // the MSET has just written. Making room before each key logged "DEL a"
+    // before the MSET record: replay then read the DEL first (nothing to
+    // delete), stored a and b, and evicted x once loaded. A restart held
+    // {a, b}; the server had {x, b}. The DELs must follow the record.
+    const std::string aof_file = "test_aof_mset_evict.aof";
+    using Record = std::vector<std::string>;
+    for(EvictionPolicy policy : {EvictionPolicy::SIEVE, EvictionPolicy::LRU}) {
+        std::remove(aof_file.c_str());
+        {
+            AOFLogger aof(aof_file);
+            InMemoryStorage s(2, &aof, policy);
+            CommandContext ctx{s, &aof};
+            s.set("x", "1");
+            s.get("x");
+            executeCommand(ctx, {"MSET", "a", "1", "b", "2"});
+            ASSERT_EQ(s.stats().keys, size_t{2});
+            ASSERT_TRUE(s.exists("b").success);
+            ASSERT_EQ(s.exists("x").success, policy == EvictionPolicy::SIEVE);   // LRU evicts x, the oldest
+        }
+        std::vector<std::string> live = policy == EvictionPolicy::SIEVE ? Record{"x", "b"} : Record{"a", "b"};
+        AOFLogger aof(aof_file);
+        auto records = aofRecords(aof.readRaw());
+        ASSERT_EQ(records.size(), size_t{3});
+        ASSERT_EQ(records[1][0], "MSET");
+        ASSERT_EQ(records[2][0], "DEL");
+        InMemoryStorage s(2, &aof, policy);
+        ASSERT_TRUE(replayAOF(s, aof).ok);
+        ASSERT_EQ(s.stats().keys, size_t{2});
+        for(const auto& key : live) ASSERT_TRUE(s.exists(key).success);
+    }
+    // More new keys than fit: the table goes to the capacity, not past it
+    std::remove(aof_file.c_str());
+    InMemoryStorage s(2);
+    CommandContext ctx{s};
+    executeCommand(ctx, {"MSET", "a", "1", "b", "2", "c", "3"});
+    ASSERT_EQ(s.stats().keys, size_t{2});
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
+}
+
+// ==================== INFO ====================
+
+TEST(test_storage_counts_as_redis_does) {
+    // The same counts Redis 7.0.15 gives for the same commands: a read that
+    // finds a live key is a hit (WRONGTYPE too), and writes count neither
+    InMemoryStorage s(4);
+    s.set("a", "1");                            // writes: not counted
+    s.lpush("l", {"x"});
+    s.hset("h", {{"f", "v"}});
+    s.sadd("s", {"m"});
+    s.get("a"); s.exists("a"); s.type("a"); s.ttl("a");           // 4 hits
+    s.lrange("l", 0, -1); s.llen("l");                              // 2
+    s.hget("h", "f"); s.hget("h", "missing-field"); s.hgetall("h"); s.hlen("h");    // 4
+    s.smembers("s"); s.sismember("s", "m"); s.scard("s");           // 3
+    s.get("l");                                 // WRONGTYPE: still a hit
+    for(const char* key : {"x1", "x2"}) {       // every read path's miss
+        s.get(key); s.exists(key); s.type(key); s.ttl(key); s.lrange(key, 0, -1); s.llen(key);
+        s.hget(key, "f"); s.hgetall(key); s.hlen(key); s.smembers(key); s.sismember(key, "m"); s.scard(key);
+    }
+    s.lpop("l"); s.del("missing");              // writes again
+    auto st = s.stats();
+    ASSERT_EQ(st.keyspace_hits, uint64_t{14});
+    ASSERT_EQ(st.keyspace_misses, uint64_t{24});
+    ASSERT_EQ(st.expired_keys, uint64_t{0});
+    ASSERT_EQ(st.evicted_keys, uint64_t{0});
+    ASSERT_EQ(st.keys, size_t{3});              // a, h, s (the list emptied, so it went)
+    ASSERT_EQ(st.max_keys, size_t{4});
+
+    // Expired, found on a read: a miss and an expiry; to make room: an eviction
+    s.setExpiringAt("e", "v", InMemoryStorage::unixTimeMs() - 1);
+    ASSERT_EQ(s.stats().expires, size_t{1});
+    s.get("e");
+    st = s.stats();
+    ASSERT_EQ(st.keyspace_misses, uint64_t{25});
+    ASSERT_EQ(st.expired_keys, uint64_t{1});
+    ASSERT_EQ(st.expires, size_t{0});
+    s.set("n1", "1");                           // the fourth key fits
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{0});
+    s.set("n2", "1");                           // a fifth: one evicted
+    ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});     // an eviction isn't an expiry
+}
+
+TEST(test_info_sections_and_command_count) {
+    InMemoryStorage s(10);
+    ServerStats server;
+    server.tcp_port = 6380;
+    server.max_clients = 7;
+    server.started = std::chrono::steady_clock::now();
+    Transaction tx;
+    CommandContext ctx{s, nullptr, 2};
+    ctx.server = &server;
+    ctx.transaction = &tx;
+
+    std::string all = executeCommand(ctx, {"INFO"});
+    for(const char* line : {"# Server\r\nkosh_version:3.0.0\r\n", "tcp_port:6380\r\n", "connected_clients:2\r\n",
+                            "maxclients:7\r\n", "maxkeys:10\r\n", "aof_enabled:0\r\n",
+                            "total_commands_processed:0\r\n", "keyspace_hits:0\r\n", "# Keyspace\r\n"}) {
+        ASSERT_TRUE(all.find(line) != std::string::npos);
+    }
+    ASSERT_TRUE(all.find("db0:") == std::string::npos);     // no keys, no db0 line
+    ASSERT_TRUE(all.find("redis_version") == std::string::npos);
+    // Sections by name, in any case; unknown ones give nothing, as in Redis
+    std::string stats = executeCommand(ctx, {"INFO", "STATS"});
+    ASSERT_TRUE(stats.find("# Stats\r\n") != std::string::npos);
+    ASSERT_TRUE(stats.find("# Server") == std::string::npos);
+    std::string two = executeCommand(ctx, {"info", "server", "keyspace"});
+    ASSERT_TRUE(two.find("# Server") != std::string::npos && two.find("# Keyspace") != std::string::npos);
+    ASSERT_TRUE(two.find("# Clients") == std::string::npos);
+    ASSERT_EQ(executeCommand(ctx, {"INFO", "nosuch"}), "$0\r\n\r\n");
+    ASSERT_TRUE(executeCommand(ctx, {"INFO", "everything"}).find("# Memory") != std::string::npos);
+    executeCommand(ctx, {"SET", "k", "v"});
+    ASSERT_TRUE(executeCommand(ctx, {"INFO", "keyspace"}).find("db0:keys=1,expires=0\r\n") != std::string::npos);
+
+    // Commands are counted once they have run: EXEC and what it runs, not
+    // refused or queued ones
+    uint64_t before = server.commands_processed;
+    executeCommand(ctx, {"NOPE"});
+    executeCommand(ctx, {"GET"});
+    executeCommand(ctx, {"MULTI"});
+    executeCommand(ctx, {"PING"});
+    executeCommand(ctx, {"PING"});
+    executeCommand(ctx, {"EXEC"});
+    ASSERT_EQ(server.commands_processed - before, uint64_t{4});     // MULTI, EXEC, 2 PINGs
+}
+
+// ==================== RESP3 and HELLO ====================
+// Expected bytes are Redis 7.0.15's for the same commands
+
+TEST(test_resp3_reply_types) {
+    // The replies whose type depends on the protocol, in both
+    for(int protocol : {2, 3}) {
+        InMemoryStorage s(10);
+        CommandContext ctx{s};
+        ctx.protocol = protocol;
+        bool v3 = protocol == 3;
+        const std::string null = v3 ? "_\r\n" : "$-1\r\n";
+        ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), null);
+        ASSERT_EQ(executeCommand(ctx, {"LPOP", "missing"}), null);
+        ASSERT_EQ(executeCommand(ctx, {"HGET", "missing", "f"}), null);
+        executeCommand(ctx, {"HSET", "h", "f", "1"});
+        ASSERT_EQ(executeCommand(ctx, {"HGETALL", "h"}),
+                  std::string(v3 ? "%1" : "*2") + "\r\n$1\r\nf\r\n$1\r\n1\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"HGETALL", "missing"}), v3 ? "%0\r\n" : "*0\r\n");
+        executeCommand(ctx, {"SADD", "s", "a"});
+        ASSERT_EQ(executeCommand(ctx, {"SMEMBERS", "s"}), std::string(v3 ? "~1" : "*1") + "\r\n$1\r\na\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"SMEMBERS", "missing"}), v3 ? "~0\r\n" : "*0\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"CONFIG", "GET", "save"}), v3 ? "%0\r\n" : "*0\r\n");
+        // Lists stay arrays, and INFO is a verbatim string: "=", length, "txt:"
+        executeCommand(ctx, {"RPUSH", "l", "a"});
+        ASSERT_EQ(executeCommand(ctx, {"LRANGE", "l", "0", "-1"}), "*1\r\n$1\r\na\r\n");
+        std::string info = executeCommand(ctx, {"INFO"});
+        ASSERT_EQ(info.substr(0, 1), v3 ? "=" : "$");
+        ASSERT_EQ(info.find("txt:# Server") != std::string::npos, v3);
+    }
+}
+
+TEST(test_hello) {
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ctx.client_id = 7;
+    const std::string fields = "$6\r\nserver\r\n$4\r\nkosh\r\n$7\r\nversion\r\n$5\r\n3.0.0\r\n$5\r\nproto\r\n";
+    const std::string rest = "$2\r\nid\r\n:7\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n"
+                             "$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n";
+    // HELLO 3 switches to RESP3 and answers with a map; HELLO 2 back, with an array
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3"}), "%7\r\n" + fields + ":3\r\n" + rest);
+    ASSERT_EQ(ctx.protocol, 3);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), "_\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO"}), "%7\r\n" + fields + ":3\r\n" + rest);   // no version: keeps it
+    ASSERT_EQ(executeCommand(ctx, {"hello", "2"}), "*14\r\n" + fields + ":2\r\n" + rest);
+    ASSERT_EQ(ctx.protocol, 2);
+
+    // Errors, Redis's words; none switches the protocol
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "4"}), "-NOPROTO unsupported protocol version\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "1"}), "-NOPROTO unsupported protocol version\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "x"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3abc"}), "-ERR Protocol version is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "BOGUS"}), "-ERR Syntax error in HELLO option 'BOGUS'\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default"}), "-ERR Syntax error in HELLO option 'AUTH'\r\n");
+    ASSERT_EQ(ctx.protocol, 2);
+
+    // No password set: HELLO AUTH works for "default" with any password
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "nobody", "x"}), kWrongPass);
+    ASSERT_EQ(ctx.protocol, 2);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "x"}).substr(0, 4), "%7\r\n");
+}
+
+TEST(test_hello_with_a_password) {
+    InMemoryStorage s(10);
+    const std::string password = "s3cret";
+    CommandContext ctx{s};
+    ctx.password = &password;
+    ctx.authenticated = false;
+    const std::string noauth = "-NOAUTH HELLO must be called with the client already authenticated, "
+        "otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client and "
+        "select the RESP protocol version at the same time\r\n";
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3"}), noauth);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO"}), noauth);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "wrong"}), kWrongPass);
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "DEFAULT", "s3cret"}), kWrongPass);
+    ASSERT_FALSE(ctx.authenticated);
+    ASSERT_EQ(ctx.protocol, 2);
+    ASSERT_EQ(executeCommand(ctx, {"PING"}), kNoAuth);
+    // What redis-py and node-redis send first when given a password
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "AUTH", "default", "s3cret"}).substr(0, 4), "%7\r\n");
+    ASSERT_TRUE(ctx.authenticated);
+    ASSERT_EQ(ctx.protocol, 3);
+    ASSERT_EQ(executeCommand(ctx, {"GET", "missing"}), "_\r\n");
+}
+
+TEST(test_client_subcommands) {
+    InMemoryStorage s(10);
+    std::string name;
+    CommandContext ctx{s};
+    ctx.client_id = 42;
+    ctx.client_name = &name;
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "ID"}), ":42\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "$-1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", "app"}), "+OK\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"client", "getname"}), "$3\r\napp\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", "a b"}),
+              "-ERR Client names cannot contain spaces, newlines or special characters.\r\n");
+    ASSERT_EQ(name, "app");                                         // unchanged
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME", ""}), "+OK\r\n");   // clears it
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "$-1\r\n");
+    ctx.protocol = 3;
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "GETNAME"}), "_\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"HELLO", "3", "SETNAME", "n"}).substr(0, 4), "%7\r\n");
+    ASSERT_EQ(name, "n");
+
+    // What clients send on connect and newer Redis versions support: an error
+    // they skip, never an OK claiming support Kosh lacks
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETINFO", "LIB-NAME", "redis-py"}),
+              "-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "SETNAME"}),
+              "-ERR wrong number of arguments for 'client|setname' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "ID", "x"}),
+              "-ERR wrong number of arguments for 'client|id' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT"}), "-ERR wrong number of arguments for 'client' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"CLIENT", "HELP"}).substr(0, 4), "*9\r\n");
 }
 
 // ==================== Pollers ====================
@@ -2075,8 +2981,8 @@ TEST(test_poller_epoll) {
 using ParseStatus = RespParser::ParseStatus;
 
 // The reason the parser gives for rejecting `input`; fails the test if it doesn't.
-std::string protocolErrorOf(const std::string& input) {
-    auto parsed = RespParser::parse(input);
+std::string protocolErrorOf(const std::string& input, bool authenticated = true) {
+    auto parsed = RespParser::parse(input, authenticated);
     if(parsed.status != ParseStatus::Error) {
         throw std::runtime_error("expected a protocol error for: " + input.substr(0, 40));
     }
@@ -2189,6 +3095,27 @@ TEST(test_resp_rejects_oversized_input) {
     ASSERT_EQ(protocolErrorOf(std::string(100 * 1024, 'a')), "too big inline request");
 }
 
+TEST(test_resp_unauthenticated_limits) {
+    // Before AUTH: 10 arguments of 16 KB at most, refused as soon as a header
+    // asks for more, without waiting for the data
+    std::string ten = "*10\r\n";
+    for(int i = 0; i < 10; i++) ten += "$1\r\na\r\n";
+    ASSERT_TRUE(RespParser::parse(ten, false).status == ParseStatus::Ok);
+    ASSERT_EQ(protocolErrorOf("*11\r\n", false), "unauthenticated multibulk length");
+    const std::string bulk(RespParser::kMaxUnauthenticatedBulk, 'b');
+    auto largest = RespParser::parse("*1\r\n$16384\r\n" + bulk + "\r\n", false);
+    ASSERT_TRUE(largest.status == ParseStatus::Ok);
+    ASSERT_EQ(largest.args[0], bulk);
+    ASSERT_EQ(protocolErrorOf("*1\r\n$16385\r\n", false), "unauthenticated bulk length");
+    ASSERT_EQ(protocolErrorOf("*2\r\n$4\r\nAUTH\r\n$100000\r\n", false), "unauthenticated bulk length");
+    // After AUTH, the usual limits
+    ASSERT_TRUE(RespParser::parse("*11\r\n").status == ParseStatus::NeedMore);
+    ASSERT_TRUE(RespParser::parse("*1\r\n$16385\r\n").status == ParseStatus::NeedMore);
+    // An inline command is at most 64 KB either way
+    const std::string longest(RespParser::kMaxInlineLength, 'a');
+    ASSERT_TRUE(RespParser::parse(longest + "\r\n", false).status == ParseStatus::Ok);
+}
+
 TEST(test_resp_inline_length_limit) {
     const std::string longest(RespParser::kMaxInlineLength, 'a');
     auto parsed = RespParser::parse(longest + "\r\n");
@@ -2265,7 +3192,7 @@ TEST(test_resp_serialize) {
 // ==================== Main ======================================
 
 int main() {
-    std::cout << "\n========== Mini-Redis Test Suite ==========\n\n";
+    std::cout << "\n========== Kosh Test Suite ==========\n\n";
 
     std::cout << "[Basic Operations]\n";
     RUN_TEST(test_set_and_get);
@@ -2291,6 +3218,10 @@ int main() {
     RUN_TEST(test_keytable_matches_unordered_map);
     RUN_TEST(test_keytable_rehash_is_incremental);
     RUN_TEST(test_keytable_big_table_given_back);
+    RUN_TEST(test_siphash24_reference_vectors);
+    RUN_TEST(test_siphash13_matches_cpython);
+    RUN_TEST(test_keyed_hash_depends_on_the_key);
+    RUN_TEST(test_tables_hash_with_their_own_key);
 
     std::cout << "\n[SIEVE Eviction]\n";
     RUN_TEST(test_sieve_evicts_first_unvisited_key);
@@ -2384,12 +3315,45 @@ int main() {
     RUN_TEST(test_dispatch_unknown_command);
     RUN_TEST(test_dispatch_replies);
     RUN_TEST(test_dispatch_appends_replies);
+    RUN_TEST(test_dispatch_ping);
     RUN_TEST(test_dispatch_quit_closes_connection);
     RUN_TEST(test_dispatch_set_options);
     RUN_TEST(test_dispatch_set_rejects_bad_options);
+    RUN_TEST(test_parse_int64_reads_as_redis);
     RUN_TEST(test_dispatch_strict_integer_arguments);
     RUN_TEST(test_dispatch_extreme_expiry_times);
     RUN_TEST(test_dispatch_write_flags);
+
+    std::cout << "\n[Authentication]\n";
+    RUN_TEST(test_constant_time_equals);
+    RUN_TEST(test_auth_required_before_commands);
+    RUN_TEST(test_quit_needs_no_auth);
+    RUN_TEST(test_auth_without_a_password);
+
+    std::cout << "\n[Transactions]\n";
+    RUN_TEST(test_transactions_queue_and_run);
+    RUN_TEST(test_transactions_abort);
+    RUN_TEST(test_transactions_in_the_aof);
+    RUN_TEST(test_aof_replay_drops_an_incomplete_transaction);
+
+    std::cout << "\n[Counters and Several Keys]\n";
+    RUN_TEST(test_incr_decr);
+    RUN_TEST(test_aof_incr_is_logged_as_incrby);
+    RUN_TEST(test_del_exists_several_keys);
+    RUN_TEST(test_aof_del_several_keys_is_one_record);
+    RUN_TEST(test_mget_mset);
+    RUN_TEST(test_aof_mset_is_one_record);
+    RUN_TEST(test_mset_evicts_after_its_record);
+
+    std::cout << "\n[INFO]\n";
+    RUN_TEST(test_storage_counts_as_redis_does);
+    RUN_TEST(test_info_sections_and_command_count);
+
+    std::cout << "\n[RESP3 and HELLO]\n";
+    RUN_TEST(test_resp3_reply_types);
+    RUN_TEST(test_hello);
+    RUN_TEST(test_hello_with_a_password);
+    RUN_TEST(test_client_subcommands);
 
     std::cout << "\n[Pollers]\n";
     RUN_TEST(test_poller_select);
@@ -2404,6 +3368,7 @@ int main() {
     RUN_TEST(test_resp_empty_array_is_skipped);
     RUN_TEST(test_resp_rejects_malformed_input);
     RUN_TEST(test_resp_rejects_oversized_input);
+    RUN_TEST(test_resp_unauthenticated_limits);
     RUN_TEST(test_resp_inline_length_limit);
     RUN_TEST(test_resp_every_split_point);
     RUN_TEST(test_resp_serialize);

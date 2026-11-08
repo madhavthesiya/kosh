@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mini-Redis throughput at several commits, measured in one interleaved session.
+"""Kosh throughput at several commits, measured in one interleaved session.
 
 Each commit is checked out into its own git worktree and measured with that
-commit's own bench.py (Mini-Redis only). Every round measures every commit,
+commit's own bench.py (Kosh only). Every round measures every commit,
 so each round gives a paired comparison: the versions measured minutes apart,
 under the same conditions. The order rotates from round to round, so no
 version is always measured first.
@@ -49,6 +49,7 @@ def parse_args():
     p.add_argument("--pipelines", default="16")
     p.add_argument("--aof", default="on,off")
     p.add_argument("--requests", type=int, default=1_000_000, help="per unpipelined test")
+    p.add_argument("--keyspace", type=int, default=100_000, help="random keys (bench.py --keyspace)")
     # Long runs: with --threads, redis-benchmark rounds each run time up to its
     # 250 ms timer (see bench.py), which matters for fast pipelined runs
     p.add_argument("--pipelined-requests", type=int, default=5_000_000,
@@ -134,7 +135,7 @@ def main():
         sys.exit(f"{args.out} already exists; pick another --out or delete it")
     runs_csv = args.out.with_name(args.out.stem + "-runs.csv")
     # Not /tmp: under WSL, systemd empties it whenever the distribution restarts.
-    work = Path.home() / ".cache" / "mini-redis-compare" / time.strftime("%Y%m%d-%H%M%S")
+    work = Path.home() / ".cache" / "kosh-compare" / time.strftime("%Y%m%d-%H%M%S")
     work.mkdir(parents=True)
 
     versions = []   # (label, worktree, commit description, request flags)
@@ -166,7 +167,7 @@ def main():
                 result = subprocess.run(
                     [sys.executable, str(tree / "bench" / "bench.py"),
                      "--out", str(out), "--servers", "mini", "--pipelines", args.pipelines,
-                     "--aof", args.aof, "--runs", "1", *flags],
+                     "--aof", args.aof, "--runs", "1", "--keyspace", str(args.keyspace), *flags],
                     capture_output=True, text=True)
                 if result.returncode != 0:
                     sys.exit(f"bench.py failed for {label}:\n{result.stderr[-2000:]}")
@@ -202,7 +203,8 @@ def main():
     lines = ["# Throughput by commit", "",
              bl.environment_markdown(bl.environment()), "",
              f"- **Method:** each commit's own `bench.py --servers mini --pipelines "
-             f"{args.pipelines} --aof {args.aof} --runs 1 --requests {args.requests} "
+             f"{args.pipelines} --aof {args.aof} --runs 1 --keyspace {args.keyspace} "
+             f"--requests {args.requests} "
              f"--pipelined-requests {args.pipelined_requests}`. {args.rounds} rounds; each "
              "round measures every commit, in an order that rotates from round to round and "
              "is reversed every other round.",

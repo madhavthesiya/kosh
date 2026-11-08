@@ -1,0 +1,18 @@
+# clang-tidy for the server's sources, run in CI (.github/workflows/ci.yml):
+#   run-clang-tidy -p build "<repo>/[A-Za-z_]+\.cpp$"
+# Every finding fails the build; a check is off only for a reason given here.
+#
+# bugprone-easily-swappable-parameters: flags every function taking two
+#   arguments of one type (key and value, start and stop); the call sites
+#   are tested, and renaming types to dodge it would not make them safer.
+# performance-enum-size: asks for 1-byte enums. None of these enums is
+#   stored per key (an entry's type comes from its variant), so it would
+#   save nothing; per-key memory is measured in bench/memory_layout.cpp.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -performance-enum-size
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'

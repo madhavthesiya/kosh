@@ -1,4 +1,5 @@
 #include "InMemoryStorage.h"
+#include "Integer.h"
 #include "RespParser.h"
 #include <cassert>
 #include <cstring>
@@ -55,7 +56,7 @@ int64_t InMemoryStorage::unixTimeMs() {
 }
 
 InMemoryStorage::InMemoryStorage(size_t capacity, AOFLogger* aof, EvictionPolicy policy)
-    : policy_(policy), capacity_(capacity), aof_(aof) {
+    : data_(KeyedHash{SipKey::random()}), policy_(policy), capacity_(capacity), aof_(aof) {
     // Eviction makes room by removing a key, so at least one must fit. With
     // capacity 0, the first SET would evict from an empty LRU list.
     if(capacity_ == 0) throw std::invalid_argument("InMemoryStorage capacity must be at least 1");
@@ -75,6 +76,7 @@ InMemoryStorage::~InMemoryStorage() {
 InMemoryStorage::CacheEntry* InMemoryStorage::newEntry(std::string_view key){
     if(key.size() > UINT32_MAX) throw std::length_error("key too long");
     void* block = ::operator new(sizeof(CacheEntry) + key.size());
+    // cppcheck-suppress legacyUninitvar ; misreads placement new, which initializes entry
     auto* entry = new (block) CacheEntry{};
     entry->key_len = static_cast<uint32_t>(key.size());
     // The key's bytes go into the raw storage after the entry, not into it
@@ -111,11 +113,16 @@ void InMemoryStorage::logAOF(std::initializer_list<std::string_view> parts) {
 
 void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
                              const std::vector<std::string>& tail) {
+    logAOF(head, tail.data(), tail.data() + tail.size());
+}
+
+void InMemoryStorage::logAOF(std::initializer_list<std::string_view> head,
+                             const std::string* first, const std::string* last) {
     if(!aof_ || loading_) return;
     aof_->logWith([&](std::string& out) {
-        RespParser::appendLength(out, '*', head.size() + tail.size());
+        RespParser::appendLength(out, '*', head.size() + static_cast<size_t>(last - first));
         for(std::string_view part : head) RespParser::appendBulk(out, part);
-        for(const auto& part : tail) RespParser::appendBulk(out, part);
+        for(const std::string* part = first; part != last; ++part) RespParser::appendBulk(out, *part);
     });
 }
 
@@ -194,36 +201,57 @@ InMemoryStorage::CacheEntry* InMemoryStorage::getOrCreateEntry(const std::string
 
 // ==================== Key Operations ====================
 
+// One key is a range of one (a single object counts as an array of one)
 Result InMemoryStorage::exists(const std::string& key){
-    std::unique_lock lock(mutex_);
-    CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(*e)) {
-        expireEntry(e);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    }
-    return Result::ok();
+    return countExisting(&key, &key + 1) ? Result::ok() : Result::fail(ErrorCode::KEY_NOT_FOUND);
 }
 
 Result InMemoryStorage::del(const std::string& key){
+    return deleteKeys(&key, &key + 1) ? Result::ok() : Result::fail(ErrorCode::KEY_NOT_FOUND);
+}
+
+// Each key is a keyspace hit or miss, as in Redis. Unique lock: an expired key is removed.
+size_t InMemoryStorage::countExisting(const std::string* first, const std::string* last){
     std::unique_lock lock(mutex_);
-    CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    // An expired key no longer exists: DEL returns 0, as in Redis. Its removal
-    // is still logged, as an expiration.
-    if(isExpired(*e)) {
-        expireEntry(e);
-        return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    size_t found = 0;
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        const bool live = e && !isExpired(*e);
+        countRead(live);
+        if(live) found++;
+        else if(e) expireEntry(e);
     }
-    eraseEntry(e);
-    logAOF({"DEL", key});
-    return Result::ok();
+    return found;
+}
+
+// The record is the command as given, as Redis logs it (probed on 7.0.15),
+// and only if a key was removed. The keys it didn't remove are absent at that
+// point in replay too, so for them the record does nothing.
+size_t InMemoryStorage::deleteKeys(const std::string* first, const std::string* last){
+    std::unique_lock lock(mutex_);
+    size_t removed = 0;
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        if(!e) continue;
+        // An expired key no longer exists: it doesn't count, as in Redis. Its
+        // removal is still logged, as an expiration.
+        if(isExpired(*e)) {
+            expireEntry(e);
+            continue;
+        }
+        eraseEntry(e);
+        removed++;
+    }
+    if(removed > 0) logAOF({"DEL"}, first, last);
+    return removed;
 }
 
 Result InMemoryStorage::type(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok("none");
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok("none");
     return Result::ok(dataTypeToString(getDataType(*e)));
 }
 
@@ -249,7 +277,9 @@ Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
 Result InMemoryStorage::ttl(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(!e->has_expiry) return Result::ok("-1");
     int64_t remaining_ms = addSaturating(e->expiry_time.time_since_epoch().count(),
                                          -steadyNowMs().time_since_epoch().count());
@@ -290,9 +320,60 @@ Result InMemoryStorage::setExpiringAt(const std::string& key, const std::string&
     return r;
 }
 
+// Logged as INCRBY with the delta, whichever of the four commands it was: the
+// operation, as Redis logs it, not the result. Integer arithmetic is exact,
+// so replay, from the same state, reaches the same value. Logging the result
+// (SET) would have to carry the TTL too, converted from the monotonic clock at
+// every increment; this record leaves the expiry's own record untouched.
+Result InMemoryStorage::incrBy(const std::string& key, int64_t delta){
+    std::unique_lock lock(mutex_);
+    CacheEntry* e = data_.find(key);
+    if(e && isExpired(*e)) {
+        expireEntry(e);
+        e = nullptr;
+    }
+    int64_t value = 0;
+    if(e) {
+        if(getDataType(*e) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
+        if(!parseInt64(std::get<std::string>(e->value), value)) return Result::fail(ErrorCode::NOT_AN_INTEGER);
+    }
+    // Checked before adding: signed overflow is undefined behaviour
+    if((delta > 0 && value > INT64_MAX - delta) || (delta < 0 && value < INT64_MIN - delta)) {
+        return Result::fail(ErrorCode::INTEGER_OVERFLOW);
+    }
+    std::string sum = std::to_string(value + delta);
+    if(e) {
+        std::get<std::string>(e->value) = sum;
+        markUsed(*e);
+    } else {
+        makeRoomForNewKey();
+        insertEntry(key, ValueType(sum));
+    }
+    logAOF({"INCRBY", key, std::to_string(delta)});
+    return Result::ok(sum);
+}
+
+// Room is made after the keys are stored, not before each one as SET does.
+// An eviction is logged as a DEL when it happens, so one in the middle would
+// come before the MSET record, and its victim could be a key this MSET had
+// just written: replay would read the DEL first, then the MSET, and bring the
+// key back (with SIEVE, the default, it can; test_mset_evicts_after_its_record).
+// So: every key, then the record, then evictions down to the capacity, their
+// DELs after the record, in the order replay reads them. Redis also evicts
+// outside the command, before the next one. An MSET of more new keys than
+// fit leaves the ones the policy keeps.
+void InMemoryStorage::mset(const std::string* first, const std::string* last){
+    std::unique_lock lock(mutex_);
+    for(const std::string* pair = first; pair != last; pair += 2) {
+        setInternal(pair[0], pair[1], std::nullopt, /*make_room=*/false);
+    }
+    logAOF({"MSET"}, first, last);
+    evictDownTo(capacity_);
+}
+
 // SET always overwrites regardless of existing type (same as real Redis)
 Result InMemoryStorage::setInternal(const std::string& key, const std::string& value,
-                                    std::optional<ExpiryTime> expiry){
+                                    std::optional<ExpiryTime> expiry, bool make_room){
     if(CacheEntry* e = data_.find(key)) {
         if(isExpired(*e)) {
             expireEntry(e);
@@ -304,7 +385,7 @@ Result InMemoryStorage::setInternal(const std::string& key, const std::string& v
             return Result::ok();
         }
     }
-    makeRoomForNewKey();
+    if(make_room) makeRoomForNewKey();
     setExpiry(insertEntry(key, ValueType(value)), expiry);
     return Result::ok();
 }
@@ -377,9 +458,11 @@ Result InMemoryStorage::rpop(const std::string& key){
 Result InMemoryStorage::lrange(const std::string& key, int start, int stop){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
-    
+
     const auto& list = boxed<ListValue>(e->value);
     int len = static_cast<int>(list.size());
     
@@ -399,7 +482,9 @@ Result InMemoryStorage::lrange(const std::string& key, int start, int stop){
 Result InMemoryStorage::llen(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::LIST) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<ListValue>(e->value).size()));
 }
@@ -442,7 +527,9 @@ Result InMemoryStorage::srem(const std::string& key, const std::vector<std::stri
 Result InMemoryStorage::smembers(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& set = boxed<SetValue>(e->value);
     return Result::ok(std::vector<std::string>(set.begin(), set.end()));
@@ -451,7 +538,9 @@ Result InMemoryStorage::smembers(const std::string& key){
 Result InMemoryStorage::sismember(const std::string& key, const std::string& member){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& set = boxed<SetValue>(e->value);
     return Result::ok(set.count(member) > 0 ? 1 : 0);
@@ -460,7 +549,9 @@ Result InMemoryStorage::sismember(const std::string& key, const std::string& mem
 Result InMemoryStorage::scard(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::SET) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<SetValue>(e->value).size()));
 }
@@ -484,7 +575,9 @@ Result InMemoryStorage::hset(const std::string& key, const std::vector<std::pair
 Result InMemoryStorage::hget(const std::string& key, const std::string& field){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    const bool live = e && !isExpired(*e);
+    countRead(live);        // the key's hit or miss, whether or not the field is there
+    if(!live) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& hash = boxed<HashValue>(e->value);
     auto fit = hash.find(field);
@@ -515,7 +608,9 @@ Result InMemoryStorage::hdel(const std::string& key, const std::vector<std::stri
 Result InMemoryStorage::hgetall(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(std::vector<std::string>{});
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(std::vector<std::string>{});
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     const auto& hash = boxed<HashValue>(e->value);
     // Return as alternating field, value pairs (same as real Redis)
@@ -530,7 +625,9 @@ Result InMemoryStorage::hgetall(const std::string& key){
 Result InMemoryStorage::hlen(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
-    if(!e || isExpired(*e)) return Result::ok(0);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) return Result::ok(0);
     if(getDataType(*e) != DataType::HASH) return Result::fail(ErrorCode::WRONG_TYPE);
     return Result::ok(static_cast<int>(boxed<HashValue>(e->value).size()));
 }
@@ -737,26 +834,46 @@ void InMemoryStorage::evictOne(){
     std::string key(victim->key());    // a copy: erasing frees the original
     eraseEntry(victim);
     logAOF({"DEL", key});
+    evicted_keys_++;
 }
 
 void InMemoryStorage::expireEntry(CacheEntry* entry){
     std::string key(entry->key());     // a copy, as above
     eraseEntry(entry);
     logAOF({"DEL", key});
+    expired_keys_++;
 }
 
-// Called before adding a key. Not while loading: replay repeats the live
-// server's evictions from their DEL records instead of choosing its own.
+InMemoryStorage::Stats InMemoryStorage::stats() const {
+    std::shared_lock lock(mutex_);
+    Stats s;
+    s.keyspace_hits = keyspace_hits_.load(std::memory_order_relaxed);
+    s.keyspace_misses = keyspace_misses_.load(std::memory_order_relaxed);
+    s.expired_keys = expired_keys_;
+    s.evicted_keys = evicted_keys_;
+    s.keys = data_.size();
+    s.expires = expiry_index_.size();
+    s.max_keys = capacity_;
+    return s;
+}
+
+// Called before adding a key (capacity is at least 1)
 void InMemoryStorage::makeRoomForNewKey(){
-    if(loading_ || data_.size() < capacity_) return;    // no clock read on the common path
+    evictDownTo(capacity_ - 1);
+}
+
+// Not while loading: replay repeats the live server's evictions from their
+// DEL records instead of choosing its own.
+void InMemoryStorage::evictDownTo(size_t limit){
+    if(loading_ || data_.size() <= limit) return;       // no clock read on the common path
     // Expired keys go before any live key, wherever they are in the queue.
     // Only as many as are needed: each insert does a bounded amount of work.
     ExpiryTime now = steadyNowMs();
-    while(data_.size() >= capacity_ && !expiry_index_.empty() &&
+    while(data_.size() > limit && !expiry_index_.empty() &&
           expiry_index_.begin()->first <= now) {
         expireEntry(const_cast<CacheEntry*>(expiry_index_.begin()->second));
     }
-    while(data_.size() >= capacity_) evictOne();
+    while(data_.size() > limit) evictOne();
 }
 
 void InMemoryStorage::setLoading(bool loading){

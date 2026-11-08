@@ -21,12 +21,16 @@
 //   them. It never shrinks.
 //
 // Entry is the caller's type; KeyOf::key(const Entry&) returns its key.
+// Hash is kept in the table, as std::unordered_map keeps its hasher, so it
+// can carry a key (KeyedHash, SipHash.h). The default, std::hash, has a
+// fixed seed: fine for tests and tools, not for keys a client chooses.
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <new>
 #include <string_view>
 
@@ -38,12 +42,14 @@
 template<typename Entry, typename KeyOf, typename Hash = std::hash<std::string_view>>
 class KeyTable {
     public:
-        KeyTable() = default;
+        explicit KeyTable(Hash hash = Hash()) : hash_(hash) {}
         ~KeyTable() { clear(); }
         KeyTable(const KeyTable&) = delete;
         KeyTable& operator=(const KeyTable&) = delete;
 
         size_t size() const { return size_; }
+        // The hash the table gives this key (for tests: which hasher is used)
+        size_t hashOf(std::string_view key) const { return hash_(key); }
         // Buckets in the table, plus the new table's while a rehash runs
         size_t bucketCount() const { return bucketsOf(t0_) + bucketsOf(t1_); }
         size_t childBuckets() const { return children_; }
@@ -52,7 +58,7 @@ class KeyTable {
         // The entry with this key, or nullptr. Changes nothing (no rehash
         // step), so it is safe under a shared lock.
         Entry* find(std::string_view key) const {
-            size_t h = Hash{}(key);
+            size_t h = hash_(key);
             uint8_t tag = tagOf(h);
             if(rehashing()) {
                 // A bucket the rehash hasn't reached yet can still hold the
@@ -72,7 +78,7 @@ class KeyTable {
         void insert(Entry* entry) {
             growIfFull();
             rehashStep();
-            size_t h = Hash{}(KeyOf::key(*entry));
+            size_t h = hash_(KeyOf::key(*entry));
             Table& t = rehashing() ? t1_ : t0_;
             insertInChain(&t.buckets[h & t.mask], entry, tagOf(h));
             size_++;
@@ -82,7 +88,7 @@ class KeyTable {
         // Returns false if it isn't in the table.
         bool erase(const Entry* entry) {
             rehashStep();
-            size_t h = Hash{}(KeyOf::key(*entry));
+            size_t h = hash_(KeyOf::key(*entry));
             bool removed = false;
             if(rehashing()) {
                 size_t i = h & t0_.mask;
@@ -146,6 +152,7 @@ class KeyTable {
         static constexpr size_t kMapFromBytes = size_t{1} << 20;   // tables of 1 MB or more
         static constexpr size_t kGiveBackBytes = size_t{1} << 16;  // given back 64 KB at a time
 
+        Hash hash_;
         Table t0_;                     // the table
         Table t1_;                     // the rehash target, while a rehash runs
         size_t rehash_index_ = 0;      // t0_'s buckets below this have moved to t1_
@@ -206,9 +213,12 @@ class KeyTable {
 #endif
             void* block = std::calloc(1, bytes + alignof(Bucket));
             if(!block) throw std::bad_alloc();
-            auto addr = reinterpret_cast<uintptr_t>(block);
-            addr = (addr + alignof(Bucket) - 1) & ~uintptr_t{alignof(Bucket) - 1};
-            return {reinterpret_cast<Bucket*>(addr), block, buckets - 1, 0, 0};
+            // std::align, not integer arithmetic on the address: a pointer
+            // made from an integer loses track of the block it points into
+            void* aligned = block;
+            size_t space = bytes + alignof(Bucket);
+            std::align(alignof(Bucket), bytes, aligned, space);
+            return {static_cast<Bucket*>(aligned), block, buckets - 1, 0, 0};
         }
 
         static void freeBlock(Table& t) {
@@ -349,7 +359,7 @@ class KeyTable {
                     for(unsigned s = 0; s < kSlots; s++) {
                         if(!(b->meta >> s & 1)) continue;
                         Entry* e = static_cast<Entry*>(b->slots[s]);
-                        size_t h = Hash{}(KeyOf::key(*e));
+                        size_t h = hash_(KeyOf::key(*e));
                         insertInChain(&t1_.buckets[h & t1_.mask], e, b->tags[s]);
                         b->meta = static_cast<uint8_t>(b->meta & ~(1u << s));
                         moved_any = true;

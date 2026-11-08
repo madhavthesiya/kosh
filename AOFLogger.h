@@ -101,6 +101,10 @@ public:
     // Why writing or syncing failed, while it is failing
     std::string lastWriteError() const;
 
+    // Whether writes or syncs are failing now, without retrying them (INFO's
+    // aof_last_write_status)
+    bool failing() const { return failing_ || sync_failing_; }
+
     // False if the file could not be opened; log() would then silently drop writes.
     bool isOpen() const { return fd_ >= 0; }
 

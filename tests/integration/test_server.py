@@ -1,6 +1,6 @@
-"""Integration tests: run the real mini_redis_server binary and talk to it over TCP.
+"""Integration tests: run the real kosh-server binary and talk to it over TCP.
 
-Usage:  python3 tests/integration/test_server.py <path-to-mini_redis_server> [unittest args]
+Usage:  python3 tests/integration/test_server.py <path-to-kosh-server> [unittest args]
 CTest runs this automatically (see CMakeLists.txt).
 
 Standard library only, so the test suite stays dependency-free. Each test starts
@@ -42,7 +42,7 @@ def describe_exit(returncode):
 
 
 class ServerProcess:
-    """A running mini_redis_server on a free port, working in `workdir`.
+    """A running kosh-server on a free port, working in `workdir`.
     `nofile` limits its open files (POSIX): a soft limit, or (soft, hard).
     `fsize` limits the size of the files it writes, in bytes (soft limit)."""
 
@@ -53,6 +53,9 @@ class ServerProcess:
             workdir = self._tmp.name
         self.workdir = workdir
         self.port = free_port()
+        # Where clients connect: the --bind address, or loopback
+        bind = args[args.index("--bind") + 1] if "--bind" in args else "0.0.0.0"
+        self.host = "127.0.0.1" if bind == "0.0.0.0" else bind
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
         def set_limits():
@@ -63,10 +66,10 @@ class ServerProcess:
             if fsize:
                 resource.setrlimit(resource.RLIMIT_FSIZE,
                                    (fsize, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
-        # ctest runs the suite once more with MINI_REDIS_POLLER=select, so the
+        # ctest runs the suite once more with KOSH_POLLER=select, so the
         # select() path stays tested now that Linux uses epoll by default. A
         # test that names a poller itself keeps it.
-        poller = os.environ.get("MINI_REDIS_POLLER")
+        poller = os.environ.get("KOSH_POLLER")
         if poller and "--poller" not in args:
             args = (*args, "--poller", poller)
         self.proc = subprocess.Popen(
@@ -81,10 +84,21 @@ class ServerProcess:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"server exited during startup ({describe_exit(self.proc.returncode)}):\n{self.output()}")
             try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
-                return
+                socket.create_connection((self.host, self.port), timeout=0.2).close()
             except OSError:
                 time.sleep(0.05)
+                continue
+            # The server counts the probe as a client until it reads its close.
+            # A test that counts clients (--maxclients, INFO) starts only after
+            # that: otherwise the probe and the test's own connections can wait
+            # in the backlog together, be accepted in one pass, and the probe
+            # takes a slot (seen: 22 of 200 runs refused a client too early).
+            while time.monotonic() < deadline:
+                log = self.output()
+                if "Client disconnected" in log or "Client refused" in log:
+                    return
+                time.sleep(0.01)
+            break
         self.stop()
         raise RuntimeError(f"server did not listen on port {self.port} within {timeout} s")
 
@@ -98,9 +112,13 @@ class ServerProcess:
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
     def output(self):
-        self._log.flush()
-        self._log.seek(0)
-        return self._log.read()
+        # Through a handle of its own. The server's stdout is self._log's open
+        # file, and every handle to one open file shares its offset: seeking
+        # self._log back to read moved where the server's next line went, so a
+        # line logged meanwhile overwrote the log's start and the read began
+        # after it (seen once in ctest; a sleep after the seek made it every time).
+        with open(self._log.name) as log:
+            return log.read()
 
     def stop(self):
         if self.is_running():
@@ -135,8 +153,8 @@ class RespError(Exception):
 class Client:
     """Minimal RESP client: sends commands as RESP arrays, parses one reply per call."""
 
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    def __init__(self, port, host="127.0.0.1"):
+        self.sock = socket.create_connection((host, port), timeout=5)
         self.reader = self.sock.makefile("rb")
 
     def call(self, *args):
@@ -202,6 +220,15 @@ class BasicCommandTest(ServerTestCase):
             self.assertEqual(c.call("GET", "greeting"), value)
             self.assertIsNone(c.call("GET", "missing"))
 
+    def test_log_lines_are_written_at_once(self):
+        # The log is a file here, as under systemd or docker: each line must
+        # reach it while the server runs, not when a buffer fills or at exit.
+        # The server logs a connection when it accepts it, before reading the
+        # PING, so the line is written by the time PONG arrives.
+        with Client(self.server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+            self.assertIn("Client connected", self.server.output())
+
     def test_bgrewriteaof_reports_error_when_aof_is_disabled(self):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError):
@@ -214,7 +241,7 @@ class BasicCommandTest(ServerTestCase):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call("SAVE")
-            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE'")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'SAVE', with args beginning with: ")
         self.assertFalse(os.path.exists(os.path.join(self.server.workdir, "dump.rdb")))
 
 
@@ -489,14 +516,15 @@ class ErrorReplyTest(ServerTestCase):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call(b"bad\r\nname")
-            self.assertEqual(str(caught.exception), "ERR unknown command 'bad  name'")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'bad  name', with args beginning with: ")
             self.assertEqual(c.call("PING"), b"PONG")
 
     def test_long_command_name_is_quoted_up_to_128_bytes(self):
         with Client(self.server.port) as c:
             with self.assertRaises(RespError) as caught:
                 c.call(b"x" * 10_000)
-            self.assertEqual(str(caught.exception), "ERR unknown command '" + "x" * 128 + "'")
+            self.assertEqual(str(caught.exception),
+                             "ERR unknown command '" + "x" * 128 + "', with args beginning with: ")
 
 
 class AofDamageTest(ServerTestCase):
@@ -547,6 +575,27 @@ def pipeline(client, commands):
     """Sends all `commands` at once, then reads one reply for each."""
     client.sock.sendall(b"".join(Client.encode(cmd) for cmd in commands))
     return [client.read_reply() for _ in commands]
+
+
+class SeveralKeysAndCountersTest(ServerTestCase):
+    """MSET, DEL with several keys and the counters, through a real server and
+    a restart: each command is one AOF record, and replay gives the same data"""
+
+    def test_they_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            first = self.start_server(workdir=workdir)
+            with Client(first.port) as c:
+                self.assertEqual(c.call("MSET", "a", "1", "b", "2", "n", "10"), b"OK")
+                self.assertEqual(c.call("INCR", "n"), 11)
+                self.assertEqual(c.call("DECRBY", "n", "3"), 8)
+                self.assertEqual(c.call("DEL", "a", "missing"), 1)
+                self.assertEqual(c.call("EXISTS", "a", "b", "n"), 2)
+            first.stop()
+            second = self.start_server(workdir=workdir)
+            with Client(second.port) as c:
+                self.assertEqual(c.call("MGET", "a", "b", "n"), [None, b"2", b"8"])
+                self.assertEqual(c.call("INCR", "n"), 9)
+            second.stop()
 
 
 class AofGroupCommitTest(ServerTestCase):
@@ -613,7 +662,10 @@ class AofWriteErrorTest(ServerTestCase):
         value = b"v" * 100
         with tempfile.TemporaryDirectory() as workdir:
             server = self.start_server(workdir=workdir, fsize=4096)
-            with Client(server.port) as c:
+            with Client(server.port) as c, Client(server.port) as t:
+                # A transaction queued while the AOF still takes writes
+                t.call("MULTI")
+                self.assertEqual(t.call("SET", "tx", "1"), b"QUEUED")
                 acknowledged, refusal = [], None
                 for i in range(100):     # about 130 bytes each: 4 KB holds about 30
                     try:
@@ -625,6 +677,21 @@ class AofWriteErrorTest(ServerTestCase):
                 self.assertIsNotNone(refusal, "every SET was acknowledged")
                 self.assertEqual(refusal, "MISCONF Errors writing to the AOF file: File too large")
                 self.assertEqual(c.call("GET", "k0"), value)     # reads still work
+
+                # As in Redis, a transaction that writes is refused whole at EXEC
+                with self.assertRaisesRegex(RespError, "^EXECABORT Transaction discarded because of: MISCONF"):
+                    t.call("EXEC")
+                # A write queued now is refused as it queues, and aborts its transaction
+                c.call("MULTI")
+                with self.assertRaisesRegex(RespError, "^MISCONF"):
+                    c.call("SET", "tx", "2")
+                with self.assertRaisesRegex(RespError, "^EXECABORT Transaction discarded because of previous"):
+                    c.call("EXEC")
+                # One that only reads still runs
+                c.call("MULTI")
+                c.call("GET", "k0")
+                self.assertEqual(c.call("EXEC"), [value])
+                self.assertIsNone(c.call("GET", "tx"))
 
                 # Room on the disk again: what was waiting is written, writes resume
                 hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
@@ -668,10 +735,327 @@ class AofWriteErrorTest(ServerTestCase):
             restarted.stop()
 
 
+def network_ipv4():
+    """This machine's address on its network (not loopback), or None. Connecting
+    from it is what a client on another machine looks like to the server. A UDP
+    connect() only picks a route: it sends nothing."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))   # RFC 5737: for documentation, never a real host
+            address = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if address.startswith("127.") or address == "0.0.0.0" else address
+
+
+def read_until_closed(host, port, timeout=2.0):
+    """Connects, sends nothing, and returns what the server sends before closing."""
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        received = b""
+        while chunk := s.recv(4096):
+            received += chunk
+        return received
+
+
+class NetworkAccessTest(ServerTestCase):
+    """Who can connect: --bind and protected mode."""
+
+    def network_address(self):
+        address = network_ipv4()
+        if address is None:
+            self.skipTest("this machine has no network address besides loopback")
+        return address
+
+    def test_listens_on_loopback_only_by_default(self):
+        server = self.start_server("--appendonly", "no")
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection((self.network_address(), server.port), timeout=2).close()
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn(f"listening on 127.0.0.1:{server.port}", server.output())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux routes all of 127.0.0.0/8 to loopback")
+    def test_bind_picks_the_address(self):
+        server = self.start_server("--appendonly", "no", "--bind", "127.0.0.2")
+        with Client(server.port, host="127.0.0.2") as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", server.port), timeout=2).close()
+
+    def test_protected_mode_refuses_other_machines(self):
+        # Every interface, but no password: as Redis, only this machine is served
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0")
+        reply = read_until_closed(self.network_address(), server.port)
+        self.assertTrue(reply.startswith(b"-DENIED Kosh is running in protected mode"), reply)
+        self.assertTrue(reply.endswith(b"\r\n") and reply.count(b"\r\n") == 1, reply)
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn("(protected mode)", server.output())
+
+    def test_protected_mode_no_serves_other_machines(self):
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0", "--protected-mode", "no")
+        with Client(server.port, host=self.network_address()) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+        self.assertIn("WARNING: protected mode is off and no password is set", server.output())
+
+    def test_with_a_password_other_machines_may_authenticate(self):
+        # Protected mode is for servers with no password; with one, AUTH decides
+        server = self.start_server("--appendonly", "no", "--bind", "0.0.0.0", "--requirepass", "s3cret")
+        with Client(server.port, host=self.network_address()) as c:
+            with self.assertRaisesRegex(RespError, "^NOAUTH"):
+                c.call("PING")
+            self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertEqual(c.call("PING"), b"PONG")
+
+
+class Resp3Client(Client):
+    """A client that speaks RESP3 after HELLO 3: reads its maps, sets, nulls
+    and verbatim strings too, and keeps each reply's type marker, so a test
+    can check what was sent, not only what it decodes to."""
+
+    def read_typed(self):
+        line = self.reader.readline()
+        if not line.endswith(b"\r\n"):
+            raise ConnectionError(f"connection closed mid-reply: {line!r}")
+        kind, payload = line[:1], line[1:-2]
+        if kind == b"_":
+            return kind, None
+        if kind == b"%":
+            items = [self.read_typed()[1] for _ in range(2 * int(payload))]
+            return kind, dict(zip(items[::2], items[1::2]))
+        if kind == b"~":
+            return kind, {self.read_typed()[1] for _ in range(int(payload))}
+        if kind == b"=":
+            return kind, self.reader.read(int(payload) + 2)[:-2]
+        if kind == b"*":
+            return kind, [self.read_typed()[1] for _ in range(int(payload))]
+        if kind == b"$":
+            length = int(payload)
+            return kind, None if length < 0 else self.reader.read(length + 2)[:-2]
+        if kind == b"-":
+            raise RespError(payload.decode())
+        return kind, int(payload) if kind == b":" else payload
+
+    def typed(self, *args):
+        self.sock.sendall(self.encode(args))
+        return self.read_typed()
+
+
+class Resp3Test(ServerTestCase):
+    """HELLO and RESP3, which redis-py 8 and node-redis 6 ask for on connect."""
+
+    def test_hello_3_switches_only_its_own_connection(self):
+        server = self.start_server("--appendonly", "no")
+        with Resp3Client(server.port) as v3, Resp3Client(server.port) as v2:
+            kind, hello = v3.typed("HELLO", "3")
+            self.assertEqual(kind, b"%")
+            self.assertEqual((hello[b"server"], hello[b"proto"]), (b"kosh", 3))
+            v3.typed("HSET", "h", "f", "1")
+            self.assertEqual(v3.typed("HGETALL", "h"), (b"%", {b"f": b"1"}))
+            self.assertEqual(v3.typed("GET", "missing"), (b"_", None))
+            # The other connection still speaks RESP2
+            self.assertEqual(v2.typed("HGETALL", "h"), (b"*", [b"f", b"1"]))
+            self.assertEqual(v2.typed("GET", "missing"), (b"$", None))
+
+    def test_hello_authenticates_as_clients_send_it(self):
+        # redis-py and node-redis, given a password, open with HELLO 3 AUTH default <password>
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        with Resp3Client(server.port) as c:
+            with self.assertRaisesRegex(RespError, "^NOAUTH HELLO must be called"):
+                c.typed("HELLO", "3")
+            with self.assertRaisesRegex(RespError, WRONGPASS):
+                c.typed("HELLO", "3", "AUTH", "default", "wrong")
+            kind, hello = c.typed("HELLO", "3", "AUTH", "default", "s3cret")
+            self.assertEqual((kind, hello[b"proto"]), (b"%", 3))
+            self.assertEqual(c.typed("SMEMBERS", "missing"), (b"~", set()))
+
+    def test_client_ids_and_names(self):
+        server = self.start_server("--appendonly", "no")
+        with Resp3Client(server.port) as a, Resp3Client(server.port) as b:
+            ids = [a.typed("CLIENT", "ID")[1], b.typed("CLIENT", "ID")[1]]
+            self.assertLess(ids[0], ids[1])
+            a.typed("CLIENT", "SETNAME", "worker-1")
+            self.assertEqual(a.typed("CLIENT", "GETNAME"), (b"$", b"worker-1"))
+            self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", None))   # names are per connection
+            _, hello = b.typed("HELLO", "3", "SETNAME", "worker-2")
+            self.assertEqual(hello[b"id"], ids[1])
+            self.assertEqual(b.typed("CLIENT", "GETNAME"), (b"$", b"worker-2"))
+
+
+class InfoTest(ServerTestCase):
+    """INFO's server counters, which only a running server has."""
+
+    @staticmethod
+    def info(client, section="all"):
+        text = client.call("INFO", section).decode()
+        return dict(line.split(":", 1) for line in text.split("\r\n") if ":" in line and not line.startswith("#"))
+
+    def test_server_counters(self):
+        server = self.start_server("--appendonly", "no", "--maxclients", "2")
+        with Client(server.port) as a, Client(server.port) as b:
+            # A third client is refused, and counted
+            self.assertEqual(exchange_raw(server.port, b""), b"-ERR max number of clients reached\r\n")
+            info = self.info(a)
+            self.assertEqual(info["rejected_connections"], "1")
+            self.assertGreaterEqual(int(info["total_connections_received"]), 3)   # a, b, and the start-up probe
+            self.assertEqual((info["connected_clients"], info["maxclients"]), ("2", "2"))
+            self.assertEqual(info["tcp_port"], str(server.port))
+            self.assertEqual(info["aof_enabled"], "0")
+            # A burst of commands over about half a second shows in the rate
+            for _ in range(10):
+                a.sock.sendall(Client.encode(["PING"]) * 500)
+                for _ in range(500):
+                    a.read_reply()
+                time.sleep(0.05)
+            self.assertGreater(int(self.info(a, "stats")["instantaneous_ops_per_sec"]), 0)
+            b.call("GET", "missing")
+            self.assertEqual(self.info(b, "stats")["keyspace_misses"], "1")
+
+
+class TransactionTest(ServerTestCase):
+    """MULTI/EXEC/DISCARD over real connections (redis-py's pipeline() uses them by default)."""
+
+    def test_transaction_runs_at_exec_and_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                c.sock.sendall(b"".join(Client.encode(cmd) for cmd in
+                               (["MULTI"], ["SET", "a", "1"], ["RPUSH", "l", "x", "y"], ["GET", "a"], ["EXEC"])))
+                self.assertEqual([c.read_reply() for _ in range(4)], [b"OK", b"QUEUED", b"QUEUED", b"QUEUED"])
+                self.assertEqual(c.read_reply(), [b"OK", 2, b"1"])
+            server.stop()
+            restarted = self.start_server(workdir=workdir)
+            with Client(restarted.port) as c:
+                self.assertEqual(c.call("GET", "a"), b"1")
+                self.assertEqual(c.call("LRANGE", "l", 0, -1), [b"x", b"y"])
+
+    def test_a_transaction_is_its_connections_own(self):
+        server = self.start_server("--appendonly", "no")
+        with Client(server.port) as a, Client(server.port) as b:
+            a.call("MULTI")
+            self.assertEqual(a.call("SET", "k", "v"), b"QUEUED")
+            self.assertIsNone(b.call("GET", "k"))          # not run yet, and b isn't queuing
+            self.assertEqual(a.call("EXEC"), [b"OK"])
+            self.assertEqual(b.call("GET", "k"), b"v")
+        # A client that disconnects in the middle of one leaves nothing behind
+        with Client(server.port) as a:
+            a.call("MULTI")
+            a.call("SET", "gone", "1")
+        with Client(server.port) as b:
+            self.assertIsNone(b.call("GET", "gone"))
+
+    def test_incomplete_transaction_in_the_aof_is_cut_off_at_startup(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            before = Client.encode(["SET", "x", "1"])
+            with open(os.path.join(workdir, "appendonly.aof"), "wb") as f:
+                f.write(before + Client.encode(["MULTI"]) + Client.encode(["SET", "a", "1"]))
+            server = self.start_server(workdir=workdir)
+            with Client(server.port) as c:
+                self.assertEqual(c.call("GET", "x"), b"1")
+                self.assertIsNone(c.call("GET", "a"))
+            self.assertIn("incomplete record or transaction", server.output())
+            server.stop()
+            with open(os.path.join(workdir, "appendonly.aof"), "rb") as f:
+                self.assertEqual(f.read(), before)
+
+
+NOAUTH = "^NOAUTH Authentication required.$"
+WRONGPASS = "^WRONGPASS invalid username-password pair or user is disabled.$"
+
+
+class AuthTest(ServerTestCase):
+    """--requirepass and AUTH over real connections."""
+
+    def test_every_connection_must_authenticate(self):
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        with Client(server.port) as c:
+            with self.assertRaisesRegex(RespError, NOAUTH):
+                c.call("SET", "k", "v")
+            with self.assertRaisesRegex(RespError, WRONGPASS):
+                c.call("AUTH", "wrong")
+            self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertEqual(c.call("SET", "k", "v"), b"OK")
+        with Client(server.port) as c:    # a new connection starts over
+            with self.assertRaisesRegex(RespError, NOAUTH):
+                c.call("GET", "k")
+            self.assertEqual(c.call("AUTH", "default", "s3cret"), b"OK")
+            self.assertEqual(c.call("GET", "k"), b"v")
+
+    def test_auth_and_commands_in_one_pipeline(self):
+        # The limits lift for the commands right behind AUTH in the same read
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        many = [f"v{i}" for i in range(20)]
+        with Client(server.port) as c:
+            c.sock.sendall(Client.encode(["AUTH", "s3cret"]) + Client.encode(["RPUSH", "l", *many])
+                           + Client.encode(["GET", "missing"]))
+            self.assertEqual(c.read_reply(), b"OK")
+            self.assertEqual(c.read_reply(), 20)
+            self.assertIsNone(c.read_reply())
+
+    def test_unauthenticated_clients_get_small_limits(self):
+        # Refused at the header, before any data, and disconnected (Redis's replies)
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        self.assertEqual(exchange_raw(server.port, b"*11\r\n"),
+                         b"-ERR Protocol error: unauthenticated multibulk length\r\n")
+        self.assertEqual(exchange_raw(server.port, b"*2\r\n$4\r\nAUTH\r\n$16385\r\n"),
+                         b"-ERR Protocol error: unauthenticated bulk length\r\n")
+        with Client(server.port) as c:    # after AUTH, the usual limits
+            c.call("AUTH", "s3cret")
+            self.assertEqual(c.call("SET", "big", "x" * 100000), b"OK")
+
+    def test_password_from_a_file(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "password")
+            with open(path, "w", newline="") as f:
+                f.write("s3cret\r\n")     # one line ending is not part of the password
+            server = self.start_server("--appendonly", "no", "--requirepass-file", path)
+            with Client(server.port) as c:
+                with self.assertRaisesRegex(RespError, WRONGPASS):
+                    c.call("AUTH", "s3cret\r\n")
+                self.assertEqual(c.call("AUTH", "s3cret"), b"OK")
+            self.assertIn("this machine only, with the password", server.output())
+            self.assertNotIn("process list", server.output())
+
+    def test_password_given_directly_warns(self):
+        server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
+        self.assertIn("can read --requirepass in the process list", server.output())
+
+    def test_password_is_never_written_down(self):
+        # Neither in the log nor in the AOF: AUTH changes no data, so it isn't logged
+        with tempfile.TemporaryDirectory() as workdir:
+            server = self.start_server("--requirepass", "s3cret", workdir=workdir)
+            with Client(server.port) as c:
+                c.call("AUTH", "s3cret")
+                c.call("SET", "k", "v")
+                with self.assertRaises(RespError):
+                    c.call("AUTH", "s3cret-wrong")
+            server.stop()     # writes out what the AOF still buffers
+            with open(os.path.join(workdir, "appendonly.aof"), "rb") as f:
+                aof = f.read()
+            with open(os.path.join(workdir, "server.log"), "rb") as f:
+                log = f.read()
+        self.assertIn(b"SET", aof)
+        self.assertNotIn(b"s3cret", aof)
+        self.assertNotIn(b"s3cret", log)
+
+
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
         with tempfile.TemporaryDirectory() as workdir:
             return subprocess.run([SERVER_BINARY, *args], cwd=workdir, capture_output=True, timeout=5)
+
+    def test_version_matches_what_the_running_server_reports(self):
+        # One version, from Version.h: --version, INFO and the start-up log must agree
+        for flag in ("--version", "-v"):
+            with self.subTest(flag=flag):
+                result = self.run_server(flag)
+                self.assertEqual(result.returncode, 0)
+                self.assertRegex(result.stdout.decode(), r"^kosh-server \d+\.\d+\.\d+\n$")
+        version = self.run_server("--version").stdout.decode().split()[1]
+        server = self.start_server("--appendonly", "no")
+        with Client(server.port) as c:
+            self.assertEqual(InfoTest.info(c, "server")["kosh_version"], version)
+        self.assertIn(f"Kosh {version} listening on", server.output())
 
     def test_help_exits_zero(self):
         result = self.run_server("--help")
@@ -686,12 +1070,51 @@ class CommandLineTest(ServerTestCase):
             ("--appendfsync", "sometimes"), ("--appendfsync",),
             ("--poller", "kqueue"), ("--maxclients", "0"), ("--maxclients", "many"),
             ("--eviction", "fifo"), ("--eviction",),
+            # Numeric IPv4 only: no host names, IPv6 or partial addresses
+            ("--bind", "localhost"), ("--bind", "1.2.3"), ("--bind", "256.0.0.1"),
+            ("--bind", "::1"), ("--bind", ""), ("--bind",),
+            ("--protected-mode", "on"), ("--protected-mode",),
+            ("--requirepass", ""), ("--requirepass", "p" * 513), ("--requirepass", "two\nlines"),
+            ("--requirepass",), ("--requirepass-file", os.path.join("no", "such", "file")),
+            ("--requirepass-file",),
         ]
         for args in cases:
             with self.subTest(args=args):
                 result = self.run_server(*args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertTrue(result.stderr, "expected an error message on stderr")
+
+    def test_a_rejected_password_is_not_printed(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "password")
+            for content in ("first line\nsecond line\n", "\n", "q" * 600):
+                with self.subTest(content=content[:20]):
+                    with open(path, "w", newline="") as f:
+                        f.write(content)
+                    result = self.run_server("--requirepass-file", path)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(b"Invalid --requirepass-file: ", result.stderr)
+                    for secret in (b"first line", b"qqqq"):
+                        self.assertNotIn(secret, result.stderr)
+        result = self.run_server("--requirepass", "p" * 513)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"longer than 512 bytes", result.stderr)
+        self.assertNotIn(b"pppp", result.stderr)
+
+    def test_failing_to_listen_says_why(self):
+        # The reason is the system's own (glibc's wording), so a wrong error
+        # code shows. 192.0.2.1 (RFC 5737, for documentation) is no machine's address.
+        port = free_port()
+        result = self.run_server("--port", str(port), "--bind", "192.0.2.1", "--appendonly", "no")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Cannot listen on 192.0.2.1:%d: Cannot assign requested address" % port,
+                      result.stderr)
+
+        server = self.start_server("--appendonly", "no")
+        result = self.run_server("--port", str(server.port), "--appendonly", "no")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Cannot listen on 127.0.0.1:%d: Address already in use" % server.port,
+                      result.stderr)
 
     def test_unopenable_aof_file_fails_fast(self):
         # Running without persistence while the user believes it is on would be worse than not starting.
@@ -749,6 +1172,6 @@ class CommandLineTest(ServerTestCase):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        sys.exit(f"usage: {sys.argv[0]} <path-to-mini_redis_server> [unittest args]")
+        sys.exit(f"usage: {sys.argv[0]} <path-to-kosh-server> [unittest args]")
     SERVER_BINARY = os.path.abspath(sys.argv.pop(1))
     unittest.main()

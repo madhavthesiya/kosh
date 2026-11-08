@@ -1,0 +1,6 @@
+# Fuzz inputs are raw bytes from clients, CRLF included: never convert them
+tests/fuzz/corpus/** binary
+
+# Docker reads these on any OS: a CRLF after a line-ending backslash breaks RUN
+Dockerfile text eol=lf
+.dockerignore text eol=lf

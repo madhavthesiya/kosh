@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory per key: Mini-Redis against real Redis, for the same keys.
+"""Memory per key: Kosh against real Redis, for the same keys.
 
 Loads N keys shaped like redis-benchmark's (16-byte "key:000000012345", 3-byte
 values) into each server over one pipelined connection, and reports how much
@@ -7,11 +7,11 @@ the server's resident memory (VmRSS) grew, per key. RSS is the measure both
 servers share: it counts the hash table, every allocation, and the
 allocator's own headers and fragmentation.
 
-- Mini-Redis sizes its hash table for --maxkeys at startup, so its baseline
+- Kosh sizes its hash table for --maxkeys at startup, so its baseline
   comes from a server started with --maxkeys 1, and the growth includes the
   bucket array. Redis's table grows as keys arrive, so its baseline is the
   empty server itself.
-- Redis allocates with jemalloc, Mini-Redis with glibc's malloc. Mini-Redis is
+- Redis allocates with jemalloc, Kosh with glibc's malloc. Kosh is
   also measured with jemalloc (LD_PRELOAD), to separate the allocator from the
   data layout.
 - No AOF for either, and no snapshots for Redis. Redis's own count of its
@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--runs", type=int, default=3, help="runs per server (median reported)")
     p.add_argument("--redis-server", default="redis-server")
     p.add_argument("--jemalloc", default="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
-                   help="jemalloc library to preload into Mini-Redis ('' to skip)")
+                   help="jemalloc library to preload into Kosh ('' to skip)")
     p.add_argument("--build-dir", type=Path, default=bl.REPO_ROOT / "build-bench")
     args = p.parse_args()
     if args.keys % BATCH:
@@ -91,14 +91,14 @@ def used_memory(port):
 def measure_mini(binary, keys, env):
     """RSS growth for `keys` keys: a server sized for them and loaded, against
     one started with --maxkeys 1"""
-    with tempfile.TemporaryDirectory(prefix="mini-redis-mem-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-mem-") as workdir:
         port = bl.free_port()
-        with bl.Server(bl.mini_redis_argv(binary, port, workdir, False, 1), workdir, port,
+        with bl.Server(bl.kosh_argv(binary, port, workdir, False, 1), workdir, port,
                        env=env) as srv:
             srv.wait_ready()
             base = rss_bytes(srv.proc.pid)
         port = bl.free_port()
-        with bl.Server(bl.mini_redis_argv(binary, port, workdir, False, keys), workdir, port,
+        with bl.Server(bl.kosh_argv(binary, port, workdir, False, keys), workdir, port,
                        env=env) as srv:
             srv.wait_ready()
             load(port, keys)
@@ -106,7 +106,7 @@ def measure_mini(binary, keys, env):
 
 
 def measure_redis(binary, keys):
-    with tempfile.TemporaryDirectory(prefix="mini-redis-mem-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-mem-") as workdir:
         port = bl.free_port()
         with bl.Server(bl.redis_argv(binary, port, workdir, False), workdir, port) as srv:
             srv.wait_ready()
@@ -119,15 +119,15 @@ def main():
     args = parse_args()
     if args.out.exists():
         sys.exit(f"{args.out} already exists; pick another --out or delete it")
-    args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
+    args.build_dir = bl.build(args.build_dir, ["kosh-server"])
     bl.check_optimised(args.build_dir)
-    binary = args.build_dir / "mini_redis_server"
+    binary = args.build_dir / "kosh-server"
 
-    configs = [("Mini-Redis", "glibc malloc", lambda: measure_mini(binary, args.keys, None))]
+    configs = [("Kosh", "glibc malloc", lambda: measure_mini(binary, args.keys, None))]
     if args.jemalloc:
         if not Path(args.jemalloc).exists():
             sys.exit(f"{args.jemalloc} not found (install libjemalloc2, or pass --jemalloc '')")
-        configs.append(("Mini-Redis", "jemalloc (LD_PRELOAD)",
+        configs.append(("Kosh", "jemalloc (LD_PRELOAD)",
                         lambda: measure_mini(binary, args.keys, {"LD_PRELOAD": args.jemalloc})))
     configs.append(("Redis", "jemalloc (built in)", lambda: measure_redis(args.redis_server, args.keys)))
 
@@ -145,7 +145,7 @@ def main():
              bl.environment_markdown(bl.environment(args.build_dir, tools=["redis-server"])), "",
              f"- **Keys:** {args.keys:,} keys of 16 bytes (`key:000000012345`) with 3-byte "
              "values, loaded over one connection, 1,000 SETs per write; no AOF.",
-             "- **Measure:** growth of the server's resident memory (VmRSS). Mini-Redis's "
+             "- **Measure:** growth of the server's resident memory (VmRSS). Kosh's "
              "baseline is a server started with `--maxkeys 1`, so the growth includes the "
              "hash table it sizes at startup; Redis's is the empty server.",
              f"- **Runs:** {args.runs}, the order alternating; median, with every run's "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput and latency of Mini-Redis, measured the same way against real Redis.
+"""Throughput and latency of Kosh, measured the same way against real Redis.
 
 For each server, AOF setting and pipeline depth, one run:
   1. starts a fresh server in an empty temporary directory (no old AOF to replay),
@@ -36,13 +36,13 @@ import benchlib as bl
 FIELDS = ["run", "server", "aof", "pipeline", "test", "rps", "avg_ms", "min_ms", "p50_ms",
           "p95_ms", "p99_ms", "max_ms", "seconds", "server_cpu_pct", "kernel_pct",
           "client_cpu_pct", "aof_bytes"]
-SERVER_NAMES = {"mini": "Mini-Redis", "redis": "Redis"}
+SERVER_NAMES = {"kosh": "Kosh", "redis": "Redis"}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--out", required=True, type=Path, help="results directory")
-    p.add_argument("--servers", default="mini,redis", help="mini, redis or both (default)")
+    p.add_argument("--servers", default="kosh,redis", help="kosh (also its old name, mini), redis, or both (default)")
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--requests", type=int, default=1_000_000, help="per unpipelined test (-n)")
     # With --threads, redis-benchmark notices that a run has finished only on its
@@ -67,11 +67,14 @@ def parse_args():
     p.add_argument("--redis-server", default="redis-server")
     p.add_argument("--redis-benchmark", default="redis-benchmark")
     args = p.parse_args()
-    args.servers = args.servers.split(",")
+    # "mini" is the server's name before it became Kosh. compare_commits.py
+    # still passes it, because it runs each commit's own bench.py, and the
+    # older ones only know "mini".
+    args.servers = ["kosh" if s == "mini" else s for s in args.servers.split(",")]
     args.pipelines = [int(x) for x in args.pipelines.split(",")]
     args.aof = [x == "on" for x in args.aof.split(",")]
     if set(args.servers) - set(SERVER_NAMES) or args.runs < 1:
-        p.error("--servers takes mini and/or redis; --runs must be at least 1")
+        p.error("--servers takes kosh and/or redis; --runs must be at least 1")
     return args
 
 
@@ -113,11 +116,11 @@ def aof_bytes(workdir):
 def measure(args, binaries, run, server, aof, pipeline):
     """One run: fresh server, SET then GET. Returns one row per test."""
     rows = []
-    with tempfile.TemporaryDirectory(prefix="mini-redis-bench-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-bench-") as workdir:
         port = bl.free_port()
-        if server == "mini":
+        if server == "kosh":
             # Twice the keyspace, so SET never evicts.
-            argv = bl.mini_redis_argv(binaries["mini"], port, workdir, aof, 2 * args.keyspace,
+            argv = bl.kosh_argv(binaries["kosh"], port, workdir, aof, 2 * args.keyspace,
                                       args.appendfsync)
         else:
             argv = bl.redis_argv(binaries["redis"], port, workdir, aof, args.appendfsync)
@@ -168,7 +171,7 @@ def summarise(rows, args):
     for r in rows:
         groups.setdefault((r["aof"], r["pipeline"], r["test"], r["server"]), []).append(r)
     summary = []
-    for key in sorted(groups, key=lambda k: (k[0] == "off", k[1], k[2] != "SET", k[3] != "mini")):
+    for key in sorted(groups, key=lambda k: (k[0] == "off", k[1], k[2] != "SET", k[3] != "kosh")):
         runs = sorted(groups[key], key=lambda r: r["rps"])
         mid = runs[(len(runs) - 1) // 2]
         rps = [r["rps"] for r in runs]
@@ -214,10 +217,10 @@ def markdown(summary, args, env_rows, commands):
 
     by_key = {(s["server"], s["aof"], s["pipeline"], s["test"]): s for s in summary}
     pairs = [(k[1:], by_key[k], by_key.get(("redis",) + k[1:]))
-             for k in by_key if k[0] == "mini" and ("redis",) + k[1:] in by_key]
+             for k in by_key if k[0] == "kosh" and ("redis",) + k[1:] in by_key]
     if pairs:
-        out += ["", "## Mini-Redis relative to Redis", "",
-                "| AOF | Pipeline | Test | Mini-Redis req/s | Redis req/s | Mini-Redis / Redis |",
+        out += ["", "## Kosh relative to Redis", "",
+                "| AOF | Pipeline | Test | Kosh req/s | Redis req/s | Kosh / Redis |",
                 "|---|---:|---|---:|---:|---:|"]
         for (aof, pipeline, test), mini, redis in pairs:
             out.append(f"| {aof} | {pipeline} | {test} | {mini['median_rps']:,.0f} | "
@@ -234,13 +237,13 @@ def main():
         sys.exit(f"{runs_csv} already exists; pick another --out or delete it")
 
     binaries = {}
-    if "mini" in args.servers:
-        args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
+    if "kosh" in args.servers:
+        args.build_dir = bl.build(args.build_dir, ["kosh-server"])
         bl.check_optimised(args.build_dir)
-        binaries["mini"] = args.build_dir / "mini_redis_server"
+        binaries["kosh"] = args.build_dir / "kosh-server"
     if "redis" in args.servers:
         binaries["redis"] = args.redis_server
-    env_rows = bl.environment(args.build_dir if "mini" in args.servers else None,
+    env_rows = bl.environment(args.build_dir if "kosh" in args.servers else None,
                               tools=["redis-server", "redis-benchmark", "taskset"])
 
     for cpu in bl.cpu_list(args.client_cpus):
@@ -251,9 +254,9 @@ def main():
     # The exact command lines, with placeholders for what changes per run.
     commands = []
     example = Path("<tmp>")
-    if "mini" in args.servers:
-        commands.append(show(bl.pinned(args.server_cpu, bl.mini_redis_argv(
-            "build-bench/mini_redis_server", "<port>", example, True, 2 * args.keyspace,
+    if "kosh" in args.servers:
+        commands.append(show(bl.pinned(args.server_cpu, bl.kosh_argv(
+            "build-bench/kosh-server", "<port>", example, True, 2 * args.keyspace,
             args.appendfsync))))
     if "redis" in args.servers:
         commands.append(show(bl.pinned(args.server_cpu, bl.redis_argv(
@@ -271,7 +274,7 @@ def main():
         for run in range(1, args.runs + 1):
             # Which server goes first alternates from run to run: anything that
             # drifts within a run (a CPU's boost budget running out, say) must
-            # not always favour the same one. (Until Phase 4, Mini-Redis always
+            # not always favour the same one. (Until Phase 4, Kosh always
             # went first.)
             servers = args.servers if run % 2 else list(reversed(args.servers))
             cases = [(aof, p, s) for aof in args.aof for p in args.pipelines for s in servers]

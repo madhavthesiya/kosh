@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(mini-redis LANGUAGES CXX)
+project(kosh LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -35,17 +35,17 @@ endif()
 find_package(Threads REQUIRED)
 
 # Main executable (CLI mode)
-add_executable(mini_redis
+add_executable(kosh-cli
     main.cpp
     Commands.cpp
     InMemoryStorage.cpp
     AOFLogger.cpp
     RedisLite.cpp
 )
-target_link_libraries(mini_redis Threads::Threads)
+target_link_libraries(kosh-cli Threads::Threads)
 
 # Server executable (TCP + RESP mode)
-add_executable(mini_redis_server
+add_executable(kosh-server
     server_main.cpp
     Server.cpp
     Poller.cpp
@@ -54,9 +54,9 @@ add_executable(mini_redis_server
     AOFLogger.cpp
     RedisLite.cpp
 )
-target_link_libraries(mini_redis_server Threads::Threads)
+target_link_libraries(kosh-server Threads::Threads)
 if(WIN32)
-    target_link_libraries(mini_redis_server ws2_32)
+    target_link_libraries(kosh-server ws2_32)
 endif()
 
 # Unit tests
@@ -123,9 +123,40 @@ add_executable(alloc_count
 )
 target_link_libraries(alloc_count Threads::Threads)
 
+# Hash flooding against std::hash and KeyedHash, and SipHash's cost (see bench/README.md)
+add_executable(hash_flood bench/hash_flood.cpp)
+
+# Times a password check by where the guess goes wrong (see bench/README.md)
+add_executable(auth_compare
+    bench/auth_compare.cpp
+    Commands.cpp
+    InMemoryStorage.cpp
+    AOFLogger.cpp
+)
+target_link_libraries(auth_compare Threads::Threads)
+
+# Fuzz target: client bytes through the parser and the command table
+# (tests/fuzz). With GCC it gets a standalone driver that replays the corpus
+# (a ctest) or mutates it at random; with clang and -DKOSH_LIBFUZZER=ON it
+# is coverage-guided libFuzzer instead.
+option(KOSH_LIBFUZZER "Build fuzz_commands with libFuzzer (clang only)" OFF)
+if(KOSH_LIBFUZZER)
+    add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp
+        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+    target_compile_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
+else()
+    add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp tests/fuzz/standalone_main.cpp
+        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+endif()
+target_link_libraries(fuzz_commands Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+if(NOT KOSH_LIBFUZZER)
+    add_test(NAME fuzz_corpus COMMAND fuzz_commands ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
+endif()
 
 # Integration tests start the real server binary and talk to it over TCP.
 # They need Python 3 (standard library only); skipped if it isn't installed.
@@ -133,14 +164,27 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME integration_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
-                     $<TARGET_FILE:mini_redis_server>)
+                     $<TARGET_FILE:kosh-server>)
     # Linux serves with epoll by default; run everything with select() as well,
     # so both pollers stay tested
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME integration_tests_select
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
-                         $<TARGET_FILE:mini_redis_server>)
-        set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "MINI_REDIS_POLLER=select")
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+    endif()
+    # redis-py and node-redis against the server. Each is skipped, saying so,
+    # if it isn't installed; KOSH_REQUIRE_CLIENTS=1 makes that a failure (CI).
+    add_test(NAME client_library_tests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
+                     $<TARGET_FILE:kosh-server>)
+    # The same commands to real Redis and to Kosh, replies compared byte for
+    # byte; registered only where redis-server is installed
+    find_program(REDIS_SERVER redis-server)
+    if(REDIS_SERVER)
+        add_test(NAME redis_compatibility
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
+                         --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
     endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")

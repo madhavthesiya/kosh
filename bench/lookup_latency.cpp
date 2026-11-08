@@ -8,6 +8,10 @@
 // counters, so cache misses can't be counted; their effect shows instead as
 // the knee where the table stops fitting in the cache.
 //
+// Since C3c the engine hashes with SipHash-1-3 under a random key, while the
+// plain std::unordered_map and KeyTable here still use std::hash, as in the
+// earlier results; hash_flood.cpp measures what the keyed hash costs.
+//
 // The lookups run two ways:
 // - independent: every key is known in advance, so the CPU can overlap the
 //   cache misses of neighbouring lookups (memory-level parallelism), as it

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Where Mini-Redis spends its CPU time under load: perf samples and flame graphs.
+"""Where Kosh spends its CPU time under load: perf samples and flame graphs.
 
 For each workload it starts a fresh server, runs redis-benchmark in a loop
 against it, waits for the load to settle, then samples the server with
@@ -164,9 +164,9 @@ def benchmark_argv(args, port, test, pipeline, loop):
 
 def profile(args, perf, binary, name, outdir):
     test, pipeline = WORKLOADS[name]
-    with tempfile.TemporaryDirectory(prefix="mini-redis-profile-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="kosh-profile-") as workdir:
         port = bl.free_port()
-        argv = bl.mini_redis_argv(binary, port, workdir, args.aof == "on", 2 * args.keyspace)
+        argv = bl.kosh_argv(binary, port, workdir, args.aof == "on", 2 * args.keyspace)
         with bl.Server(argv, workdir, port, cpus=args.server_cpu) as srv:
             srv.wait_ready()
             if test == "get":   # fill the keyspace first, so GETs find their keys
@@ -201,7 +201,7 @@ def profile(args, perf, binary, name, outdir):
                                 check=True, capture_output=True).stdout
         folded = subprocess.run([str(args.flamegraph / "stackcollapse-perf.pl")], input=script,
                                 check=True, capture_output=True).stdout
-        title = (f"Mini-Redis {test.upper()} P={pipeline}, AOF {args.aof}: "
+        title = (f"Kosh {test.upper()} P={pipeline}, AOF {args.aof}: "
                  f"{args.clients} clients, {args.keyspace:,} keys")
         svg = subprocess.run([str(args.flamegraph / "flamegraph.pl"), "--title", title,
                               "--subtitle", f"commit {bl.git_commit_id()}, "
@@ -239,9 +239,9 @@ def main():
                      f"  git clone https://github.com/brendangregg/FlameGraph {args.flamegraph}")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
+    args.build_dir = bl.build(args.build_dir, ["kosh-server"])
     bl.check_optimised(args.build_dir)
-    binary = args.build_dir / "mini_redis_server"
+    binary = args.build_dir / "kosh-server"
     env_rows = bl.environment(args.build_dir)
     env_rows.append(("perf", subprocess.run([perf, "--version"], capture_output=True,
                                             text=True).stdout.strip()))
@@ -250,7 +250,7 @@ def main():
     lines = ["# CPU profile", "", bl.environment_markdown(env_rows), "",
              f"- **Sampling:** `perf record -e cpu-clock -F {args.freq} --call-graph "
              f"dwarf,16384 -p <server pid> -- sleep {args.seconds:g}`, after 2 s of load.",
-             f"- **Server:** `taskset -c {args.server_cpu} build-bench/mini_redis_server "
+             f"- **Server:** `taskset -c {args.server_cpu} build-bench/kosh-server "
              f"--maxkeys {2 * args.keyspace} --appendonly {'yes' if args.aof == 'on' else 'no'}`",
              f"- **Load:** `taskset -c {args.client_cpus} redis-benchmark -t <test> "
              f"-r {args.keyspace} -c {args.clients} -P <pipeline> -l"

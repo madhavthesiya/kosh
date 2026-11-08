@@ -1,0 +1,8 @@
+# Send only what the build needs: everything else (results, notes, a stray
+# password file or AOF) stays out of the build context.
+*
+!CMakeLists.txt
+!*.cpp
+!*.h
+!bench/*.cpp
+!tests/

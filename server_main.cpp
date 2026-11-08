@@ -3,16 +3,25 @@
 #include <optional>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
 #include "Commands.h"
 #include "Server.h"
+#include "Version.h"
 
 // Settings that would otherwise mean editing and rebuilding, e.g. a larger
 // key limit for benchmarks or a separate port and AOF file for tests.
-// Defaults match the server's previous hard-coded behaviour.
 struct ServerConfig {
     int port = 6379;
+    // Loopback: a server started with no options can't be reached from the
+    // network. (Redis listens on every interface unless its config file says
+    // otherwise, and relies on protected mode alone.)
+    std::string bindAddress = "127.0.0.1";
+    bool protectedMode = true;
+    std::optional<std::string> password;    // none: clients needn't AUTH
+    bool passwordInArgs = false;            // from --requirepass, which ps shows
     size_t maxKeys = 10000;
     // SIEVE: fewer misses than LRU on every trace measured, and a hit
     // writes nothing outside the entry (bench/results/after-memory-fixes)
@@ -26,8 +35,18 @@ struct ServerConfig {
 };
 
 static void printUsage(std::ostream& out) {
-    out << "Usage: mini_redis_server [options]\n"
+    out << "Usage: kosh-server [options]\n"
            "  --port <1-65535>         TCP port to listen on (default 6379)\n"
+           "  --bind <ipv4>            Address to listen on (default 127.0.0.1: this machine\n"
+           "                           only); 0.0.0.0 listens on every interface\n"
+           "  --protected-mode <yes|no>\n"
+           "                           With no password set, refuse clients on other\n"
+           "                           machines (default yes)\n"
+           "  --requirepass-file <path>\n"
+           "                           Clients must AUTH with the password in this file\n"
+           "                           (one line, at most 512 bytes) before anything else\n"
+           "  --requirepass <password> The same, given directly; other users on this machine\n"
+           "                           can read it in the process list, so prefer the file\n"
            "  --maxkeys <n>            Keys to hold before evicting one (default 10000)\n"
            "  --eviction <sieve|lru>   Which key a full server evicts: SIEVE's choice\n"
            "                           (NSDI 2024), or the least recently used (default sieve)\n"
@@ -39,6 +58,7 @@ static void printUsage(std::ostream& out) {
            "  --maxclients <n>         Clients served at once; more are refused (default 10000)\n"
            "  --poller <epoll|select>  How to wait for sockets (default: epoll on Linux,\n"
            "                           select elsewhere; select serves about 1,000 clients)\n"
+           "  --version                Print the version and exit\n"
            "  --help                   Show this message\n";
 }
 
@@ -55,14 +75,45 @@ static bool parseNumber(const std::string& text, T min, T max, T& out) {
     return true;
 }
 
-enum class ParseResult { Run, Help, Error };
+// The password in a file: its content minus one line ending. Reads at most a
+// little more than the longest password, so a wrong path to a huge file
+// can't take long. Returns why it can't be used, or "" if it can.
+static std::string readPasswordFile(const std::string& path, std::string& password) {
+    std::ifstream file(path, std::ios::binary);
+    if(!file) return "cannot open '" + path + "'";
+    std::string content(kMaxPasswordLength + 3, '\0');
+    file.read(&content[0], static_cast<std::streamsize>(content.size()));
+    if(file.bad()) return "cannot read '" + path + "'";
+    content.resize(static_cast<size_t>(file.gcount()));
+    if(!content.empty() && content.back() == '\n') content.pop_back();
+    if(!content.empty() && content.back() == '\r') content.pop_back();
+    password = std::move(content);
+    return "";
+}
+
+// Why a password can't be used, or "" if it can. The messages never quote it.
+static std::string passwordProblem(const std::string& password) {
+    if(password.empty()) return "the password is empty, which would protect nothing";
+    if(password.size() > kMaxPasswordLength) {
+        return "the password is longer than " + std::to_string(kMaxPasswordLength) + " bytes";
+    }
+    if(password.find_first_of("\r\n") != std::string::npos) {
+        return "the password must be one line";
+    }
+    return "";
+}
+
+enum class ParseResult { Run, Help, Version, Error };
 
 static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
     for(int i = 1; i < argc; i++) {
         std::string option = argv[i];
         if(option == "--help" || option == "-h") return ParseResult::Help;
+        if(option == "--version" || option == "-v") return ParseResult::Version;
 
-        if(option != "--port" && option != "--maxkeys" && option != "--eviction" &&
+        if(option != "--port" && option != "--bind" && option != "--protected-mode" &&
+           option != "--requirepass" && option != "--requirepass-file" &&
+           option != "--maxkeys" && option != "--eviction" &&
            option != "--appendonly" && option != "--appendfilename" && option != "--appendfsync" &&
            option != "--maxclients" && option != "--poller") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
@@ -77,6 +128,26 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         bool ok = true;
         if(option == "--port") {
             ok = parseNumber(value, 1, 65535, config.port);
+        } else if(option == "--bind") {
+            // Numeric only, so a host name can't resolve to an address nobody meant
+            in_addr address;
+            ok = parseIPv4(value.c_str(), address);
+            if(ok) config.bindAddress = value;
+        } else if(option == "--protected-mode") {
+            ok = (value == "yes" || value == "no");
+            if(ok) config.protectedMode = (value == "yes");
+        } else if(option == "--requirepass" || option == "--requirepass-file") {
+            // Not the generic message below, which would print the password
+            std::string password = value;
+            std::string problem;
+            if(option == "--requirepass-file") problem = readPasswordFile(value, password);
+            if(problem.empty()) problem = passwordProblem(password);
+            if(!problem.empty()) {
+                std::cerr << "Invalid " << option << ": " << problem << "\n";
+                return ParseResult::Error;
+            }
+            config.password = std::move(password);
+            config.passwordInArgs = (option == "--requirepass");
         } else if(option == "--maxkeys") {
             // 0 is rejected: eviction assumes at least one key fits
             ok = parseNumber<size_t>(value, 1, SIZE_MAX, config.maxKeys);
@@ -111,9 +182,24 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
 }
 
 int main(int argc, char* argv[]) {
+    // The log goes out a line at a time, as Redis's does, even when stdout is a
+    // file or a pipe (systemd, docker logs), which the C library would
+    // otherwise buffer a few KB at a time: a line would show up only once
+    // dozens more had followed it, or never if the server were killed. A
+    // write per log line costs little: lines are per connection, never per
+    // command. (std::cout writes through stdout while synced with stdio, the
+    // default.) Windows's C library treats line buffering as full buffering,
+    // so there it is unbuffered.
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+#endif
+
     ServerConfig config;
     switch(parseArgs(argc, argv, config)) {
         case ParseResult::Help:  printUsage(std::cout); return 0;
+        case ParseResult::Version: std::cout << "kosh-server " << kKoshVersion << "\n"; return 0;
         case ParseResult::Error: return 2;
         case ParseResult::Run:   break;
     }
@@ -141,8 +227,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         if(loaded.truncated_bytes > 0) {
-            std::cerr << "Warning: the AOF ended with an incomplete record (the server stopped "
-                         "while writing it); cut off its " << loaded.truncated_bytes << " bytes\n";
+            std::cerr << "Warning: the AOF ended with an incomplete record or transaction (the "
+                         "server stopped while writing it); cut off its " << loaded.truncated_bytes
+                      << " bytes\n";
         }
         std::cout << "Loaded " << loaded.commands
                   << (loaded.commands == 1 ? " command" : " commands") << " from the AOF\n";
@@ -158,10 +245,16 @@ int main(int argc, char* argv[]) {
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
     Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);
-    if(!server.start()) {
-        std::cerr << "Failed to start server on port " << config.port << "\n";
-        return 1;
+    server.setBindAddress(config.bindAddress);
+    server.setProtectedMode(config.protectedMode);
+    if(config.password) {
+        server.setPassword(*config.password);
+        if(config.passwordInArgs) {
+            std::cerr << "Warning: other users on this machine can read --requirepass in the "
+                         "process list; --requirepass-file keeps the password out of it\n";
+        }
     }
+    if(!server.start()) return 1;   // start() said why
 
     // Serve until a stop signal (exit code 0), or until the AOF fails for good
     // with --appendfsync always (exit code 1)

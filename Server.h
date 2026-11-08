@@ -1,11 +1,14 @@
 #pragma once
 #include "Socket.h"     // first: on Windows it must set FD_SETSIZE before winsock2.h is included
 #include "Poller.h"
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <unordered_map>
 
+#include "Commands.h"         // Transaction
 #include "InMemoryStorage.h"
 #include "RespParser.h"
 
@@ -21,6 +24,17 @@ public:
     Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr,
            std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
     ~Server();
+
+    // Set these before start().
+    // The IPv4 address to listen on: 127.0.0.1 by default, so only this
+    // machine can connect; 0.0.0.0 listens on every interface.
+    void setBindAddress(std::string address) { bind_address_ = std::move(address); }
+    // Protected mode, as Redis's (on by default): with no password set, a
+    // client that isn't on this machine gets -DENIED and is disconnected.
+    void setProtectedMode(bool on) { protected_mode_ = on; }
+    // A password (at most kMaxPasswordLength bytes): every client must AUTH
+    // before any other command, and protected mode no longer applies
+    void setPassword(std::string password) { password_ = std::move(password); }
 
     bool start();       // Create socket, bind, listen
     void run();         // Event loop — handles multiple clients concurrently
@@ -42,6 +56,11 @@ private:
         bool want_read = true;           // what the poller is currently asked to report
         bool want_write = false;
         bool queued = false;             // in to_serve_ for this pass of the loop
+        bool authenticated = false;      // AUTH succeeded, or no password is set
+        int protocol = 2;                // RESP2 until HELLO 3
+        uint64_t id = 0;                 // CLIENT ID: 1, 2, 3... in order of connection
+        std::string name;                // CLIENT SETNAME; empty: none
+        Transaction transaction;         // MULTI ... EXEC
     };
 
     enum class SendStatus { Done, Blocked, Failed };
@@ -71,7 +90,7 @@ private:
     static constexpr int kMaxAcceptsPerEvent = 1000;
 
     // Bytes read per recv() (Redis reads 16 KB as well)
-    static constexpr size_t kReadChunk = 16 * 1024;
+    static constexpr size_t kReadChunk = size_t{16} * 1024;
 
     // Stop running a client's commands once this many bytes of its replies are
     // waiting to be sent, and stop reading from it until they have gone. Memory
@@ -81,10 +100,13 @@ private:
 
     // The parsed arguments keep their memory between commands, up to this much
     // per argument and this many arguments; more is given back after use
-    static constexpr size_t kKeepArgBytes = 64 * 1024;
+    static constexpr size_t kKeepArgBytes = size_t{64} * 1024;
     static constexpr size_t kKeepArgs = 1024;
 
     int port_;
+    std::string bind_address_ = "127.0.0.1";
+    bool protected_mode_ = true;
+    std::optional<std::string> password_;
     socket_t listen_socket_ = INVALID_SOCKET;
     InMemoryStorage& storage_;
     bool running_ = false;
@@ -102,6 +124,21 @@ private:
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
+    uint64_t last_client_id_ = 0;       // never reused, as in Redis
+
+    // What INFO reports. instantaneous_ops_per_sec comes from samples of the
+    // command count, taken at most every 100 ms: the rate between the oldest
+    // and newest of the last kOpSamples (as Redis does, over 16 samples)
+    ServerStats stats_;
+    struct OpSample {
+        std::chrono::steady_clock::time_point time;
+        uint64_t commands = 0;
+    };
+    static constexpr size_t kOpSamples = 16;
+    OpSample op_samples_[kOpSamples];
+    size_t op_sample_next_ = 0;
+    size_t op_samples_taken_ = 0;
+    void sampleOpsPerSec();
 
     // Clients with replies to send in this pass of the loop, in order. They are
     // served after the pass's AOF records are written (group commit).

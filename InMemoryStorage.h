@@ -2,11 +2,13 @@
 #include "StorageInterface.h"
 #include "AOFLogger.h"
 #include "KeyTable.h"
+#include "SipHash.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -56,6 +58,11 @@ class InMemoryStorage final : public StorageInterface {
         explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr,
                                  EvictionPolicy policy=EvictionPolicy::LRU);
 
+        // The key table's hash of `key`, for tests: each storage must hash
+        // with its own random key. Never exposed to clients, who could use
+        // it to pick colliding keys.
+        size_t hashOf(std::string_view key) const { return data_.hashOf(key); }
+
         // String operations
         Result set(const std::string& key, const std::string& value) override;
         Result set(const std::string& key, const std::string& value, int ttlSeconds) override;
@@ -68,9 +75,30 @@ class InMemoryStorage final : public StorageInterface {
         template<typename Use>
         Result readString(const std::string& key, Use&& use);
 
+        // MGET: calls use(value) for each key in [first, last), in order, with
+        // nullptr where there is no string (no key, or another type: MGET
+        // replies nil, never WRONGTYPE). One lock for all, so no one sees an
+        // MSET half done. Each key is a keyspace hit or miss, as in Redis.
+        // `use` must not call back into this object.
+        template<typename Use>
+        void readStrings(const std::string* first, const std::string* last, Use&& use);
+
+        // MSET: [first, last) holds keys and values, alternately (an even
+        // count). Sets each key as SET does, dropping its old type and TTL,
+        // under one lock and as one AOF record: no one sees some keys set and
+        // others not, before or after a crash.
+        void mset(const std::string* first, const std::string* last);
+
         // Key operations
         Result del(const std::string& key) override;
         Result exists(const std::string& key) override;
+
+        // DEL and EXISTS with several keys, [first, last): how many were
+        // removed, and how many exist (a key given twice counts twice, as in
+        // Redis). Each under one lock, so no one sees a DEL half done. DEL
+        // writes one AOF record, so after a crash it is all there or not at all.
+        size_t deleteKeys(const std::string* first, const std::string* last);
+        size_t countExisting(const std::string* first, const std::string* last);
         Result type(const std::string& key) override;
         Result expire(const std::string& key, int ttlSeconds) override;
         Result ttl(const std::string& key) override;
@@ -109,6 +137,14 @@ class InMemoryStorage final : public StorageInterface {
         // The wall clock now, as Unix time in milliseconds
         static int64_t unixTimeMs();
 
+        // INCRBY (and INCR, DECR, DECRBY): adds `delta` to the integer in the
+        // string at `key`, 0 if there is no key, and returns the sum as text.
+        // A read, an add and a write under one lock, so concurrent increments
+        // can't lose one another's. The value changes in place, so a TTL stays,
+        // as in Redis. Fails with WRONG_TYPE, NOT_AN_INTEGER (see Integer.h)
+        // or INTEGER_OVERFLOW, and then changes nothing.
+        Result incrBy(const std::string& key, int64_t delta);
+
         // AOF operations
         std::vector<std::string> dumpState() const;   // serialize current state as commands
 
@@ -124,6 +160,22 @@ class InMemoryStorage final : public StorageInterface {
         // Buckets in the key table: none until the first key, then growing
         // with the keys (tests check it)
         size_t bucketCount() const;
+
+        // What INFO reports, counted as Redis counts it: a read command that
+        // finds a live key is a keyspace hit (even if it then fails with
+        // WRONGTYPE), one that doesn't is a miss, and writes count as neither.
+        // A key removed because its TTL passed is expired; one removed to make
+        // room for another, evicted.
+        struct Stats {
+            uint64_t keyspace_hits = 0;
+            uint64_t keyspace_misses = 0;
+            uint64_t expired_keys = 0;
+            uint64_t evicted_keys = 0;
+            size_t keys = 0;        // held, expired ones not yet removed included
+            size_t expires = 0;     // of those, the keys with a TTL
+            size_t max_keys = 0;    // the capacity (--maxkeys)
+        };
+        Stats stats() const;
 
         ~InMemoryStorage() override;
         InMemoryStorage(const InMemoryStorage&) = delete;
@@ -150,7 +202,10 @@ class InMemoryStorage final : public StorageInterface {
         struct EntryKey {
             static std::string_view key(const CacheEntry& e) { return e.key(); }
         };
-        using DataMap = KeyTable<CacheEntry, EntryKey>;
+        // Clients choose the keys, so the table's hash is keyed with a
+        // random key per process (SipHash.h): no one can pick keys that all
+        // land in one bucket
+        using DataMap = KeyTable<CacheEntry, EntryKey, KeyedHash>;
 
         // The entry and its key's bytes in one block, and its release
         static CacheEntry* newEntry(std::string_view key);
@@ -175,7 +230,8 @@ class InMemoryStorage final : public StorageInterface {
         void markUsed(CacheEntry& entry);               // a hit, for the eviction policy
         void evictOne();                                // removes and logs the policy's choice
         CacheEntry* sieveVictim();                      // SIEVE's choice; leaves the hand on it
-        void makeRoomForNewKey();                       // expired keys first, then evictOne()
+        void makeRoomForNewKey();                       // evictDownTo(capacity - 1)
+        void evictDownTo(size_t limit);                 // expired keys first, then evictOne()
 
         // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
@@ -186,9 +242,11 @@ class InMemoryStorage final : public StorageInterface {
         DataType getDataType(const CacheEntry& entry) const;
         std::string dataTypeToString(DataType dt) const;
 
-        // Internal set (called by every set variant); no expiry if `expiry` is empty
+        // Internal set (called by every set variant); no expiry if `expiry` is
+        // empty. `make_room` false: a new key may take the table past its
+        // capacity, and the caller evicts afterwards (MSET)
         Result setInternal(const std::string& key, const std::string& value,
-                           std::optional<ExpiryTime> expiry);
+                           std::optional<ExpiryTime> expiry, bool make_room = true);
 
         // Ensures key exists, is not expired, and holds the expected type
         // Returns nullptr if valid, or a Result with the appropriate error
@@ -204,6 +262,8 @@ class InMemoryStorage final : public StorageInterface {
         void logAOF(std::initializer_list<std::string_view> parts);
         void logAOF(std::initializer_list<std::string_view> head,
                     const std::vector<std::string>& tail);
+        void logAOF(std::initializer_list<std::string_view> head,
+                    const std::string* first, const std::string* last);
         void logAOF(std::initializer_list<std::string_view> head,
                     const std::vector<std::pair<std::string, std::string>>& pairs);
 
@@ -234,19 +294,50 @@ class InMemoryStorage final : public StorageInterface {
         mutable std::shared_mutex mutex_;
         AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
         bool loading_ = false;              // replaying the AOF (see setLoading)
+
+        // For stats(). Reads run under the shared lock, several at once, so
+        // theirs are atomic (relaxed: they are counts, not synchronisation);
+        // expiries and evictions happen under the exclusive lock.
+        mutable std::atomic<uint64_t> keyspace_hits_{0};
+        mutable std::atomic<uint64_t> keyspace_misses_{0};
+        uint64_t expired_keys_ = 0;
+        uint64_t evicted_keys_ = 0;
+        void countRead(bool found) const {
+            (found ? keyspace_hits_ : keyspace_misses_).fetch_add(1, std::memory_order_relaxed);
+        }
 };
 
 template<typename Use>
 Result InMemoryStorage::readString(const std::string& key, Use&& use) {
     std::unique_lock lock(mutex_);      // unique: an expired key is removed, and the hit is recorded
     CacheEntry* e = data_.find(key);
-    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
-    if(isExpired(*e)) {
-        expireEntry(e);
+    const bool live = e && !isExpired(*e);
+    countRead(live);
+    if(!live) {
+        if(e) expireEntry(e);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
     if(getDataType(*e) != DataType::STRING) return Result::fail(ErrorCode::WRONG_TYPE);
     markUsed(*e);
     use(std::get<std::string>(e->value));
     return Result::ok();
+}
+
+template<typename Use>
+void InMemoryStorage::readStrings(const std::string* first, const std::string* last, Use&& use) {
+    std::unique_lock lock(mutex_);      // as readString: expired keys are removed, hits recorded
+    for(const std::string* key = first; key != last; ++key) {
+        CacheEntry* e = data_.find(*key);
+        const bool live = e && !isExpired(*e);
+        countRead(live);
+        if(!live) {
+            if(e) expireEntry(e);
+            use(nullptr);
+        } else if(getDataType(*e) != DataType::STRING) {
+            use(nullptr);
+        } else {
+            markUsed(*e);
+            use(&std::get<std::string>(e->value));
+        }
+    }
 }

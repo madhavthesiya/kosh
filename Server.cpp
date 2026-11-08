@@ -1,8 +1,10 @@
 #include "Server.h"
 #include "Commands.h"
+#include "Version.h"
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <csignal>
 #ifndef _WIN32
 #include <signal.h>
@@ -33,11 +35,22 @@ void onStopSignal(int) {
 }
 #endif
 
-// Tells a client the server is full, as Redis does at maxclients, then closes
-// its socket. The new socket's buffer is empty, so the short reply fits.
-void refuseClient(socket_t fd) {
-    static const char kReply[] = "-ERR max number of clients reached\r\n";
-    sendSome(fd, kReply, sizeof(kReply) - 1);
+const char kServerFull[] = "-ERR max number of clients reached\r\n";
+
+// Protected mode's reply, which Redis also starts with -DENIED
+const char kDenied[] =
+    "-DENIED Kosh is running in protected mode: no password is set, so only clients on "
+    "this machine are served. To serve this one, set a password with --requirepass-file "
+    "or --requirepass, or start Kosh with --protected-mode no, but only on a network "
+    "you trust.\r\n";
+
+// Sends a new client one error reply, as Redis does, then closes its socket.
+// The new socket's send buffer is empty, so the short reply fits. (A client
+// that sent a command first may lose the reply: closing a socket with unread
+// data resets the connection. Redis's refusals behave the same.)
+template<size_t N>
+void refuseClient(socket_t fd, const char (&reply)[N]) {
+    sendSome(fd, reply, N - 1);
     CLOSE_SOCKET(fd);
 }
 
@@ -64,6 +77,8 @@ Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
                std::unique_ptr<Poller> poller, size_t max_clients)
     : port_(port), storage_(storage), aof_(aof), poller_(std::move(poller)),
       max_clients_(max_clients) {
+    stats_.tcp_port = port;
+    stats_.max_clients = max_clients;
     if(!poller_) poller_ = makePoller(defaultPollerName());
     if(!poller_) poller_ = makePoller("select");    // epoll_create1() failed: select() always works
     if(aof_) aof_->setDeferred(true);
@@ -130,20 +145,43 @@ bool Server::start() {
         return false;
     }
 
-    // Allow port reuse (avoid "address already in use" on restart)
+    // The same option name means different things on the two systems.
+    // POSIX: SO_REUSEADDR lets a restarted server bind its port while
+    // connections the old one closed are still in TIME_WAIT; a port another
+    // socket is listening on stays refused.
+    // Windows: SO_REUSEADDR lets a socket bind a port another one is already
+    // listening on, so a second server would start and serve no one, and any
+    // program could bind beside Kosh. SO_EXCLUSIVEADDRUSE refuses that, as
+    // Microsoft advises for servers.
     int opt = 1;
+#ifdef _WIN32
+    setsockopt(listen_socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
     setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&opt), sizeof(opt));
+#endif
 
-    // Bind to port
+    // Listen on one address: 127.0.0.1 unless --bind says otherwise. Only this
+    // machine can reach a loopback address, so a server nobody configured
+    // can't be reached from the network.
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    if(!parseIPv4(bind_address_.c_str(), addr.sin_addr)) {
+        std::cerr << "Cannot listen on '" << bind_address_ << "': not an IPv4 address\n";
+        CLOSE_SOCKET(listen_socket_);
+        return false;
+    }
     addr.sin_port = htons(static_cast<uint16_t>(port_));
 
     if(bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&addr),
             sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "bind() failed — is port " << port_ << " already in use?\n";
+        // e.g. the port is in use, or the address isn't one of this machine's.
+        // Read before printing: on Windows, writing the message's first part
+        // resets the error code to 0.
+        int error = lastSocketError();
+        std::cerr << "Cannot listen on " << bind_address_ << ":" << port_ << ": "
+                  << socketErrorText(error) << "\n";
         CLOSE_SOCKET(listen_socket_);
         return false;
     }
@@ -157,8 +195,23 @@ bool Server::start() {
 
     poller_->add(listen_socket_);
     running_ = true;
-    std::cout << "Mini-Redis server listening on port " << port_ << "\n";
+    stats_.started = std::chrono::steady_clock::now();
+    std::cout << "Kosh " << kKoshVersion << " listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
+    // Who can connect, and whether they need the password (never printed)
+    const char* need = password_ ? ", with the password" : "";
+    if(isLoopback(addr.sin_addr)) {
+        std::cout << "Access: this machine only" << need
+                  << " (--bind 0.0.0.0 listens on every interface)\n";
+    } else if(password_) {
+        std::cout << "Access: any machine that can reach port " << port_ << need << "\n";
+    } else if(protected_mode_) {
+        std::cout << "Access: protected mode: clients on other machines are refused, "
+                     "since no password is set\n";
+    } else {
+        std::cout << "WARNING: protected mode is off and no password is set: anyone who can "
+                     "reach port " << port_ << " can read and change every key\n";
+    }
     std::cout << "I/O multiplexing: " << poller_->name();
     if(poller_->capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << poller_->capacity() << ")";
     std::cout << ", single-threaded | maxclients " << max_clients_ << "\n";
@@ -218,9 +271,11 @@ void Server::run() {
         // On Windows the console handler runs on another thread, so the timeout
         // is what lets the loop notice.
         if(poller_->wait(1000, ready) < 0) {
-            if(running_) std::cerr << poller_->name() << " error " << lastSocketError() << "\n";
+            int error = lastSocketError();      // before printing, which can reset it (Windows)
+            if(running_) std::cerr << poller_->name() << " error: " << socketErrorText(error) << "\n";
             continue;
         }
+        sampleOpsPerSec();
 
         // 1. Read from every ready client and run its commands. Their replies
         //    wait in each client's output buffer, their AOF records in the AOF's.
@@ -258,6 +313,27 @@ void Server::run() {
     if(stop_requested) std::cout << "Received a stop signal: shutting down\n";
 }
 
+// After each wakeup of the event loop, at most every 100 ms. While the
+// server is idle, the loop still wakes once a second (the poller's timeout),
+// so the rate falls back to 0 within the 16 samples.
+void Server::sampleOpsPerSec() {
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    if(op_samples_taken_ > 0) {
+        const OpSample& last = op_samples_[(op_sample_next_ + kOpSamples - 1) % kOpSamples];
+        if(now - last.time < milliseconds(100)) return;
+    }
+    op_samples_[op_sample_next_] = {now, stats_.commands_processed};
+    op_sample_next_ = (op_sample_next_ + 1) % kOpSamples;
+    if(op_samples_taken_ < kOpSamples) op_samples_taken_++;
+    // The oldest sample kept: the first while the ring fills, then the next to be overwritten
+    const OpSample& oldest = op_samples_[op_samples_taken_ < kOpSamples ? 0 : op_sample_next_];
+    double seconds = duration<double>(now - oldest.time).count();
+    stats_.ops_per_sec = seconds > 0
+        ? static_cast<uint64_t>(std::llround(static_cast<double>(stats_.commands_processed - oldest.commands) / seconds))
+        : 0;
+}
+
 // ==================== Connection Management ====================
 
 // Accepts every waiting connection rather than one per pass of the loop, up to
@@ -282,7 +358,8 @@ void Server::acceptNewClients() {
                 close(reserve_fd_);
                 socket_t extra = accept(listen_socket_, nullptr, nullptr);
                 if(extra != INVALID_SOCKET) {
-                    refuseClient(extra);
+                    refuseClient(extra, kServerFull);
+                    stats_.rejected_connections++;
                     std::cout << "Client refused: the server is out of file descriptors\n";
                 }
                 reserve_fd_ = open("/dev/null", O_RDONLY);
@@ -304,16 +381,30 @@ void Server::acceptNewClients() {
             continue;
         }
 
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+
+        // Protected mode, as Redis's: with no password, only clients on this
+        // machine. Checked first, since it is the lasting reason: a client told
+        // "server full" would only retry.
+        if(protected_mode_ && !password_ && !isLoopback(client_addr.sin_addr)) {
+            refuseClient(client, kDenied);
+            stats_.rejected_connections++;
+            std::cout << "Client refused: " << ip << " is not on this machine (protected mode)\n";
+            continue;
+        }
         // As Redis does at maxclients
         if(clients_.size() >= max_clients_) {
-            refuseClient(client);
+            refuseClient(client, kServerFull);
+            stats_.rejected_connections++;
             std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
             continue;
         }
         // Watching a socket select() can't hold would write past the end of
         // fd_set (Linux) or silently never serve it (Windows)
         if(!poller_->canWatch(client)) {
-            refuseClient(client);
+            refuseClient(client, kServerFull);
+            stats_.rejected_connections++;
             std::cout << "Client refused: the server is at its " << poller_->name() << " limit ("
                       << clients_.size() << " clients)\n";
             continue;
@@ -326,12 +417,14 @@ void Server::acceptNewClients() {
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                    reinterpret_cast<const char*>(&flag), sizeof(flag));
 
-        // Register client with empty buffers, watched for readability
-        clients_[client];
+        // Register client with empty buffers, watched for readability. With a
+        // password set, it must AUTH first.
+        Client& added = clients_[client];
+        added.authenticated = !password_;
+        added.id = ++last_client_id_;
         poller_->add(client);
 
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        stats_.connections_received++;
         std::cout << "Client connected: " << ip << ":"
                   << ntohs(client_addr.sin_port)
                   << " (total: " << clients_.size() << ")\n";
@@ -447,9 +540,19 @@ void Server::runCommands(Client& client) {
     // once per command: quadratic in the number of commands in one read.
     size_t pos = 0;
     CommandContext ctx{storage_, aof_, clients_.size()};
+    ctx.password = password_ ? &*password_ : nullptr;
+    ctx.authenticated = client.authenticated;
+    ctx.protocol = client.protocol;
+    ctx.client_id = client.id;
+    ctx.client_name = &client.name;
+    ctx.transaction = &client.transaction;
+    ctx.server = &stats_;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
-        // Into args_, whose strings are reused from command to command
-        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_);
+        // Into args_, whose strings are reused from command to command. Until
+        // the client authenticates, smaller limits apply (see RespParser); an
+        // AUTH lifts them for the next command in the same read.
+        auto parsed = RespParser::parseInto(std::string_view(client.in).substr(pos), args_,
+                                            ctx.authenticated);
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
@@ -464,6 +567,8 @@ void Server::runCommands(Client& client) {
 
         // The reply goes straight into the client's buffer
         executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
+        client.authenticated = ctx.authenticated;   // AUTH or HELLO may have succeeded
+        client.protocol = ctx.protocol;             // HELLO may have switched it
         releaseLargeArgs(parsed.argc);
 
         // QUIT: send its reply, then disconnect; commands after it don't run

@@ -1,0 +1,74 @@
+# Changelog
+
+What changed in each release of Kosh. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and from 3.0.0 on,
+versions follow [Semantic Versioning](https://semver.org/): a change that can
+break a working setup raises the major number.
+
+Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
+`v2.5-memory`), not as semantic versions; they are listed at the end.
+
+## [3.0.0] - Unreleased
+
+The first release under the name Kosh, and the first meant for others to run.
+
+### Breaking
+
+- The project is renamed from Mini-Redis to Kosh. The binaries are now
+  `kosh-server` (was `mini_redis_server`) and `kosh-cli` (was `mini_redis`).
+  The repository moved to `github.com/madhavthesiya/kosh`; GitHub redirects
+  the old address.
+- The server listens on 127.0.0.1 by default (it listened on every interface).
+  `--bind 0.0.0.0` listens everywhere; with no password, protected mode then
+  refuses clients on other machines, as Redis's does.
+- Integer arguments are read as Redis reads them: `EXPIRE k 010`, `-0` and
+  `LRANGE l 01 1` are now errors.
+- `CLIENT` with an unknown subcommand is an error (it replied `OK`).
+
+### Added
+
+- RESP3 and `HELLO`, so client libraries that open with `HELLO 3` connect
+  (redis-py 8, node-redis 6); `CLIENT ID`, `GETNAME`, `SETNAME`, `HELP`.
+- Transactions: `MULTI`, `EXEC`, `DISCARD`, written to the AOF all or nothing.
+  `WATCH` is not supported.
+- `INCR`, `DECR`, `INCRBY`, `DECRBY`, `MGET`, `MSET`; `DEL` and `EXISTS` take
+  several keys.
+- `INFO` with Redis's sections and field names: hits, misses, expired and
+  evicted keys, commands, memory, clients, keyspace.
+- Passwords: `--requirepass-file` (or `--requirepass`) and `AUTH`, compared in
+  constant time, with Redis's limits on what an unauthenticated client may send.
+- `--bind` and `--protected-mode`.
+- `--version`; the start-up log names the version.
+- A Dockerfile: multi-stage, runs as a non-root user, 37.5 MB.
+- `SECURITY.md`: how to report a vulnerability, and the threat model.
+- Released under the MIT License.
+
+### Changed
+
+- Keys are hashed with SipHash-1-3 under a random key per process, so a client
+  can't choose keys that all collide (hash flooding).
+- Replies match Redis's byte for byte: an unknown command's error, `PING` with
+  a message. 178 of 179 test commands give the same bytes as Redis 7.0.15
+  (the 179th is `WATCH`).
+
+### Fixed
+
+- The log is written a line at a time when stdout is a file or a pipe
+  (systemd, `docker logs`); a line could appear only after dozens more.
+- On Windows, another socket could bind the port Kosh listens on.
+
+## Before semantic versions
+
+- **`v2.5-memory`** (2026-11-04): SIEVE eviction, the default (exact LRU with
+  `--eviction lru`); `KeyTable`, a hash table with cache-line buckets, one
+  allocation per key and no stall when it grows.
+- **`v2-fast`** (2026-11-03): epoll on Linux, `--maxclients`, `--poller`;
+  `--appendfsync always|everysec|no`; group commit; no heap allocation per
+  request once warmed up.
+- **`v1-correct`** (2026-11-03): network and persistence correctness: non-blocking
+  sockets with reply buffers, parser limits, clean shutdown on SIGTERM, AOF
+  rewrite through a temporary file, damage detection at start-up, retried AOF
+  writes, absolute expiry times in the AOF.
+- **`v0-baseline`** (2026-10-31): the project before any of this work.
+
+[3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...HEAD

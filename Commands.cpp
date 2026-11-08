@@ -1,10 +1,19 @@
 #include "Commands.h"
+#include "Integer.h"
 #include "RespParser.h"
+#include "Version.h"
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <climits>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <unordered_map>
+#ifdef _WIN32
+#include <process.h>    // _getpid
+#else
+#include <unistd.h>     // getpid, sysconf
+#endif
 
 namespace {
 
@@ -38,13 +47,6 @@ bool equalsIgnoreCase(std::string_view a, std::string_view b) {
            });
 }
 
-// The whole of `text` as a 64-bit integer. std::from_chars, unlike std::stoll,
-// rejects trailing garbage such as "10abc" and reports overflow instead of throwing.
-bool parseInt64(const std::string& text, int64_t& out) {
-    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-    return ec == std::errc() && end == text.data() + text.size();
-}
-
 // An index past the range of int selects what INT_MIN or INT_MAX would
 int clampToInt(int64_t value) {
     return static_cast<int>(std::clamp<int64_t>(value, INT_MIN, INT_MAX));
@@ -75,7 +77,10 @@ std::string parseExpiry(const std::string& text, bool seconds, bool relative,
 
 // ---- Connection and server ----
 
-void cmdPing(CommandContext&, const Args&, std::string& out) {
+// PING [message]: PONG, or the message back as a bulk string, as in Redis
+void cmdPing(CommandContext&, const Args& args, std::string& out) {
+    if(args.size() > 2) return RespParser::appendError(out, "ERR wrong number of arguments for 'ping' command");
+    if(args.size() == 2) return RespParser::appendBulk(out, args[1]);
     RespParser::appendSimpleString(out, "PONG");
 }
 
@@ -84,18 +89,272 @@ void cmdQuit(CommandContext& ctx, const Args&, std::string& out) {
     ok(out);
 }
 
-// redis-cli and redis-benchmark send these at startup
-void cmdCommand(CommandContext&, const Args&, std::string& out) { RespParser::appendLength(out, '*', 0); }
-void cmdClient(CommandContext&, const Args&, std::string& out) { ok(out); }
+constexpr const char* kWrongPass = "WRONGPASS invalid username-password pair or user is disabled.";
 
-void cmdConfig(CommandContext&, const Args& args, std::string& out) {
-    if(equalsIgnoreCase(args[1], "GET")) return RespParser::appendLength(out, '*', 0);
+// Whether user/password may log in: the only user is "default" (as in Redis
+// without ACL users), and user names are case-sensitive. With no password
+// set, "default" accepts any password (Redis's nopass user).
+bool credentialsMatch(const CommandContext& ctx, const std::string& user, const std::string& password) {
+    bool password_ok = !ctx.password || constantTimeEquals(password, *ctx.password);
+    return user == "default" && password_ok;
+}
+
+// AUTH <password>, or AUTH <username> <password>: Redis's two forms. Replies
+// are Redis's, word for word. A failed AUTH changes nothing: a client that
+// had authenticated stays authenticated, as in Redis.
+void cmdAuth(CommandContext& ctx, const Args& args, std::string& out) {
+    if(args.size() > 3) return RespParser::appendError(out, kSyntaxError);
+    if(args.size() == 2 && !ctx.password) {
+        return RespParser::appendError(out, "ERR AUTH <password> called without any password "
+            "configured for the default user. Are you sure your configuration is correct?");
+    }
+    static const std::string kDefaultUser = "default";
+    const std::string& user = args.size() == 3 ? args[1] : kDefaultUser;
+    if(!credentialsMatch(ctx, user, args[args.size() - 1])) return RespParser::appendError(out, kWrongPass);
+    ctx.authenticated = true;
+    ok(out);
+}
+
+// A client name must be printable ASCII without spaces, as in Redis, whose
+// CLIENT LIST output is split on spaces. Empty means "no name".
+bool setClientName(CommandContext& ctx, const std::string& name, std::string& out) {
+    for(unsigned char c : name) {
+        if(c < '!' || c > '~') {
+            RespParser::appendError(out, "ERR Client names cannot contain spaces, newlines or special characters.");
+            return false;
+        }
+    }
+    if(ctx.client_name) *ctx.client_name = name;
+    return true;
+}
+
+// HELLO [protover [AUTH username password] [SETNAME clientname]]
+//
+// What modern clients send first: redis-py 8 and node-redis 6 open every
+// connection with HELLO 3 (with AUTH when there's a password), and give up
+// if it fails, without falling back to RESP2. It switches the connection's
+// protocol, can authenticate and name it, and describes the server. Checks
+// and replies follow Redis 7.0.15's, in its order: the version, the
+// options, the credentials, then whether the client is authenticated.
+void cmdHello(CommandContext& ctx, const Args& args, std::string& out) {
+    int protocol = ctx.protocol;
+    size_t next = 1;
+    if(args.size() >= 2) {
+        int64_t version;
+        if(!parseInt64(args[1], version)) {
+            return RespParser::appendError(out, "ERR Protocol version is not an integer or out of range");
+        }
+        if(version < 2 || version > 3) return RespParser::appendError(out, "NOPROTO unsupported protocol version");
+        protocol = static_cast<int>(version);
+        next = 2;
+    }
+    const std::string* user = nullptr;
+    const std::string* password = nullptr;
+    const std::string* name = nullptr;
+    for(size_t i = next; i < args.size(); i++) {
+        size_t more = args.size() - 1 - i;
+        if(equalsIgnoreCase(args[i], "AUTH") && more >= 2) {
+            user = &args[i + 1];
+            password = &args[i + 2];
+            i += 2;
+        } else if(equalsIgnoreCase(args[i], "SETNAME") && more >= 1) {
+            name = &args[i + 1];
+            i += 1;
+        } else {
+            return RespParser::appendError(out, "ERR Syntax error in HELLO option '" + args[i].substr(0, 128) + "'");
+        }
+    }
+    if(user) {
+        if(!credentialsMatch(ctx, *user, *password)) return RespParser::appendError(out, kWrongPass);
+        ctx.authenticated = true;
+    }
+    if(!ctx.authenticated) {
+        return RespParser::appendError(out, "NOAUTH HELLO must be called with the client already "
+            "authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate "
+            "the client and select the RESP protocol version at the same time");
+    }
+    if(name && !setClientName(ctx, *name, out)) return;
+    ctx.protocol = protocol;
+
+    // The server's description, in the protocol just chosen: a map in RESP3,
+    // a flat array of names and values in RESP2. Same fields as Redis.
+    RespParser::appendMapLength(out, 7, protocol);
+    RespParser::appendBulk(out, "server");
+    RespParser::appendBulk(out, "kosh");
+    RespParser::appendBulk(out, "version");
+    RespParser::appendBulk(out, kKoshVersion);
+    RespParser::appendBulk(out, "proto");
+    RespParser::appendInteger(out, protocol);
+    RespParser::appendBulk(out, "id");
+    RespParser::appendInteger(out, static_cast<long long>(ctx.client_id));
+    RespParser::appendBulk(out, "mode");
+    RespParser::appendBulk(out, "standalone");
+    RespParser::appendBulk(out, "role");
+    RespParser::appendBulk(out, "master");
+    RespParser::appendBulk(out, "modules");
+    RespParser::appendLength(out, '*', 0);
+}
+
+// CLIENT ID | GETNAME | SETNAME name | HELP. Anything else gets Redis's
+// "unknown subcommand" error, which clients expect: on connect they send
+// subcommands newer Redis versions have (SETINFO, MAINT_NOTIFICATIONS) and
+// carry on when they fail. Answering OK would claim support Kosh lacks.
+void cmdClient(CommandContext& ctx, const Args& args, std::string& out) {
+    const std::string& sub = args[1];
+    // A known subcommand with the wrong number of arguments gets Redis's
+    // arity error, which names it in lower case
+    static const std::pair<const char*, size_t> kSubcommands[] = {
+        {"id", 2}, {"getname", 2}, {"setname", 3}, {"help", 2}};
+    for(const auto& [name, argc] : kSubcommands) {
+        if(equalsIgnoreCase(sub, name) && args.size() != argc) {
+            return RespParser::appendError(out, std::string("ERR wrong number of arguments for 'client|")
+                                                + name + "' command");
+        }
+    }
+    if(equalsIgnoreCase(sub, "ID")) return RespParser::appendInteger(out, static_cast<long long>(ctx.client_id));
+    if(equalsIgnoreCase(sub, "GETNAME")) {
+        if(!ctx.client_name || ctx.client_name->empty()) return RespParser::appendNull(out, ctx.protocol);
+        return RespParser::appendBulk(out, *ctx.client_name);
+    }
+    if(equalsIgnoreCase(sub, "SETNAME")) {
+        if(setClientName(ctx, args[2], out)) ok(out);
+        return;
+    }
+    if(equalsIgnoreCase(sub, "HELP")) {
+        static const char* const kHelp[] = {
+            "CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "GETNAME",
+            "    Return the name of the current connection.",
+            "ID",
+            "    Return the ID of the current connection.",
+            "SETNAME <name>",
+            "    Assign the name <name> to the current connection.",
+            "HELP",
+            "    Print this help.",
+        };
+        RespParser::appendLength(out, '*', std::size(kHelp));
+        for(const char* line : kHelp) RespParser::appendSimpleString(out, line);
+        return;
+    }
+    RespParser::appendError(out, "ERR unknown subcommand '" + sub.substr(0, 128) + "'. Try CLIENT HELP.");
+}
+
+// redis-cli sends COMMAND DOCS at startup; an empty reply means "no docs"
+void cmdCommand(CommandContext&, const Args&, std::string& out) { RespParser::appendLength(out, '*', 0); }
+
+// redis-benchmark sends CONFIG GET save and CONFIG GET appendonly at
+// startup; Kosh has no such settings to report, so the map is empty
+void cmdConfig(CommandContext& ctx, const Args& args, std::string& out) {
+    if(equalsIgnoreCase(args[1], "GET")) return RespParser::appendMapLength(out, 0, ctx.protocol);
     RespParser::appendError(out, "ERR unknown subcommand '" + args[1].substr(0, 128) + "'");
 }
 
-void cmdInfo(CommandContext& ctx, const Args&, std::string& out) {
-    RespParser::appendBulk(out, "# Server\r\nmini_redis_version:2.0\r\n"
-                                "# Clients\r\nconnected_clients:" + std::to_string(ctx.clients) + "\r\n");
+// Resident memory in bytes (Linux, from /proc); 0 where it isn't known.
+// Not glibc's allocator count, which would miss the key table's mmap'ed arrays.
+size_t residentBytes() {
+#if defined(__linux__)
+    std::ifstream statm("/proc/self/statm");
+    size_t total_pages = 0, resident_pages = 0;
+    if(statm >> total_pages >> resident_pages) {
+        return resident_pages * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    }
+#endif
+    return 0;
+}
+
+uint64_t processId() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(_getpid());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+// INFO [section ...]: the server's state in Redis's format and with Redis's
+// field names, so what reads Redis's INFO (redis-py's info(), dashboards)
+// reads Kosh's: "# Section" lines, name:value lines, a blank line between
+// sections. Sections are chosen by name, in any case; none, "all", "default"
+// or "everything" means all of them, and an unknown one gives nothing, as in
+// Redis. Left out rather than made up:
+// - redis_version: Kosh isn't a complete Redis of any version, and tools
+//   decide what to send by it;
+// - used_memory (glibc's count would miss the key table), and avg_ttl, which
+//   Kosh doesn't track. Kosh's limit is maxkeys, not maxmemory.
+void cmdInfo(CommandContext& ctx, const Args& args, std::string& out) {
+    auto wanted = [&](const char* section) {
+        if(args.size() == 1) return true;
+        for(size_t i = 1; i < args.size(); i++) {
+            if(equalsIgnoreCase(args[i], section) || equalsIgnoreCase(args[i], "all") ||
+               equalsIgnoreCase(args[i], "default") || equalsIgnoreCase(args[i], "everything")) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const ServerStats no_server{};
+    const ServerStats& server = ctx.server ? *ctx.server : no_server;
+    const InMemoryStorage::Stats keys = ctx.storage.stats();
+    std::string text;
+    auto section = [&](const char* name) {
+        if(!text.empty()) text += "\r\n";
+        text += "# ";
+        text += name;
+        text += "\r\n";
+    };
+    auto field = [&](const char* name, std::string_view value) {
+        text += name;
+        text += ':';
+        text += value;
+        text += "\r\n";
+    };
+    auto number = [&](const char* name, uint64_t value) { field(name, std::to_string(value)); };
+
+    if(wanted("server")) {
+        section("Server");
+        field("kosh_version", kKoshVersion);
+        number("process_id", processId());
+        number("tcp_port", static_cast<uint64_t>(server.tcp_port));
+        uint64_t uptime = 0;
+        if(ctx.server) {
+            uptime = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - server.started).count());
+        }
+        number("uptime_in_seconds", uptime);
+        number("uptime_in_days", uptime / 86400);
+    }
+    if(wanted("clients")) {
+        section("Clients");
+        number("connected_clients", ctx.clients);
+        number("maxclients", server.max_clients);
+    }
+    if(wanted("memory")) {
+        section("Memory");
+        if(size_t rss = residentBytes()) number("used_memory_rss", rss);
+        number("maxkeys", keys.max_keys);
+    }
+    if(wanted("persistence")) {
+        section("Persistence");
+        number("aof_enabled", ctx.aof ? 1 : 0);
+        field("aof_last_write_status", ctx.aof && ctx.aof->failing() ? "err" : "ok");
+    }
+    if(wanted("stats")) {
+        section("Stats");
+        number("total_connections_received", server.connections_received);
+        number("total_commands_processed", server.commands_processed);
+        number("instantaneous_ops_per_sec", server.ops_per_sec);
+        number("rejected_connections", server.rejected_connections);
+        number("expired_keys", keys.expired_keys);
+        number("evicted_keys", keys.evicted_keys);
+        number("keyspace_hits", keys.keyspace_hits);
+        number("keyspace_misses", keys.keyspace_misses);
+    }
+    if(wanted("keyspace")) {
+        section("Keyspace");
+        if(keys.keys > 0) {
+            field("db0", "keys=" + std::to_string(keys.keys) + ",expires=" + std::to_string(keys.expires));
+        }
+    }
+    RespParser::appendVerbatim(out, text, ctx.protocol);
 }
 
 // ---- Strings ----
@@ -135,7 +394,7 @@ void cmdGet(CommandContext& ctx, const Args& args, std::string& out) {
         RespParser::appendBulk(out, value);
     });
     if(r.error == ErrorCode::WRONG_TYPE) RespParser::appendError(out, kWrongType);
-    else if(!r.success) RespParser::appendNull(out);
+    else if(!r.success) RespParser::appendNull(out, ctx.protocol);
 }
 
 void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
@@ -146,14 +405,65 @@ void cmdSetex(CommandContext& ctx, const Args& args, std::string& out) {
     r.success ? ok(out) : RespParser::appendError(out, "ERR setex failed");
 }
 
-// ---- Keys ----
-
-void cmdDel(CommandContext& ctx, const Args& args, std::string& out) {
-    RespParser::appendInteger(out, ctx.storage.del(args[1]).success ? 1 : 0);
+// MGET key [key ...]: each value, or nil where there is no string (a list,
+// say: unlike GET, MGET doesn't fail with WRONGTYPE)
+void cmdMget(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendLength(out, '*', args.size() - 1);
+    ctx.storage.readStrings(args.begin() + 1, args.end(), [&](const std::string* value) {
+        if(value) RespParser::appendBulk(out, *value);
+        else RespParser::appendNull(out, ctx.protocol);
+    });
 }
 
+// MSET key value [key value ...]
+void cmdMset(CommandContext& ctx, const Args& args, std::string& out) {
+    if(args.size() % 2 == 0) {      // a key without a value
+        return RespParser::appendError(out, "ERR wrong number of arguments for 'mset' command");
+    }
+    ctx.storage.mset(args.begin() + 1, args.end());
+    ok(out);
+}
+
+// INCR, DECR, INCRBY, DECRBY. In Redis's order (t_string.c): the increment
+// first, then the key's type, whether its value is an integer, and whether the
+// sum fits in 64 bits. Each error changes nothing.
+void incrementBy(CommandContext& ctx, const std::string& key, int64_t delta, std::string& out) {
+    auto r = ctx.storage.incrBy(key, delta);
+    switch(r.error) {
+        case ErrorCode::NONE:             return RespParser::appendInteger(out, std::stoll(r.value));
+        case ErrorCode::WRONG_TYPE:       return RespParser::appendError(out, kWrongType);
+        case ErrorCode::INTEGER_OVERFLOW: return RespParser::appendError(out, "ERR increment or decrement would overflow");
+        default:                          return RespParser::appendError(out, kNotAnInteger);
+    }
+}
+
+void cmdIncr(CommandContext& ctx, const Args& args, std::string& out) { incrementBy(ctx, args[1], 1, out); }
+void cmdDecr(CommandContext& ctx, const Args& args, std::string& out) { incrementBy(ctx, args[1], -1, out); }
+
+void cmdIncrby(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t delta;
+    if(!parseInt64(args[2], delta)) return RespParser::appendError(out, kNotAnInteger);
+    incrementBy(ctx, args[1], delta, out);
+}
+
+void cmdDecrby(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t delta;
+    if(!parseInt64(args[2], delta)) return RespParser::appendError(out, kNotAnInteger);
+    // Its negation doesn't fit in 64 bits
+    if(delta == INT64_MIN) return RespParser::appendError(out, "ERR decrement would overflow");
+    incrementBy(ctx, args[1], -delta, out);
+}
+
+// ---- Keys ----
+
+// DEL key [key ...]: how many were removed
+void cmdDel(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.deleteKeys(args.begin() + 1, args.end())));
+}
+
+// EXISTS key [key ...]: how many exist, a key given twice counted twice
 void cmdExists(CommandContext& ctx, const Args& args, std::string& out) {
-    RespParser::appendInteger(out, ctx.storage.exists(args[1]).success ? 1 : 0);
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.countExisting(args.begin() + 1, args.end())));
 }
 
 void cmdType(CommandContext& ctx, const Args& args, std::string& out) {
@@ -201,7 +511,7 @@ void cmdRpush(CommandContext& ctx, const Args& args, std::string& out) { cmdPush
 void cmdPop(CommandContext& ctx, const Args& args, std::string& out, bool left) {
     auto r = left ? ctx.storage.lpop(args[1]) : ctx.storage.rpop(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out, ctx.protocol);
 }
 void cmdLpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, true); }
 void cmdRpop(CommandContext& ctx, const Args& args, std::string& out) { cmdPop(ctx, args, out, false); }
@@ -239,7 +549,8 @@ void cmdSrem(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdSmembers(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.smembers(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    RespParser::appendArray(out, r.values);
+    RespParser::appendSetLength(out, r.values.size(), ctx.protocol);
+    for(const auto& member : r.values) RespParser::appendBulk(out, member);
 }
 
 void cmdSismember(CommandContext& ctx, const Args& args, std::string& out) {
@@ -270,7 +581,7 @@ void cmdHset(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdHget(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hget(args[1], args[2]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out);
+    r.success ? RespParser::appendBulk(out, r.value) : RespParser::appendNull(out, ctx.protocol);
 }
 
 void cmdHdel(CommandContext& ctx, const Args& args, std::string& out) {
@@ -282,7 +593,9 @@ void cmdHdel(CommandContext& ctx, const Args& args, std::string& out) {
 void cmdHgetall(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.hgetall(args[1]);
     if(r.error == ErrorCode::WRONG_TYPE) return RespParser::appendError(out, kWrongType);
-    RespParser::appendArray(out, r.values);
+    // r.values holds field, value, field, value...: a map in RESP3
+    RespParser::appendMapLength(out, r.values.size() / 2, ctx.protocol);
+    for(const auto& item : r.values) RespParser::appendBulk(out, item);
 }
 
 void cmdHlen(CommandContext& ctx, const Args& args, std::string& out) {
@@ -305,21 +618,78 @@ void cmdRewriteAof(CommandContext& ctx, const Args&, std::string& out) {
     ok(out);
 }
 
+// ---- Transactions ----
+// MULTI starts queuing (executeCommand queues, see there), EXEC runs the
+// queue, DISCARD drops it. Replies and errors are Redis 7.0.15's.
+
+void cmdMulti(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction) return RespParser::appendError(out, "ERR MULTI needs a client connection");
+    // A nested MULTI is an error, but it doesn't abort the transaction
+    if(ctx.transaction->active) return RespParser::appendError(out, "ERR MULTI calls can not be nested");
+    *ctx.transaction = Transaction{};
+    ctx.transaction->active = true;
+    ok(out);
+}
+
+void cmdDiscard(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction || !ctx.transaction->active) {
+        return RespParser::appendError(out, "ERR DISCARD without MULTI");
+    }
+    *ctx.transaction = Transaction{};
+    ok(out);
+}
+
+// Runs the queued commands one after another and replies with an array of
+// their replies. A command that fails as it runs (WRONGTYPE) doesn't stop
+// the others: as in Redis, there is no rollback. Nothing else can run in
+// between, since the server runs one command at a time.
+//
+// In the AOF, a transaction that may write is logged between MULTI and EXEC
+// records, and replay applies it only once it reaches the EXEC: a server that
+// stops while writing the transaction leaves none of it, not a part.
+void cmdExec(CommandContext& ctx, const Args&, std::string& out) {
+    if(!ctx.transaction || !ctx.transaction->active) {
+        return RespParser::appendError(out, "ERR EXEC without MULTI");
+    }
+    if(ctx.transaction->aborted) {
+        *ctx.transaction = Transaction{};
+        return RespParser::appendError(out, "EXECABORT Transaction discarded because of previous errors.");
+    }
+    Transaction taken = std::move(*ctx.transaction);
+    *ctx.transaction = Transaction{};       // so the commands run, instead of being queued
+    bool log = taken.writes && ctx.aof;
+    if(log) ctx.aof->log("*1\r\n$5\r\nMULTI\r\n");
+    RespParser::appendLength(out, '*', taken.queued.size());
+    for(const auto& command : taken.queued) executeCommand(ctx, Args(command), out);
+    if(log) ctx.aof->log("*1\r\n$4\r\nEXEC\r\n");
+}
+
 const Command kCommands[] = {
     // name           arity  flags      handler
     {"ping",            -1,  0,         cmdPing},
-    {"quit",            -1,  0,         cmdQuit},
+    {"auth",            -2,  kCmdNoAuth, cmdAuth},
+    {"hello",           -1,  kCmdNoAuth, cmdHello},
+    {"quit",            -1,  kCmdNoAuth | kCmdNotQueued, cmdQuit},
+    {"multi",            1,  kCmdNotQueued, cmdMulti},
+    {"exec",             1,  kCmdNotQueued, cmdExec},
+    {"discard",          1,  kCmdNotQueued, cmdDiscard},
     {"command",         -1,  0,         cmdCommand},
-    {"client",          -1,  0,         cmdClient},
+    {"client",          -2,  0,         cmdClient},
     {"config",          -2,  0,         cmdConfig},
     {"info",            -1,  0,         cmdInfo},
 
     {"set",             -3,  kCmdWrite, cmdSet},
     {"get",              2,  0,         cmdGet},
     {"setex",            4,  kCmdWrite, cmdSetex},
+    {"mget",            -2,  0,         cmdMget},
+    {"mset",            -3,  kCmdWrite, cmdMset},
+    {"incr",            2,  kCmdWrite, cmdIncr},
+    {"decr",             2,  kCmdWrite, cmdDecr},
+    {"incrby",           3,  kCmdWrite, cmdIncrby},
+    {"decrby",           3,  kCmdWrite, cmdDecrby},
 
-    {"del",              2,  kCmdWrite, cmdDel},
-    {"exists",           2,  0,         cmdExists},
+    {"del",             -2,  kCmdWrite, cmdDel},
+    {"exists",          -2,  0,         cmdExists},
     {"type",             2,  0,         cmdType},
     {"expire",           3,  kCmdWrite, cmdExpire},
     {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
@@ -344,8 +714,11 @@ const Command kCommands[] = {
     {"hgetall",          2,  0,         cmdHgetall},
     {"hlen",             2,  0,         cmdHlen},
 
-    {"bgrewriteaof",    -1,  0,         cmdRewriteAof},
-    {"aofrewrite",      -1,  0,         cmdRewriteAof},
+    // Refused inside MULTI, unlike in Redis: Kosh rewrites in the foreground,
+    // so a rewrite in the middle of EXEC would start the new file after the
+    // transaction's MULTI record, and replay would find an EXEC without one
+    {"bgrewriteaof",    -1,  kCmdNoMulti, cmdRewriteAof},
+    {"aofrewrite",      -1,  kCmdNoMulti, cmdRewriteAof},
 };
 
 struct CommandIndex {
@@ -384,30 +757,96 @@ const Command* lookupCommand(std::string_view name) {
     return it == index.by_name.end() ? nullptr : it->second;
 }
 
+bool constantTimeEquals(std::string_view given, std::string_view secret) {
+    if(given.size() > kMaxPasswordLength || secret.size() > kMaxPasswordLength) return false;
+    // Zero-padded copies, so the loop always runs over the same 512 bytes.
+    // (Copying takes time in proportion to the lengths: the client's own, and
+    // the password's, which is the same on every attempt.)
+    unsigned char a[kMaxPasswordLength] = {};
+    unsigned char b[kMaxPasswordLength] = {};
+    if(!given.empty()) std::memcpy(a, given.data(), given.size());
+    if(!secret.empty()) std::memcpy(b, secret.data(), secret.size());
+    // volatile, so the compiler can't stop at the first difference: the
+    // result alone would allow it
+    volatile unsigned char diff = 0;
+    for(size_t i = 0; i < kMaxPasswordLength; i++) {
+        diff = static_cast<unsigned char>(diff | (a[i] ^ b[i]));
+    }
+    // Lengths matter too: "abc" padded with zeros equals "abc\0"
+    return diff == 0 && given.size() == secret.size();
+}
+
 bool arityMatches(const Command& cmd, size_t argc) {
     if(cmd.arity >= 0) return argc == static_cast<size_t>(cmd.arity);
     return argc >= static_cast<size_t>(-cmd.arity);
 }
 
+// Redis's unknown-command error, byte for byte (server.c in 7.0.15): the name
+// (128 bytes at most), then the arguments, each quoted, until 128 bytes of
+// them are written. Each stops at a NUL byte, as C's %s does. Some clients
+// and tests match on this text.
+std::string unknownCommandError(const Args& args) {
+    auto asCString = [](const std::string& s) {
+        return std::string_view(s.data(), std::min(s.size(), s.find('\0')));
+    };
+    std::string quoted;
+    for(size_t i = 1; i < args.size() && quoted.size() < 128; i++) {
+        size_t room = 128 - quoted.size();
+        quoted += '\'';
+        quoted += asCString(args[i]).substr(0, room);
+        quoted += "' ";
+    }
+    return "ERR unknown command '" + std::string(asCString(args[0]).substr(0, 128)) +
+           "', with args beginning with: " + quoted;
+}
+
 void executeCommand(CommandContext& ctx, const Args& args, std::string& out) {
     if(args.empty()) return RespParser::appendError(out, "ERR empty command");
+    Transaction* tx = ctx.transaction;
+    const bool in_multi = tx && tx->active;
     const Command* cmd = lookupCommand(args[0]);
-    if(!cmd) {
-        // Quote at most 128 bytes of the name, as Redis does
-        return RespParser::appendError(out, "ERR unknown command '" + args[0].substr(0, 128) + "'");
-    }
+
+    // A command refused before it runs, as Redis's rejectCommand: inside
+    // MULTI it also aborts the transaction, and a refused EXEC discards it,
+    // with an EXECABORT that says why
+    auto reject = [&](const std::string& error) {
+        if(in_multi) tx->aborted = true;
+        if(cmd && cmd->handler == cmdExec) {
+            if(tx) *tx = Transaction{};
+            return RespParser::appendError(out, "EXECABORT Transaction discarded because of: " + error);
+        }
+        RespParser::appendError(out, error);
+    };
+
+    if(!cmd) return reject(unknownCommandError(args));
     if(!arityMatches(*cmd, args.size())) {
-        return RespParser::appendError(out, std::string("ERR wrong number of arguments for '")
-                                            + cmd->name + "' command");
+        return reject(std::string("ERR wrong number of arguments for '") + cmd->name + "' command");
     }
+    // After the two checks above, as in Redis (checked on 7.0.15). They tell a
+    // client without the password only what is public: the command names and
+    // how many arguments each takes.
+    if(!ctx.authenticated && !(cmd->flags & kCmdNoAuth)) return reject("NOAUTH Authentication required.");
+    if(in_multi && (cmd->flags & kCmdNoMulti)) return reject("ERR Command not allowed inside a transaction");
     // While the AOF can't be written (a full disk), refuse writes, as Redis
     // does: their records couldn't be saved. Reads still work. Each attempt
     // retries first, so writes resume as soon as the file takes data again.
-    if((cmd->flags & kCmdWrite) && ctx.aof && !ctx.aof->flushPending()) {
-        return RespParser::appendError(out, "MISCONF Errors writing to the AOF file: " +
-                                            ctx.aof->lastWriteError());
+    // An EXEC whose transaction writes is refused whole, as in Redis.
+    bool writes = (cmd->flags & kCmdWrite) || (cmd->handler == cmdExec && in_multi && tx->writes);
+    if(writes && ctx.aof && !ctx.aof->flushPending()) {
+        return reject("MISCONF Errors writing to the AOF file: " + ctx.aof->lastWriteError());
+    }
+
+    // Inside MULTI, queue it: it runs at EXEC
+    if(in_multi && !(cmd->flags & kCmdNotQueued)) {
+        tx->queued.emplace_back(args.begin(), args.end());
+        if(cmd->flags & kCmdWrite) tx->writes = true;
+        return RespParser::appendSimpleString(out, "QUEUED");
     }
     cmd->handler(ctx, args, out);
+    // As Redis counts total_commands_processed: once a command has run (so an
+    // INFO doesn't count itself), EXEC and each command it runs included;
+    // refused or queued ones not
+    if(ctx.server) ctx.server->commands_processed++;
 }
 
 void executeCommand(CommandContext& ctx, const std::vector<std::string>& args, std::string& out) {
@@ -439,40 +878,72 @@ AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof) {
         return result;
     };
 
+    // A transaction's records, from its MULTI on: applied together at its
+    // EXEC, so one the server stopped writing partway leaves nothing behind
+    bool in_transaction = false;
+    size_t transaction_start = 0;
+    std::vector<std::vector<std::string>> transaction;
+    auto run = [&](const Command& cmd, const Args& args) {
+        discarded.clear();
+        cmd.handler(ctx, args, discarded);
+        result.commands++;
+    };
+
     // Parse from a moving position. Erasing each command from the front of the
     // buffer moved the whole rest of the file every time: quadratic in its size.
     size_t pos = 0;
+    size_t incomplete_at = buffer.size();       // where a record cut short begins
     while(pos < buffer.size()) {
         auto parsed = RespParser::parseInto(std::string_view(buffer).substr(pos), scratch);
         if(parsed.status == RespParser::ParseStatus::NeedMore) {
-            // The file ends partway through a record: the server stopped while
-            // writing it. Cut it off, or new records would be appended after it
-            // and read as its missing part at the next start (Redis also does
-            // this, with aof-load-truncated). A length damaged into a larger one
-            // looks the same and would cut more; nothing in the file tells them apart.
-            if(!aof.truncate(pos)) {
-                result.ok = false;
-                result.error = "cannot cut off the incomplete record at byte " +
-                               std::to_string(pos) + ": " + aof.lastError();
-                return result;
-            }
-            result.truncated_bytes = buffer.size() - pos;
+            incomplete_at = pos;
             break;
         }
         if(parsed.status == RespParser::ParseStatus::Error) return damaged(pos, parsed.error);
 
         Args args(scratch.data(), parsed.argc);
         if(!args.empty()) {
-            // Only write commands are logged, so anything else means the file is damaged
-            const Command* cmd = lookupCommand(args[0]);
-            if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
-                return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
+            if(args.size() == 1 && equalsIgnoreCase(args[0], "MULTI")) {
+                if(in_transaction) return damaged(pos, "MULTI inside a transaction");
+                in_transaction = true;
+                transaction_start = pos;
+                transaction.clear();
+            } else if(args.size() == 1 && equalsIgnoreCase(args[0], "EXEC")) {
+                if(!in_transaction) return damaged(pos, "EXEC without MULTI");
+                for(const auto& command : transaction) {
+                    Args queued(command);
+                    run(*lookupCommand(queued[0]), queued);
+                }
+                in_transaction = false;
+                transaction.clear();
+            } else {
+                // Only write commands are logged, so anything else means the file is damaged
+                const Command* cmd = lookupCommand(args[0]);
+                if(!cmd || !(cmd->flags & kCmdWrite) || !arityMatches(*cmd, args.size())) {
+                    return damaged(pos, "unexpected command '" + args[0].substr(0, 128) + "'");
+                }
+                if(in_transaction) transaction.emplace_back(args.begin(), args.end());
+                else run(*cmd, args);
             }
-            discarded.clear();
-            cmd->handler(ctx, args, discarded);
-            result.commands++;
         }
         pos += parsed.consumed;
+    }
+
+    // The file ends partway through a record, or a transaction without its
+    // EXEC: the server stopped while writing it. Cut it off, or new records
+    // would be appended after it and read as its missing part at the next
+    // start (Redis also does this, with aof-load-truncated). A length damaged
+    // into a larger one looks the same and would cut more; nothing in the
+    // file tells them apart.
+    size_t cut = in_transaction ? transaction_start : incomplete_at;
+    if(cut < buffer.size()) {
+        if(!aof.truncate(cut)) {
+            result.ok = false;
+            result.error = "cannot cut off the incomplete record at byte " +
+                           std::to_string(cut) + ": " + aof.lastError();
+            return result;
+        }
+        result.truncated_bytes = buffer.size() - cut;
     }
     return result;
 }
