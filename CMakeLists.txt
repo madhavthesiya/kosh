@@ -48,6 +48,7 @@ target_link_libraries(kosh-cli Threads::Threads)
 add_executable(kosh-server
     server_main.cpp
     Server.cpp
+    EventLoop.cpp
     Poller.cpp
     Commands.cpp
     InMemoryStorage.cpp

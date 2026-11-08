@@ -24,7 +24,7 @@ struct Transaction {
     std::vector<std::vector<std::string>> queued;
 };
 
-// What INFO reports about the server, which keeps it (see Server.cpp)
+// What INFO reports about the server, which keeps it (see EventLoop.cpp)
 struct ServerStats {
     int tcp_port = 0;
     size_t max_clients = 0;
@@ -33,7 +33,7 @@ struct ServerStats {
     uint64_t connections_received = 0;      // accepted and served
     uint64_t rejected_connections = 0;      // refused: maxclients, protected mode, out of files
     uint64_t commands_processed = 0;        // commands that ran (executeCommand counts them)
-    uint64_t ops_per_sec = 0;               // commands per second, recently (see Server.cpp)
+    uint64_t ops_per_sec = 0;               // commands per second, recently (see EventLoop.cpp)
 };
 
 // What a command can use besides its arguments

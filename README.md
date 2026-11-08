@@ -100,7 +100,7 @@ flowchart TD
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
-| **Network** | `Server.h/.cpp` | Accepting clients, the event loop, per-client buffers |
+| **Network** | `Server.h/.cpp`, `EventLoop.h/.cpp` | Accepting clients; the event loop and per-client buffers |
 | **Readiness** | `Poller.h/.cpp` | Which sockets are ready: `epoll` on Linux, `select()` elsewhere, behind one interface |
 | **Portability** | `Socket.h` | Winsock vs BSD sockets: types, non-blocking mode, error codes |
 | **Protocol** | `RespParser.h` | RESP parsing (binary-safe, with limits) + inline command support |
@@ -764,7 +764,8 @@ Not in CI: clang's static analyzer, which ran past 10 minutes on `InMemoryStorag
 kosh/
 ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 ├── main.cpp                  # CLI entry point (interactive mode)
-├── Server.h / .cpp           # TCP server — event loop, per-client buffers, RESP I/O
+├── Server.h / .cpp           # TCP server — listening socket, accepting clients, start and stop
+├── EventLoop.h / .cpp        # One thread's event loop, per-client buffers, RESP I/O
 ├── Poller.h / .cpp           # Readiness interface: epoll (Linux) and select()
 ├── Socket.h                  # Winsock / BSD socket differences (header-only)
 ├── RespParser.h              # RESP protocol parser + serializer (header-only)
@@ -943,7 +944,7 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 
 ```bash
 # Linux / macOS
-g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-server
+g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp EventLoop.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-server
 g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-cli
 g++ -std=c++17 -O2 -pthread tests/test_main.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
 g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_thread_tests
