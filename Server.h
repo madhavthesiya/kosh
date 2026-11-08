@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "EventLoop.h"
 #include "InMemoryStorage.h"
@@ -20,9 +21,11 @@ public:
     // `poller`: how to wait for sockets; the system's best (epoll on Linux,
     // select() elsewhere) if none is given. Beyond `max_clients` clients, or
     // what the poller can watch, a new client gets "-ERR max number of clients
-    // reached" and is disconnected.
+    // reached" and is disconnected. `threads`: event loops, each on its own
+    // thread (above 1 needs epoll).
     Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr,
-           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
+           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients,
+           size_t threads = 1);
     ~Server();
 
     // Set these before start().
@@ -47,7 +50,11 @@ private:
     friend class EventLoop;
 
     void acceptNewClients();                         // New connections on listen socket
+    bool dealToLoop(const EventLoop::NewClient& client);  // False if no loop can take it
+    void wakeAllLoops();                             // So that each notices the server stopping
     bool keepRunning() const;                        // False once stopped or asked to stop
+    size_t connectedClients() const { return connected_; }
+    size_t clientRemoved() { return --connected_; }  // How many remain
     bool running() const { return running_; }
     void stopWithError(const std::string& why);      // Says why; the exit code becomes 1
     // The password, or nullptr if none is set
@@ -77,5 +84,12 @@ private:
 
     uint64_t last_client_id_ = 0;       // never reused, as in Redis
 
-    std::unique_ptr<EventLoop> loop_;   // serves the clients
+    // Clients connected, across all loops: the accepting loop adds, every
+    // loop subtracts. One counter, touched only when a client comes or goes.
+    std::atomic<size_t> connected_{0};
+
+    // One per thread. The first runs on the thread that calls run() and accepts
+    // connections; the others get them dealt to them in turn.
+    std::vector<std::unique_ptr<EventLoop>> loops_;
+    size_t next_loop_ = 0;              // the accepting thread's only
 };

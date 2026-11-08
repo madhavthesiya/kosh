@@ -6,9 +6,14 @@
 // The server batches AOF writes (group commit, see run()): the logger only
 // buffers records, and the loop writes them before sending any reply.
 EventLoop::EventLoop(Server& server, InMemoryStorage& storage, AOFLogger* aof,
-                     std::unique_ptr<Poller> poller)
+                     std::unique_ptr<Poller> poller, bool threaded)
     : server_(server), storage_(storage), aof_(aof), poller_(std::move(poller)) {
     if(aof_) aof_->setDeferred(true);
+    if(threaded) {
+        wakeup_ = std::make_unique<Wakeup>();
+        new_clients_ = std::make_unique<SpscRing<NewClient>>(kNewClientQueue);
+        poller_->add(static_cast<socket_t>(wakeup_->fd()));
+    }
 }
 
 EventLoop::~EventLoop() {
@@ -44,11 +49,13 @@ void EventLoop::run() {
         // timeout bounds that delay (pselect() or a self-pipe would remove it).
         // On Windows the console handler runs on another thread, so the timeout
         // is what lets the loop notice.
-        if(poller_->wait(1000, ready) < 0) {
+        const int wait_ms = prepareToWait();
+        if(poller_->wait(wait_ms, ready) < 0) {
             int error = lastSocketError();      // before printing, which can reset it (Windows)
             if(server_.running()) std::cerr << poller_->name() << " error: " << socketErrorText(error) << "\n";
             continue;
         }
+        if(wakeup_) wakeup_->awake();
         sampleOpsPerSec();
 
         // 1. Read from every ready client and run its commands. Their replies
@@ -58,6 +65,10 @@ void EventLoop::run() {
         for(const auto& event : ready) {
             if(event.fd == listen_socket_) {
                 server_.acceptNewClients();
+                continue;
+            }
+            if(wakeup_ && event.fd == static_cast<socket_t>(wakeup_->fd())) {
+                wakeup_->consume();
                 continue;
             }
             // Each check also skips a client removed earlier in this pass
@@ -82,6 +93,39 @@ void EventLoop::run() {
         }
         to_serve_.clear();
     }
+    // A signal reaches only one thread, and an error stops only the loop that
+    // met it: the others may be asleep
+    server_.wakeAllLoops();
+}
+
+// The receiving half of the protocol in Wakeup.h: say this loop is going to
+// sleep, and only then make the last check for work. The stop check is part of
+// that: the server stops by setting a flag and then waking the loops.
+int EventLoop::prepareToWait() {
+    if(!wakeup_) return kIdleWaitMs;
+    wakeup_->aboutToSleep();
+    const bool adopted = adoptNewClients();
+    return adopted || !server_.keepRunning() ? 0 : kIdleWaitMs;
+}
+
+bool EventLoop::adoptNewClients() {
+    NewClient client;
+    bool any = false;
+    while(new_clients_->tryPop(client)) {
+        addClient(client.fd, client.id);
+        any = true;
+    }
+    return any;
+}
+
+bool EventLoop::postNewClient(const NewClient& client) {
+    if(!new_clients_->tryPush(client)) return false;
+    wakeup_->notify();
+    return true;
+}
+
+void EventLoop::wake() {
+    if(wakeup_) wakeup_->notify();
 }
 
 // After each wakeup of the event loop, at most every 100 ms. While the
@@ -120,10 +164,14 @@ void EventLoop::removeClient(socket_t fd) {
     poller_->remove(fd);
     CLOSE_SOCKET(fd);
     clients_.erase(fd);
-    std::cout << "Client disconnected (remaining: " << clients_.size() << ")\n";
+    // One string, so that lines from different threads can't interleave
+    std::cout << ("Client disconnected (remaining: " + std::to_string(server_.clientRemoved()) + ")\n");
 }
 
 void EventLoop::closeAllClients() {
+    // Dealt to this loop but never picked up: the server stopped first
+    NewClient waiting;
+    while(new_clients_ && new_clients_->tryPop(waiting)) CLOSE_SOCKET(waiting.fd);
     for(auto& [fd, client] : clients_) {
         poller_->remove(fd);
         CLOSE_SOCKET(fd);
@@ -228,7 +276,7 @@ void EventLoop::runCommands(Client& client) {
     // Erasing each command from the front would move all the bytes behind it,
     // once per command: quadratic in the number of commands in one read.
     size_t pos = 0;
-    CommandContext ctx{storage_, aof_, clients_.size()};
+    CommandContext ctx{storage_, aof_, server_.connectedClients()};
     ctx.password = server_.password();
     ctx.authenticated = client.authenticated;
     ctx.protocol = client.protocol;

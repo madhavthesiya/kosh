@@ -30,6 +30,13 @@ if(SANITIZE)
     endif()
     add_compile_options(-fsanitize=${SANITIZE} -fno-sanitize-recover=all -fno-omit-frame-pointer)
     add_link_options(-fsanitize=${SANITIZE})
+    # GCC warns that TSan doesn't model atomic_thread_fence. Wakeup.h's fences
+    # exist to prevent lost wakeups, which TSan can't see in any case; every
+    # ordering of the data itself comes from acquire and release, which it does
+    # model. tests/test_wakeup.cpp tests the fences.
+    if(SANITIZE MATCHES "thread" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-tsan)
+    endif()
 endif()
 
 find_package(Threads REQUIRED)
@@ -146,6 +153,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(kosh-loadgen bench/loadgen.cpp)
     target_link_libraries(kosh-loadgen Threads::Threads)
     add_executable(test_loadgen tests/test_loadgen.cpp)
+    # No wakeup between threads may be lost (eventfd, so Linux only)
+    add_executable(test_wakeup tests/test_wakeup.cpp)
+    target_link_libraries(test_wakeup Threads::Threads)
     # What a cross-thread queue costs, and what each part of SpscRing buys (see bench/README.md)
     add_executable(ring_bench bench/ring_bench.cpp)
     target_link_libraries(ring_bench Threads::Threads)
@@ -173,6 +183,7 @@ add_test(NAME thread_safety_tests COMMAND test_threads)
 add_test(NAME spsc_ring_tests COMMAND test_spsc_ring)
 if(TARGET test_loadgen)
     add_test(NAME loadgen_unit_tests COMMAND test_loadgen)
+    add_test(NAME wakeup_tests COMMAND test_wakeup)
 endif()
 if(NOT KOSH_LIBFUZZER)
     add_test(NAME fuzz_corpus COMMAND fuzz_commands ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
@@ -192,6 +203,9 @@ if(Python3_FOUND)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+        add_test(NAME threads_integration_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_threads.py
+                         $<TARGET_FILE:kosh-server>)
         add_test(NAME loadgen_integration_tests
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_loadgen.py
                          $<TARGET_FILE:kosh-loadgen> $<TARGET_FILE:kosh-server>)

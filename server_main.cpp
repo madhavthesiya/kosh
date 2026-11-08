@@ -32,6 +32,7 @@ struct ServerConfig {
     AOFLogger::FsyncPolicy appendFsync = AOFLogger::FsyncPolicy::EverySecond;
     std::string poller = defaultPollerName();
     size_t maxClients = Server::kDefaultMaxClients;
+    size_t threads = 1;
 };
 
 static void printUsage(std::ostream& out) {
@@ -58,6 +59,8 @@ static void printUsage(std::ostream& out) {
            "  --maxclients <n>         Clients served at once; more are refused (default 10000)\n"
            "  --poller <epoll|select>  How to wait for sockets (default: epoll on Linux,\n"
            "                           select elsewhere; select serves about 1,000 clients)\n"
+           "  --threads <1-256>        Event loops, one per thread (default 1). Above 1 needs\n"
+           "                           Linux and epoll, and is unfinished\n"
            "  --version                Print the version and exit\n"
            "  --help                   Show this message\n";
 }
@@ -115,7 +118,7 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
            option != "--requirepass" && option != "--requirepass-file" &&
            option != "--maxkeys" && option != "--eviction" &&
            option != "--appendonly" && option != "--appendfilename" && option != "--appendfsync" &&
-           option != "--maxclients" && option != "--poller") {
+           option != "--maxclients" && option != "--poller" && option != "--threads") {
             std::cerr << "Unknown option '" << option << "' (see --help)\n";
             return ParseResult::Error;
         }
@@ -165,6 +168,8 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
             else ok = false;
         } else if(option == "--maxclients") {
             ok = parseNumber<size_t>(value, 1, 1000000, config.maxClients);
+        } else if(option == "--threads") {
+            ok = parseNumber<size_t>(value, 1, 256, config.threads);
         } else if(option == "--poller") {
             // Rejected here if this system has no such poller (no epoll outside Linux)
             ok = makePoller(value) != nullptr;
@@ -177,6 +182,11 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
             std::cerr << "Invalid value '" << value << "' for " << option << " (see --help)\n";
             return ParseResult::Error;
         }
+    }
+    // Each thread needs a wakeup it can watch alongside its sockets, an eventfd
+    if(config.threads > 1 && config.poller != "epoll") {
+        std::cerr << "--threads above 1 needs epoll (Linux); the poller here is " << config.poller << "\n";
+        return ParseResult::Error;
     }
     return ParseResult::Run;
 }
@@ -244,7 +254,7 @@ int main(int argc, char* argv[]) {
               << " | AOF: "
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
-    Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients);
+    Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients, config.threads);
     server.setBindAddress(config.bindAddress);
     server.setProtectedMode(config.protectedMode);
     if(config.password) {

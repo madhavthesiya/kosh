@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <thread>
 #ifndef _WIN32
 #include <signal.h>
 #include <sys/resource.h>
@@ -71,13 +72,17 @@ void raiseOpenFileLimit(rlim_t wanted) {
 }  // namespace
 
 Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
-               std::unique_ptr<Poller> poller, size_t max_clients)
+               std::unique_ptr<Poller> poller, size_t max_clients, size_t threads)
     : port_(port), max_clients_(max_clients) {
     if(!poller) poller = makePoller(defaultPollerName());
     if(!poller) poller = makePoller("select");      // epoll_create1() failed: select() always works
-    loop_ = std::make_unique<EventLoop>(*this, storage, aof, std::move(poller));
-    loop_->stats().tcp_port = port;
-    loop_->stats().max_clients = max_clients;
+    const std::string poller_name = poller->name();
+    for(size_t i = 0; i < threads; i++) {
+        loops_.push_back(std::make_unique<EventLoop>(
+            *this, storage, aof, i == 0 ? std::move(poller) : makePoller(poller_name), threads > 1));
+        loops_.back()->stats().tcp_port = port;
+        loops_.back()->stats().max_clients = max_clients;
+    }
 }
 
 Server::~Server() {
@@ -121,7 +126,7 @@ bool Server::start() {
     // with an error reply (with a lower limit, accept() would fail with EMFILE
     // instead). That is max_clients_, or with select() its FD_SETSIZE. Redis
     // raises its limit to maxclients + 32 at startup the same way.
-    raiseOpenFileLimit(static_cast<rlim_t>(std::min(max_clients_, loop_->poller().capacity())) + 32);
+    raiseOpenFileLimit(static_cast<rlim_t>(std::min(max_clients_, loops_[0]->poller().capacity())) + 32);
     reserve_fd_ = open("/dev/null", O_RDONLY);
 #endif
 
@@ -188,10 +193,11 @@ bool Server::start() {
         return false;
     }
 
-    loop_->poller().add(listen_socket_);
-    loop_->setListenSocket(listen_socket_);
+    loops_[0]->poller().add(listen_socket_);
+    loops_[0]->setListenSocket(listen_socket_);
     running_ = true;
-    loop_->stats().started = std::chrono::steady_clock::now();
+    const auto started = std::chrono::steady_clock::now();
+    for(auto& loop : loops_) loop->stats().started = started;
     std::cout << "Kosh " << kKoshVersion << " listening on " << bind_address_ << ":" << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
     // Who can connect, and whether they need the password (never printed)
@@ -208,17 +214,23 @@ bool Server::start() {
         std::cout << "WARNING: protected mode is off and no password is set: anyone who can "
                      "reach port " << port_ << " can read and change every key\n";
     }
-    std::cout << "I/O multiplexing: " << loop_->poller().name();
-    if(loop_->poller().capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << loop_->poller().capacity() << ")";
-    std::cout << ", single-threaded | maxclients " << max_clients_ << "\n";
+    std::cout << "I/O multiplexing: " << loops_[0]->poller().name();
+    if(loops_[0]->poller().capacity() != SIZE_MAX) std::cout << " (FD_SETSIZE " << loops_[0]->poller().capacity() << ")";
+    if(loops_.size() == 1) std::cout << ", single-threaded";
+    else std::cout << ", " << loops_.size() << " threads";
+    std::cout << " | maxclients " << max_clients_ << "\n";
+    if(loops_.size() > 1) {
+        std::cout << "WARNING: more than one thread is unfinished: they share one locked map, "
+                     "MULTI is not atomic between threads, and INFO shows one thread's counts\n";
+    }
     return true;
 }
 
 void Server::stop() {
     running_ = false;
-    loop_->closeAllClients();
+    for(auto& loop : loops_) loop->closeAllClients();
     if(listen_socket_ != INVALID_SOCKET) {
-        loop_->poller().remove(listen_socket_);
+        loops_[0]->poller().remove(listen_socket_);
         CLOSE_SOCKET(listen_socket_);
         listen_socket_ = INVALID_SOCKET;
     }
@@ -233,7 +245,12 @@ void Server::stop() {
 }
 
 void Server::run() {
-    loop_->run();
+    std::vector<std::thread> threads;
+    for(size_t i = 1; i < loops_.size(); i++) {
+        threads.emplace_back([this, i] { loops_[i]->run(); });
+    }
+    loops_[0]->run();
+    for(auto& thread : threads) thread.join();
     // Connections and the AOF are closed by stop() and the destructors, which
     // run normally now instead of the process being killed by the signal.
     if(stop_requested) std::cout << "Received a stop signal: shutting down\n";
@@ -241,6 +258,10 @@ void Server::run() {
 
 bool Server::keepRunning() const {
     return running_ && !stop_requested;
+}
+
+void Server::wakeAllLoops() {
+    for(auto& loop : loops_) loop->wake();
 }
 
 void Server::stopWithError(const std::string& why) {
@@ -253,7 +274,7 @@ void Server::stopWithError(const std::string& why) {
 // Accepts every waiting connection rather than one per pass of the loop, up to
 // kMaxAcceptsPerEvent.
 void Server::acceptNewClients() {
-    ServerStats& stats = loop_->stats();
+    ServerStats& stats = loops_[0]->stats();
     for(int i = 0; i < kMaxAcceptsPerEvent; i++) {
         struct sockaddr_in client_addr{};
         int addr_len = sizeof(client_addr);
@@ -309,7 +330,7 @@ void Server::acceptNewClients() {
             continue;
         }
         // As Redis does at maxclients
-        if(loop_->clientCount() >= max_clients_) {
+        if(connected_ >= max_clients_) {
             refuseClient(client, kServerFull);
             stats.rejected_connections++;
             std::cout << "Client refused: maxclients (" << max_clients_ << ") reached\n";
@@ -317,11 +338,11 @@ void Server::acceptNewClients() {
         }
         // Watching a socket select() can't hold would write past the end of
         // fd_set (Linux) or silently never serve it (Windows)
-        if(!loop_->poller().canWatch(client)) {
+        if(!loops_[0]->poller().canWatch(client)) {
             refuseClient(client, kServerFull);
             stats.rejected_connections++;
-            std::cout << "Client refused: the server is at its " << loop_->poller().name() << " limit ("
-                      << loop_->clientCount() << " clients)\n";
+            std::cout << "Client refused: the server is at its " << loops_[0]->poller().name() << " limit ("
+                      << connected_ << " clients)\n";
             continue;
         }
 
@@ -332,11 +353,35 @@ void Server::acceptNewClients() {
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                    reinterpret_cast<const char*>(&flag), sizeof(flag));
 
-        loop_->addClient(client, ++last_client_id_);
+        connected_++;
+        if(!dealToLoop({client, ++last_client_id_})) {
+            connected_--;
+            refuseClient(client, kServerFull);
+            stats.rejected_connections++;
+            std::cout << "Client refused: every thread's queue of new clients is full\n";
+            continue;
+        }
 
         stats.connections_received++;
-        std::cout << "Client connected: " << ip << ":"
-                  << ntohs(client_addr.sin_port)
-                  << " (total: " << loop_->clientCount() << ")\n";
+        // One string, so that lines from different threads can't interleave
+        std::cout << ("Client connected: " + std::string(ip) + ":" +
+                      std::to_string(ntohs(client_addr.sin_port)) +
+                      " (total: " + std::to_string(connected_) + ")\n");
     }
+}
+
+// Round-robin: the loops end up with the same number of clients, to within
+// one, however few there are. A loop whose queue of new clients is full (it
+// hasn't run for a long while) is passed over.
+bool Server::dealToLoop(const EventLoop::NewClient& client) {
+    for(size_t tries = 0; tries < loops_.size(); tries++) {
+        const size_t index = next_loop_;
+        next_loop_ = (next_loop_ + 1) % loops_.size();
+        if(index == 0) {                    // this thread's own loop
+            loops_[0]->addClient(client.fd, client.id);
+            return true;
+        }
+        if(loops_[index]->postNewClient(client)) return true;
+    }
+    return false;
 }

@@ -10,6 +10,8 @@
 #include "Commands.h"         // Transaction, ServerStats
 #include "InMemoryStorage.h"
 #include "RespParser.h"
+#include "SpscRing.h"
+#include "Wakeup.h"
 
 class Server;
 
@@ -19,7 +21,10 @@ class Server;
 // settings, and starting and stopping.
 class EventLoop {
 public:
-    EventLoop(Server& server, InMemoryStorage& storage, AOFLogger* aof, std::unique_ptr<Poller> poller);
+    // `threaded`: other threads will send this loop work, so it needs a way to
+    // receive it and to be woken
+    EventLoop(Server& server, InMemoryStorage& storage, AOFLogger* aof,
+              std::unique_ptr<Poller> poller, bool threaded);
     ~EventLoop();
     EventLoop(const EventLoop&) = delete;
     EventLoop& operator=(const EventLoop&) = delete;
@@ -32,6 +37,17 @@ public:
 
     void addClient(socket_t fd, uint64_t id);   // An accepted client, watched from now on
     void closeAllClients();
+
+    struct NewClient {
+        socket_t fd;
+        uint64_t id;
+    };
+    // From the accepting thread: gives this loop a client. False if too many
+    // are waiting for it to pick them up.
+    bool postNewClient(const NewClient& client);
+
+    // From any thread: makes this loop look at the world again if it is asleep
+    void wake();
     size_t clientCount() const { return clients_.size(); }
 
     Poller& poller() { return *poller_; }
@@ -60,6 +76,8 @@ private:
     enum class SendStatus { Done, Blocked, Failed };
 
     // I/O multiplexing handlers
+    int prepareToWait();                             // Returns how long the poller may wait
+    bool adoptNewClients();                          // True if any arrived
     void handleReadable(socket_t fd);                // Data or end of stream on a client socket
     void queueToServe(socket_t fd, Client& client);  // Serve it once this pass has written the AOF
     bool flushAof();                                 // Before replies go out; false: stop
@@ -72,6 +90,13 @@ private:
 
     // Most a client's incomplete command may occupy (Redis's client-query-buffer-limit)
     static constexpr size_t kMaxQueryBuffer = size_t(1) << 30;
+
+    // How long the poller waits with nothing to do, in milliseconds. The loop
+    // wakes this often even when idle, to sample the rate and notice a stop.
+    static constexpr int kIdleWaitMs = 1000;
+
+    // New clients that can wait to be picked up, per loop
+    static constexpr size_t kNewClientQueue = 4096;
 
     // Bytes read per recv() (Redis reads 16 KB as well)
     static constexpr size_t kReadChunk = size_t{16} * 1024;
@@ -94,6 +119,10 @@ private:
     // Tells the event loop which sockets are ready
     std::unique_ptr<Poller> poller_;
     socket_t listen_socket_ = INVALID_SOCKET;   // INVALID_SOCKET: another loop accepts
+
+    // Only with more than one thread; a single loop has no one to hear from
+    std::unique_ptr<Wakeup> wakeup_;
+    std::unique_ptr<SpscRing<NewClient>> new_clients_;
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
