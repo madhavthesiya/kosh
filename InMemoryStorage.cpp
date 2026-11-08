@@ -364,6 +364,12 @@ InMemoryStorage::ScanResult InMemoryStorage::scan(uint64_t cursor, long long cou
     return result;
 }
 
+void InMemoryStorage::flushAll(const char* command){
+    std::unique_lock lock(mutex_);
+    freeAllEntries();
+    logAOF({command});
+}
+
 size_t InMemoryStorage::dbsize(){
     std::unique_lock lock(mutex_);
     if(!loading_) {

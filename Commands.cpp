@@ -524,6 +524,20 @@ void cmdDbsize(CommandContext& ctx, const Args&, std::string& out) {
     RespParser::appendInteger(out, static_cast<long long>(ctx.storage.dbsize()));
 }
 
+// FLUSHALL [ASYNC|SYNC] and FLUSHDB [ASYNC|SYNC]: Kosh has one database, so
+// both empty it. Always at once: ASYNC (free in the background) is accepted
+// and served synchronously. Any other argument is a syntax error, as in Redis.
+void flushKeys(CommandContext& ctx, const Args& args, std::string& out, const char* record) {
+    if(args.size() > 2 || (args.size() == 2 && !equalsIgnoreCase(args[1], "sync") &&
+                           !equalsIgnoreCase(args[1], "async"))) {
+        return RespParser::appendError(out, kSyntaxError);
+    }
+    ctx.storage.flushAll(record);
+    RespParser::appendSimpleString(out, "OK");
+}
+void cmdFlushall(CommandContext& ctx, const Args& args, std::string& out) { flushKeys(ctx, args, out, "FLUSHALL"); }
+void cmdFlushdb(CommandContext& ctx, const Args& args, std::string& out) { flushKeys(ctx, args, out, "FLUSHDB"); }
+
 // SCAN cursor [MATCH pattern] [COUNT count] [TYPE type], as Redis 7.0.15's
 // (db.c, scanGenericCommand): options in any order, any case, the last of
 // each kind wins; MATCH * is no pattern at all
@@ -764,6 +778,8 @@ const Command kCommands[] = {
     {"pttl",             2,  0,         cmdPttl},
     {"dbsize",           1,  0,         cmdDbsize},
     {"scan",            -2,  0,         cmdScan},
+    {"flushall",        -1,  kCmdWrite, cmdFlushall},
+    {"flushdb",         -1,  kCmdWrite, cmdFlushdb},
 
     {"lpush",           -3,  kCmdWrite, cmdLpush},
     {"rpush",           -3,  kCmdWrite, cmdRpush},

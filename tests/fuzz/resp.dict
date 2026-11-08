@@ -65,6 +65,8 @@ c45="PERSIST"
 c46="PTTL"
 c47="DBSIZE"
 c48="SCAN"
+c49="FLUSHALL"
+c50="FLUSHDB"
 
 # Subcommands and options
 o1="ID"
@@ -87,6 +89,8 @@ o17="persistence"
 o18="MATCH"
 o19="COUNT"
 o20="TYPE"
+o21="SYNC"
+o22="ASYNC"
 
 # Numbers at the edges of what string2ll reads
 n1="9223372036854775807"

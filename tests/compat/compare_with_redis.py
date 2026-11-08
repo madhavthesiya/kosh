@@ -286,6 +286,18 @@ for pattern, key in GLOB_PAIRS:
     assert name not in SCAN_CASES, name
     SCAN_CASES[name] = SCAN_CLEAR + arr("SET", key, "v") + arr("SCAN", 0, "MATCH", pattern, "COUNT", 100)
 
+FLUSH_CASES = {
+    "FLUSHALL": arr("SET", "a", 1) + arr("RPUSH", "l", "x") + arr("SET", "t", "v", "EX", 100) + arr("FLUSHALL") + arr("DBSIZE") + arr("EXISTS", "a", "l", "t") + arr("SCAN", 0),
+    "FLUSHDB": arr("SET", "a", 1) + arr("FLUSHDB") + arr("DBSIZE") + arr("GET", "a"),
+    "on an empty server": arr("FLUSHALL") + arr("FLUSHDB") + arr("DBSIZE"),
+    "SYNC and ASYNC, any case": arr("SET", "a", 1) + arr("FLUSHALL", "SYNC") + arr("SET", "a", 1) + arr("FLUSHALL", "async") + arr("SET", "a", 1) + arr("FLUSHDB", "Async") + arr("FLUSHDB", "sync") + arr("DBSIZE"),
+    "bad arguments": arr("SET", "a", 1) + arr("FLUSHALL", "now") + arr("FLUSHDB", "SYNC", "ASYNC") + arr("FLUSHALL", "") + arr("DBSIZE"),
+    "then writes work": arr("SET", "a", 1) + arr("FLUSHALL") + arr("SET", "b", 2) + arr("INCR", "n") + arr("MGET", "a", "b", "n") + arr("DBSIZE"),
+    "lower case": arr("set", "a", 1) + arr("flushall") + arr("flushdb") + arr("dbsize"),
+    "inside MULTI": arr("SET", "a", 1) + M + arr("FLUSHALL") + arr("SET", "b", 2) + arr("FLUSHDB", "bad") + E + arr("DBSIZE"),
+    "RESP3": H3 + arr("SET", "a", 1) + arr("FLUSHALL") + arr("DBSIZE"),
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -301,6 +313,7 @@ GROUPS = {
     "MGET, MSET": (MGET_MSET_CASES, None),
     "PTTL, PEXPIRE, PERSIST, DBSIZE": (EXPIRY_CASES, None),
     "SCAN": (SCAN_CASES, None),
+    "FLUSHALL, FLUSHDB": (FLUSH_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why

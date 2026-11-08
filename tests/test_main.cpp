@@ -2979,6 +2979,62 @@ TEST(test_scan_command) {
     ASSERT_EQ(executeCommand(ctx, {"SCAN", "0", "COUNT", "0"}), "-ERR syntax error\r\n");
 }
 
+TEST(test_flushall_flushdb) {
+    // Redis 7.0.15's replies; afterwards the engine works as new, eviction
+    // included (SIEVE's queue and hand were reset, not left dangling)
+    for(auto policy : {EvictionPolicy::SIEVE, EvictionPolicy::LRU}) {
+        InMemoryStorage s(5, nullptr, policy);
+        CommandContext ctx{s};
+        for(int i = 0; i < 5; i++) s.set("k" + std::to_string(i), "v", 100);
+        s.rpush("k0", {"x"});
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL"}), "+OK\r\n");
+        ASSERT_EQ(s.stats().keys, size_t{0});
+        ASSERT_EQ(s.stats().expires, size_t{0});
+        ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":0\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"SCAN", "0"}), "*2\r\n$1\r\n0\r\n*0\r\n");
+        for(int i = 0; i < 20; i++) s.set("n" + std::to_string(i), "v");   // evicts down to 5
+        ASSERT_EQ(s.stats().keys, size_t{5});
+        ASSERT_EQ(s.get("n19").value, "v");
+        for(const char* option : {"SYNC", "async", "Async"}) {
+            ASSERT_EQ(executeCommand(ctx, {"FLUSHDB", option}), "+OK\r\n");
+            ASSERT_EQ(s.stats().keys, size_t{0});
+            s.set("a", "1");
+        }
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL", "now"}), "-ERR syntax error\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL", "SYNC", "ASYNC"}), "-ERR syntax error\r\n");
+        ASSERT_EQ(s.get("a").value, "1");                        // a refused flush changes nothing
+    }
+}
+
+TEST(test_aof_flushall_replays) {
+    // Logged as given, even with nothing to remove (as Redis); replay empties
+    // the data at the same point, so only what came after survives
+    const std::string aof_file = "test_aof_flushall.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "a", "1"}, {"RPUSH", "l", "x"}, {"FLUSHALL"}, {"FLUSHDB", "ASYNC"},
+                {"SET", "b", "2"}, {"FLUSHALL", "bad"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{5});
+    ASSERT_EQ(records[2], (Record{"FLUSHALL"}));
+    ASSERT_EQ(records[3], (Record{"FLUSHDB"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_FALSE(s.get("a").success);
+    ASSERT_FALSE(s.exists("l").success);
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3615,6 +3671,10 @@ int main() {
     std::cout << "\n[SCAN]\n";
     RUN_TEST(test_glob_match);
     RUN_TEST(test_scan_command);
+
+    std::cout << "\n[FLUSHALL, FLUSHDB]\n";
+    RUN_TEST(test_flushall_flushdb);
+    RUN_TEST(test_aof_flushall_replays);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

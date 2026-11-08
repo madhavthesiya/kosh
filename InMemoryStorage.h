@@ -118,6 +118,11 @@ class InMemoryStorage final : public StorageInterface {
             std::vector<std::string> keys;
         };
         ScanResult scan(uint64_t cursor, long long count, const std::string* pattern, const std::string* type);
+        // FLUSHALL and FLUSHDB (one database here, so both empty it): frees
+        // every key, the eviction queue and the expiry index, and gives the
+        // table's memory back. Logged as the command given, as Redis logs it
+        // (always, even when there was nothing to remove).
+        void flushAll(const char* command);
         // DBSIZE: the live keys. Expiry here is lazy, so the expired keys are
         // removed first (soonest first, from the expiry index), where Redis's
         // background cycle would have removed most of them already. Each key
