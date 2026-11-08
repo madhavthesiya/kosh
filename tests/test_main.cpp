@@ -2717,6 +2717,89 @@ TEST(test_mset_evicts_after_its_record) {
     ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
 }
 
+TEST(test_pttl_pexpire_persist_dbsize) {
+    // Redis 7.0.15's replies (compare_with_redis.py checks them byte for byte)
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-2\r\n");
+    s.set("k", "v");
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-1\r\n");
+    // Not a whole number of seconds, so PTTL rounded to seconds (1234000)
+    // falls outside the window; TTL rounds to the nearest second
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "1234567"}), ":1\r\n");
+    std::string pttl = executeCommand(ctx, {"PTTL", "k"});
+    long long ms = std::stoll(pttl.substr(1));
+    ASSERT_TRUE(ms > 1234567 - 100 && ms <= 1234567);
+    ASSERT_EQ(executeCommand(ctx, {"TTL", "k"}), ":1235\r\n");
+
+    // Bad times change nothing
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "abc"}), "-ERR value is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "9223372036854775807"}),
+              "-ERR invalid expire time in 'pexpire' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "missing", "1000"}), ":0\r\n");
+
+    // PERSIST: 1 only when it removed an expiry
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "k"}), ":1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "k"}), ":0\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "missing"}), ":0\r\n");
+
+    // A time already past deletes the key at once, as Redis does, and isn't
+    // counted as an expiry (Redis doesn't count it either)
+    s.set("a", "1");
+    s.set("b", "2");
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":3\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "a", "0"}), ":1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "b", "-5"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});                       // gone, not just marked
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":1\r\n");
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{0});
+
+    // A key whose time runs out is still in the table (expiry is lazy) until
+    // DBSIZE removes it, counted as an expiry
+    s.set("t", "x");
+    executeCommand(ctx, {"PEXPIRE", "t", "30"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    ASSERT_EQ(s.stats().keys, size_t{2});
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});
+}
+
+TEST(test_aof_persist_and_past_expiry) {
+    // PERSIST is logged as PERSIST, a time already past as DEL (what Redis
+    // writes), a failed PERSIST not at all; replay reaches the same state
+    const std::string aof_file = "test_aof_persist.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "k", "v", "EX", "100"}, {"PERSIST", "k"}, {"PERSIST", "k"},
+                {"SET", "a", "1"}, {"PEXPIRE", "a", "0"},
+                {"SET", "b", "2"}, {"PEXPIRE", "b", "100000"}, {"PERSIST", "missing"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{6});
+    ASSERT_EQ(records[0][0], "SET");
+    ASSERT_EQ(records[1], (Record{"PERSIST", "k"}));
+    ASSERT_EQ(records[2], (Record{"SET", "a", "1"}));
+    ASSERT_EQ(records[3], (Record{"DEL", "a"}));
+    ASSERT_EQ(records[4], (Record{"SET", "b", "2"}));
+    ASSERT_EQ(records[5][0], "PEXPIREAT");
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.ttl("k").value, "-1");
+    ASSERT_FALSE(s.get("a").success);
+    ASSERT_EQ(s.ttl("b").value, "100");
+    std::remove(aof_file.c_str());
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3344,6 +3427,10 @@ int main() {
     RUN_TEST(test_mget_mset);
     RUN_TEST(test_aof_mset_is_one_record);
     RUN_TEST(test_mset_evicts_after_its_record);
+
+    std::cout << "\n[PTTL, PEXPIRE, PERSIST, DBSIZE]\n";
+    RUN_TEST(test_pttl_pexpire_persist_dbsize);
+    RUN_TEST(test_aof_persist_and_past_expiry);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

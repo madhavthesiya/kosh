@@ -489,12 +489,37 @@ void cmdPexpireat(CommandContext& ctx, const Args& args, std::string& out) {
     RespParser::appendInteger(out, ctx.storage.expireAt(args[1], at).success ? 1 : 0);
 }
 
+// As EXPIRE, in milliseconds. Redis checks only that now + ms fits in 64 bits:
+// a time far in the past just expires the key
+void cmdPexpire(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t ms;
+    if(!parseInt64(args[2], ms)) return RespParser::appendError(out, kNotAnInteger);
+    int64_t now = InMemoryStorage::unixTimeMs();
+    if(ms > INT64_MAX - now) return RespParser::appendError(out, invalidExpireTime("pexpire"));
+    RespParser::appendInteger(out, ctx.storage.expireAt(args[1], now + ms).success ? 1 : 0);
+}
+
 void cmdTtl(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.ttl(args[1]);
     if(!r.success) return RespParser::appendInteger(out, -2);
     // 64-bit: an expiry set with PEXPIREAT can be further away than INT_MAX
     // seconds, and std::stoi would throw out of the event loop
     RespParser::appendInteger(out, std::stoll(r.value));
+}
+
+void cmdPttl(CommandContext& ctx, const Args& args, std::string& out) {
+    auto r = ctx.storage.pttl(args[1]);
+    if(!r.success) return RespParser::appendInteger(out, -2);
+    RespParser::appendInteger(out, std::stoll(r.value));
+}
+
+// 1 if an expiry was removed; 0 if the key is missing or has none
+void cmdPersist(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendInteger(out, ctx.storage.persist(args[1]).success ? 1 : 0);
+}
+
+void cmdDbsize(CommandContext& ctx, const Args&, std::string& out) {
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.dbsize()));
 }
 
 // ---- Lists ----
@@ -692,8 +717,12 @@ const Command kCommands[] = {
     {"exists",          -2,  0,         cmdExists},
     {"type",             2,  0,         cmdType},
     {"expire",           3,  kCmdWrite, cmdExpire},
+    {"pexpire",          3,  kCmdWrite, cmdPexpire},
     {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
+    {"persist",          2,  kCmdWrite, cmdPersist},
     {"ttl",              2,  0,         cmdTtl},
+    {"pttl",             2,  0,         cmdPttl},
+    {"dbsize",           1,  0,         cmdDbsize},
 
     {"lpush",           -3,  kCmdWrite, cmdLpush},
     {"rpush",           -3,  kCmdWrite, cmdRpush},

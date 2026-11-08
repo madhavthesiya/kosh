@@ -102,6 +102,15 @@ class InMemoryStorage final : public StorageInterface {
         Result type(const std::string& key) override;
         Result expire(const std::string& key, int ttlSeconds) override;
         Result ttl(const std::string& key) override;
+        // PTTL: the time left in milliseconds ("-1": no expiry), not rounded
+        Result pttl(const std::string& key);
+        // PERSIST: drops the key's expiry; fails if the key is missing or has none
+        Result persist(const std::string& key);
+        // DBSIZE: the live keys. Expiry here is lazy, so the expired keys are
+        // removed first (soonest first, from the expiry index), where Redis's
+        // background cycle would have removed most of them already. Each key
+        // is removed once, so the work is paid once, not per call.
+        size_t dbsize();
 
         // List operations
         Result lpush(const std::string& key, const std::vector<std::string>& values) override;

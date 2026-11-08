@@ -227,6 +227,29 @@ MGET_MSET_CASES = {
     "RESP3": H3 + fresh("a", "b") + arr("SET", "b", 2) + arr("MGET", "a", "b"),
 }
 
+# PTTL's milliseconds change between asking Redis and asking Kosh, so a key
+# with an expiry is checked with TTL (seconds); PTTL only for -1 and -2. Each
+# group gets fresh servers, so ALL clears every key this group uses and
+# DBSIZE's count is the same on both.
+ALL = fresh("k", "l", "a", "b")
+EXPIRY_CASES = {
+    "PTTL, no key, no expiry": ALL + arr("PTTL", "k") + arr("SET", "k", "v") + arr("PTTL", "k"),
+    "PEXPIRE, then TTL": ALL + arr("SET", "k", "v") + arr("PEXPIRE", "k", 100000) + arr("TTL", "k"),
+    "PEXPIRE a missing key": ALL + arr("PEXPIRE", "k", 1000) + arr("EXISTS", "k"),
+    "PEXPIRE 0 and -1 delete at once": ALL + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("PEXPIRE", "a", 0) + arr("PEXPIRE", "b", -1) + arr("DBSIZE") + arr("EXISTS", "a", "b"),
+    "EXPIRE in the past, then DBSIZE": ALL + arr("SET", "a", 1) + arr("SET", "b", 2) + arr("EXPIRE", "a", -5) + arr("DBSIZE"),
+    "PEXPIREAT in the past, then DBSIZE": ALL + arr("SET", "a", 1) + arr("PEXPIREAT", "a", 1) + arr("DBSIZE"),
+    "PEXPIRE, bad numbers": ALL + arr("SET", "k", "v") + arr("PEXPIRE", "k", "abc") + arr("PEXPIRE", "k", "9223372036854775807") + arr("PEXPIRE", "k", "1.5") + arr("PEXPIRE", "k", "-9223372036854775808") + arr("EXISTS", "k"),
+    "PERSIST": ALL + arr("SET", "k", "v", "EX", 100) + arr("PERSIST", "k") + arr("TTL", "k") + arr("PERSIST", "k") + arr("PERSIST", "a"),
+    "PERSIST a list": ALL + arr("RPUSH", "l", "x") + arr("EXPIRE", "l", 100) + arr("PERSIST", "l") + arr("PTTL", "l") + arr("TYPE", "l"),
+    "SET clears a TTL; PERSIST then has none": ALL + arr("SET", "k", "v", "EX", 100) + arr("SET", "k", "w") + arr("PERSIST", "k"),
+    "DBSIZE, empty and counted": ALL + arr("DBSIZE") + arr("SET", "a", 1) + arr("RPUSH", "l", "x") + arr("DBSIZE") + arr("DEL", "a") + arr("DBSIZE"),
+    "wrong arity": arr("PTTL") + arr("PTTL", "a", "b") + arr("PEXPIRE", "k") + arr("PEXPIRE", "k", 1, 2) + arr("PERSIST") + arr("PERSIST", "a", "b") + arr("DBSIZE", "x"),
+    "lower case": ALL + arr("set", "k", "v") + arr("pexpire", "k", 100000) + arr("ttl", "k") + arr("persist", "k") + arr("pttl", "k") + arr("dbsize"),
+    "inside MULTI": ALL + M + arr("SET", "k", "v") + arr("PEXPIRE", "k", 100000) + arr("PERSIST", "k") + arr("PTTL", "k") + arr("DBSIZE") + E,
+    "RESP3": H3 + ALL + arr("PTTL", "k") + arr("SET", "k", "v") + arr("PERSIST", "k") + arr("DBSIZE"),
+}
+
 # group name -> (cases, server password or None)
 GROUPS = {
     "AUTH, no password set": (AUTH_CASES, None),
@@ -240,11 +263,14 @@ GROUPS = {
     "INCR, DECR, INCRBY, DECRBY": (COUNTER_CASES, None),
     "DEL and EXISTS with several keys": (DEL_EXISTS_CASES, None),
     "MGET, MSET": (MGET_MSET_CASES, None),
+    "PTTL, PEXPIRE, PERSIST, DBSIZE": (EXPIRY_CASES, None),
 }
 
 # Differences Kosh makes on purpose, and why
 EXPECTED = {
     ("Transactions", "WATCH inside MULTI"): "WATCH isn't supported (see the README's Known Limitations)",
+    ("PTTL, PEXPIRE, PERSIST, DBSIZE", "wrong arity"): "EXPIRE and PEXPIRE take no options (Redis 7.0's NX, XX, GT, LT): "
+        "a third argument is an arity error, not Redis's 'Unsupported option' (see the README's Known Limitations)",
 }
 
 

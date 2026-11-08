@@ -60,6 +60,10 @@ c40="HDEL"
 c41="HGETALL"
 c42="HLEN"
 c43="BGREWRITEAOF"
+c44="PEXPIRE"
+c45="PERSIST"
+c46="PTTL"
+c47="DBSIZE"
 
 # Subcommands and options
 o1="ID"

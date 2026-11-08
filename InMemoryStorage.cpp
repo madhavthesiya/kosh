@@ -269,23 +269,63 @@ Result InMemoryStorage::expireAt(const std::string& key, int64_t unixTimeMs){
         expireEntry(e);
         return Result::fail(ErrorCode::KEY_NOT_FOUND);
     }
+    // A time already past deletes the key now, as Redis does: logged as DEL
+    // (what Redis propagates) and not counted as an expiry (Redis doesn't
+    // count it either). Not while loading: replay sets it and lets it expire,
+    // as Redis's loading does.
+    if(!loading_ && toExpiryTime(unixTimeMs) <= steadyNowMs()) {
+        eraseEntry(e);
+        logAOF({"DEL", key});
+        return Result::ok();
+    }
     setExpiry(e, toExpiryTime(unixTimeMs));
     logAOF({"PEXPIREAT", key, std::to_string(unixTimeMs)});
     return Result::ok();
 }
 
-Result InMemoryStorage::ttl(const std::string& key){
+Result InMemoryStorage::pttl(const std::string& key){
     std::shared_lock lock(mutex_);
     const CacheEntry* e = data_.find(key);
     const bool live = e && !isExpired(*e);
     countRead(live);
     if(!live) return Result::fail(ErrorCode::KEY_NOT_FOUND);
     if(!e->has_expiry) return Result::ok("-1");
-    int64_t remaining_ms = addSaturating(e->expiry_time.time_since_epoch().count(),
-                                         -steadyNowMs().time_since_epoch().count());
+    return Result::ok(std::to_string(addSaturating(e->expiry_time.time_since_epoch().count(),
+                                                   -steadyNowMs().time_since_epoch().count())));
+}
+
+Result InMemoryStorage::ttl(const std::string& key){
+    Result r = pttl(key);
+    if(!r.success || r.value == "-1") return r;
     // Rounded to the nearest second, as Redis does: right after "SET k v EX 10"
     // this is 10, not 9
-    return Result::ok(std::to_string(addSaturating(remaining_ms, 500) / 1000));
+    return Result::ok(std::to_string(addSaturating(std::stoll(r.value), 500) / 1000));
+}
+
+// Logged as PERSIST, as Redis logs it: replay drops the expiry the same way
+Result InMemoryStorage::persist(const std::string& key){
+    std::unique_lock lock(mutex_);
+    CacheEntry* e = data_.find(key);
+    if(!e) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    if(isExpired(*e)) {
+        expireEntry(e);
+        return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    }
+    if(!e->has_expiry) return Result::fail(ErrorCode::KEY_NOT_FOUND);
+    setExpiry(e, std::nullopt);
+    logAOF({"PERSIST", key});
+    return Result::ok();
+}
+
+size_t InMemoryStorage::dbsize(){
+    std::unique_lock lock(mutex_);
+    if(!loading_) {
+        ExpiryTime now = steadyNowMs();
+        while(!expiry_index_.empty() && expiry_index_.begin()->first <= now) {
+            expireEntry(const_cast<CacheEntry*>(expiry_index_.begin()->second));
+        }
+    }
+    return data_.size();
 }
 
 // ==================== String Operations ====================
