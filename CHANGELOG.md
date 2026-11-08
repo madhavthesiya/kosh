@@ -10,6 +10,12 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 
 ## [Unreleased]
 
+### Added
+
+- `kosh-loadgen` (Linux): an open-loop load generator for Redis-compatible
+  servers. Latency counts from each request's intended send time, and a
+  percentile the run can't support prints as N/A.
+
 ## [3.1.0] - 2026-11-08
 
 ### Added

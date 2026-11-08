@@ -723,6 +723,8 @@ The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_
   - the client-disconnect regression (Challenge 7).
 - `ctest` runs them twice: with the default poller, and with `--poller select`, so the path `epoll` replaced as the default stays tested.
 
+**The load generator** (`tests/test_loadgen.cpp` and `tests/integration/test_loadgen.py`, Linux): the histogram, the RESP reply scanner across every read boundary, and the rules for refusing a percentile; then a real server frozen for a known time, with the reported percentiles checked against the arithmetic.
+
 **Client libraries** (`tests/integration/test_clients.py`):
 - redis-py 8.1 and node-redis 6.3, the current versions, each through its own API, in RESP2 and RESP3, with and without a password.
 - They cover every supported command, pipelines, `MULTI`/`EXEC` transactions, authentication failures, and errors raised as errors.
@@ -793,6 +795,7 @@ kosh/
 └── tests/
     ├── test_main.cpp              # 142 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
+    ├── test_loadgen.cpp           # kosh-loadgen's histogram, reply scanner and refusal rules
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary
     │   ├── test_clients.py        # redis-py and node-redis against it
@@ -896,6 +899,23 @@ redis-benchmark -p 6379 -t set,get -n 1000000 -r 100000 -c 50
 - `-r 100000` spreads requests over 100,000 random keys; without it, every request hits one key.
 - `--maxkeys` must be at least that many, or most `SET`s also evict.
 - Leave out `-q` to see latency percentiles.
+
+### Open-loop latency
+
+`redis-benchmark` waits for each reply before sending the next request, so when a server stalls, the requests that should have been sent meanwhile are never measured. This is coordinated omission. [`kosh-loadgen`](bench/loadgen.cpp) applies [wrk2](https://github.com/giltene/wrk2)'s method to RESP: requests follow a fixed schedule, and latency counts from each one's intended send time. It works with any Redis-compatible server, on Linux, and prints N/A rather than a percentile the run can't support. YCSB and Dragonfly's `dfly_bench` reached similar designs first.
+
+With Redis frozen for 1 second during a 30-second run at 10,000 requests/s (loopback, WSL2, one run each; [details](bench/results/open-loop/README.md)):
+
+| | `memtier_benchmark --rate-limiting` | `kosh-loadgen` | Arithmetic |
+|---|---:|---:|---:|
+| p99 | 1.43 ms | 713 ms | 700 ms |
+| p99.9 | 2.01 ms | 981 ms | 970 ms |
+| Max | 1003.5 ms | 1.010 s | 1000 ms |
+
+```bash
+cmake --build build --target kosh-loadgen
+./build/kosh-loadgen --port 6380 --rate 20000 --duration 30
+```
 
 ### Sanitizers (GCC/Clang)
 
