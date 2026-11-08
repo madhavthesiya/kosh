@@ -1,0 +1,17 @@
+kosh-loadgen  127.0.0.1:7391  target 20000 req/s, 8 connections, 1 thread(s), 20 s measured after 2 s warm-up, 10% SET
+requests: 400000 scheduled, 400000 answered, 0 error replies, 0 unanswered, 0 connections lost
+latency from the intended send time (what a client waited):
+  p50     913.4 us    95% CI [913.4 us, 917.5 us]  in 20 of 20 s
+  p90     1.53 ms     95% CI [1.53 ms, 1.54 ms]  in 20 of 20 s
+  p99     N/A: generator was 317.4 us late here, over 1/10 of the 2.69 ms measured
+  p99.9   N/A: generator was 1.06 ms late here, over 1/10 of the 6.03 ms measured
+  p99.99  N/A: generator was 5.57 ms late here, over 1/10 of the 10.29 ms measured
+  max     14.25 ms
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     897.0 us
+  p90     1.50 ms
+  p99     2.54 ms
+  p99.9   5.34 ms
+  p99.99  10.29 ms
+  max     14.24 ms
+generator's own lateness: p50 210 ns, p99 317.4 us, max 7.26 ms

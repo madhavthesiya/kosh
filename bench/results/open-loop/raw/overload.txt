@@ -1,0 +1,18 @@
+kosh-loadgen  127.0.0.1:7391  target 400000 req/s, 8 connections, 2 thread(s), 8 s measured after 2 s warm-up, 10% SET
+requests: 3200000 scheduled, 3200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+latency from the intended send time (what a client waited):
+  p50     1.141 s     95% CI [1.141 s, 1.141 s]  in 5 of 8 s
+  p90     1.443 s     95% CI [1.443 s, 1.443 s]  in 2 of 8 s
+  p99     1.485 s     95% CI [1.485 s, 1.485 s]  in 2 of 8 s
+  p99.9   1.502 s     95% CI [1.502 s, 1.502 s]  in 1 of 8 s  *
+  p99.99  1.518 s     95% CI [1.518 s, 1.518 s]  in 1 of 8 s  *
+  max     1.520 s
+  * one second produced all of this tail: a single event, so the run can't say how often it recurs
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     379.58 ms
+  p90     1.141 s
+  p99     1.325 s
+  p99.9   1.384 s
+  p99.99  1.409 s
+  max     1.411 s
+generator's own lateness: p50 435 ns, p99 32.37 ms, max 68.48 ms

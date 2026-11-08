@@ -17,6 +17,7 @@ Scripts that produce every performance number quoted for Kosh. Each one builds t
 | [`layout_bias.py`](layout_bias.py) | How much `lookup_latency` moves from code and stack layout alone: every link order of its objects, each under several environment sizes, in shuffled order. The spread (with run-to-run noise) is the floor a microbenchmark gain must clear | stdout |
 | [`hash_flood.cpp`](hash_flood.cpp) | Hash flooding: finds keys that collide under `std::hash` (timing the attacker's work), then the time to insert them into `KeyTable` with `std::hash` and with the keyed SipHash, as the count doubles; and SipHash's cost for ordinary keys, per hash and per lookup (independent and one at a time) at 1,000 to 1,000,000 keys | stdout |
 | [`auth_compare.cpp`](auth_compare.cpp) | ns per password check by where the guess goes wrong (first byte, middle, last byte, right, too short), for `std::string`'s `==`, a loop that stops at the first difference, and the `constantTimeEquals` that `AUTH` uses: whether timing reveals how much of a guess is right | stdout |
+| [`loadgen.cpp`](loadgen.cpp) (`kosh-loadgen`) | Open-loop latency of any Redis-compatible server: requests go out on a fixed schedule whether or not earlier replies have arrived, and latency counts from each request's intended send time (wrk2's method, over RESP). Prints a percentile only if the run can support it. Linux only | stdout, `--json` |
 | [`alloc_count.cpp`](alloc_count.cpp) | Heap allocations per request, layer by layer: parsing, the engine, the command and its reply, AOF logging. Exact counts, unaffected by machine noise | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
 | [`idle_load.py`](idle_load.py) | One busy client's latency and the server's CPU per request while N other connections sit idle, `select()` against epoll | `idle-load.md` |
@@ -54,6 +55,10 @@ python3 bench/memory_compare.py --out bench/results/<name>/memory.md
 # The layout-and-noise floor for lookup_latency's numbers (about 10 minutes)
 python3 bench/layout_bias.py > bench/results/<name>/layout-bias.md
 cmake --build build --target alloc_count && ./build/alloc_count
+
+# Open-loop latency: 20,000 requests/s for 30 s against a server on port 6380.
+# Each thread spins on a core. See results/open-loop/ for what a stall looks like.
+cmake --build build --target kosh-loadgen && ./build/kosh-loadgen --port 6380 --rate 20000 --duration 30
 
 # Hash flooding and the keyed hash's cost (about a minute)
 cmake --build build --target hash_flood && taskset -c 2 ./build/hash_flood

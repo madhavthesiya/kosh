@@ -135,6 +135,14 @@ add_executable(auth_compare
 )
 target_link_libraries(auth_compare Threads::Threads)
 
+# Open-loop load generator for any Redis-compatible server (see bench/README.md).
+# Linux only: it is built on epoll.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(kosh-loadgen bench/loadgen.cpp)
+    target_link_libraries(kosh-loadgen Threads::Threads)
+    add_executable(test_loadgen tests/test_loadgen.cpp)
+endif()
+
 # Fuzz target: client bytes through the parser and the command table
 # (tests/fuzz). With GCC it gets a standalone driver that replays the corpus
 # (a ctest) or mutates it at random; with clang and -DKOSH_LIBFUZZER=ON it
@@ -154,6 +162,9 @@ target_link_libraries(fuzz_commands Threads::Threads)
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+if(TARGET test_loadgen)
+    add_test(NAME loadgen_unit_tests COMMAND test_loadgen)
+endif()
 if(NOT KOSH_LIBFUZZER)
     add_test(NAME fuzz_corpus COMMAND fuzz_commands ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
 endif()
@@ -172,6 +183,9 @@ if(Python3_FOUND)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+        add_test(NAME loadgen_integration_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_loadgen.py
+                         $<TARGET_FILE:kosh-loadgen> $<TARGET_FILE:kosh-server>)
     endif()
     # redis-py and node-redis against the server. Each is skipped, saying so,
     # if it isn't installed; KOSH_REQUIRE_CLIENTS=1 makes that a failure (CI).
