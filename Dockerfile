@@ -7,7 +7,7 @@
 # See "Run with Docker" in README.md for passwords and keeping the data.
 
 # --- Build stage: compiler, CMake, sources. None of it ships. ---
-FROM debian:bookworm-slim AS build
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends g++ cmake make \
  && rm -rf /var/lib/apt/lists/*
@@ -24,7 +24,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 # glibc, not Alpine's musl: every number in the README was measured with
 # glibc's allocator, and the allocator already caused one stall (README,
 # Challenge 15). musl's is a different allocator, not measured here.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/build/kosh-server /usr/local/bin/kosh-server
 # The AOF lives in /data, owned by the image's unprivileged user (65532)
 COPY --from=build --chown=65532:65532 /data /data

@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <set>
 #include <random>
 #include <algorithm>
 #include <memory>
@@ -25,6 +27,7 @@
 #include "../RespParser.h"
 #include "../Commands.h"
 #include "../Integer.h"
+#include "../Glob.h"
 
 int passed = 0;
 int failed = 0;
@@ -294,6 +297,66 @@ TEST(test_keytable_rehash_is_incremental) {
         }
     }
     for(const auto& e : pool) ASSERT_TRUE(t.find(e->key) == e.get());
+}
+
+TEST(test_keytable_scan) {
+    // SCAN's guarantee, as Redis's: a key present for the whole scan comes
+    // back at least once, however the table grows between steps. A table that
+    // doesn't change gives every key exactly once, even caught mid-rehash.
+    auto fullScan = [](const KeyTable<TableEntry, TableKeyOf>& t, std::map<std::string, int>& seen,
+                       const std::function<void()>& between) {
+        size_t cursor = 0;
+        int steps = 0;
+        do {
+            cursor = t.scan(cursor, [&](const TableEntry& e) { seen[e.key]++; });
+            between();
+            ASSERT_TRUE(++steps < 1'000'000);
+        } while(cursor != 0);
+    };
+    for(int n : {0, 1, 27, 28, 29, 1000, 5000}) {
+        KeyTable<TableEntry, TableKeyOf> t;
+        std::vector<std::unique_ptr<TableEntry>> pool;
+        for(int i = 0; i < n; i++) {
+            pool.push_back(std::make_unique<TableEntry>(TableEntry{"k" + std::to_string(i)}));
+            t.insert(pool.back().get());
+        }
+        for(bool midRehash : {false, true}) {
+            if(midRehash) {             // add keys until a rehash is in progress
+                int extra = 0;
+                while(!t.rehashing()) {
+                    pool.push_back(std::make_unique<TableEntry>(TableEntry{"x" + std::to_string(extra++)}));
+                    t.insert(pool.back().get());
+                }
+            }
+            std::map<std::string, int> seen;
+            fullScan(t, seen, [] {});
+            ASSERT_EQ(seen.size(), pool.size());
+            for(const auto& [key, count] : seen) ASSERT_EQ(count, 1);
+        }
+    }
+    // Growing during the scan: from 1,000 keys, each step adds some (several
+    // doublings, rehashes in progress between steps) and erases some of the new
+    for(int perStep : {1, 7, 50}) {
+        KeyTable<TableEntry, TableKeyOf> t;
+        std::vector<std::unique_ptr<TableEntry>> original, added;
+        for(int i = 0; i < 1000; i++) {
+            original.push_back(std::make_unique<TableEntry>(TableEntry{"k" + std::to_string(i)}));
+            t.insert(original.back().get());
+        }
+        std::map<std::string, int> seen;
+
+        int next = 0, stepsMidRehash = 0;
+        fullScan(t, seen, [&] {
+            for(int j = 0; j < perStep; j++) {
+                added.push_back(std::make_unique<TableEntry>(TableEntry{"n" + std::to_string(next++)}));
+                t.insert(added.back().get());
+            }
+            if(added.size() % 3 == 0) t.erase(added[added.size() / 2].get());
+            if(t.rehashing()) stepsMidRehash++;
+        });
+        ASSERT_TRUE(stepsMidRehash > 0);             // the scan crossed at least one rehash
+        for(const auto& e : original) ASSERT_TRUE(seen.count(e->key) == 1);
+    }
 }
 
 TEST(test_keytable_big_table_given_back) {
@@ -2717,6 +2780,261 @@ TEST(test_mset_evicts_after_its_record) {
     ASSERT_EQ(s.stats().evicted_keys, uint64_t{1});
 }
 
+TEST(test_pttl_pexpire_persist_dbsize) {
+    // Redis 7.0.15's replies (compare_with_redis.py checks them byte for byte)
+    InMemoryStorage s(10);
+    CommandContext ctx{s};
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-2\r\n");
+    s.set("k", "v");
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-1\r\n");
+    // Not a whole number of seconds, so PTTL rounded to seconds (1234000)
+    // falls outside the window; TTL rounds to the nearest second
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "1234567"}), ":1\r\n");
+    std::string pttl = executeCommand(ctx, {"PTTL", "k"});
+    long long ms = std::stoll(pttl.substr(1));
+    ASSERT_TRUE(ms > 1234567 - 100 && ms <= 1234567);
+    ASSERT_EQ(executeCommand(ctx, {"TTL", "k"}), ":1235\r\n");
+
+    // Bad times change nothing
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "abc"}), "-ERR value is not an integer or out of range\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "k", "9223372036854775807"}),
+              "-ERR invalid expire time in 'pexpire' command\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "missing", "1000"}), ":0\r\n");
+
+    // PERSIST: 1 only when it removed an expiry
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "k"}), ":1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PTTL", "k"}), ":-1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "k"}), ":0\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PERSIST", "missing"}), ":0\r\n");
+
+    // A time already past deletes the key at once, as Redis does, and isn't
+    // counted as an expiry (Redis doesn't count it either)
+    s.set("a", "1");
+    s.set("b", "2");
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":3\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"PEXPIRE", "a", "0"}), ":1\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"EXPIRE", "b", "-5"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});                       // gone, not just marked
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":1\r\n");
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{0});
+
+    // A key whose time runs out is still in the table (expiry is lazy) until
+    // DBSIZE removes it, counted as an expiry
+    s.set("t", "x");
+    executeCommand(ctx, {"PEXPIRE", "t", "30"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    ASSERT_EQ(s.stats().keys, size_t{2});
+    ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":1\r\n");
+    ASSERT_EQ(s.stats().keys, size_t{1});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});
+}
+
+TEST(test_aof_persist_and_past_expiry) {
+    // PERSIST is logged as PERSIST, a time already past as DEL (what Redis
+    // writes), a failed PERSIST not at all; replay reaches the same state
+    const std::string aof_file = "test_aof_persist.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "k", "v", "EX", "100"}, {"PERSIST", "k"}, {"PERSIST", "k"},
+                {"SET", "a", "1"}, {"PEXPIRE", "a", "0"},
+                {"SET", "b", "2"}, {"PEXPIRE", "b", "100000"}, {"PERSIST", "missing"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{6});
+    ASSERT_EQ(records[0][0], "SET");
+    ASSERT_EQ(records[1], (Record{"PERSIST", "k"}));
+    ASSERT_EQ(records[2], (Record{"SET", "a", "1"}));
+    ASSERT_EQ(records[3], (Record{"DEL", "a"}));
+    ASSERT_EQ(records[4], (Record{"SET", "b", "2"}));
+    ASSERT_EQ(records[5][0], "PEXPIREAT");
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_EQ(s.ttl("k").value, "-1");
+    ASSERT_FALSE(s.get("a").success);
+    ASSERT_EQ(s.ttl("b").value, "100");
+    std::remove(aof_file.c_str());
+}
+
+TEST(test_glob_match) {
+    // The same pairs compare_with_redis.py sends through SCAN MATCH; Redis
+    // 7.0.15 gives the same answers (checked byte for byte there)
+    struct Case { std::string pattern, key; bool match; };
+    const std::vector<Case> cases = {
+        {"h?llo", "hello", true}, {"h?llo", "hllo", false}, {"h*llo", "hllo", true},
+        {"h*llo", "heeeello", true}, {"h[ae]llo", "hallo", true}, {"h[ae]llo", "hillo", false},
+        {"h[^e]llo", "hallo", true}, {"h[^e]llo", "hello", false}, {"h[a-b]llo", "hbllo", true},
+        {"h[b-a]llo", "hbllo", true},                        // a range given backwards is turned round
+        {"h\\*llo", "h*llo", true}, {"h\\*llo", "hello", false},
+        {"[", "[", false}, {"a[", "a", false}, {"a[^", "ab", true},     // unclosed brackets, as Redis
+        {"[\\]]", "]", true}, {"[a-]", "-", false}, {"[a-]", "a", true}, // "a-]" is a range a..]
+        {"a*", "a", true}, {"a**", "a", true}, {"*a", "a", true}, {"**", "x", true},
+        {"a*b*c", "abc", true}, {"a*b*c", "aXbYc", true}, {"a*b*c", "acb", false},
+        {"\\", "\\", true}, {"abc\\", "abc\\", true},
+        {"[a-\xff]", "\x80", false},                         // bytes compared as signed chars
+        {std::string("a?c"), std::string("a\0c", 3), true},  // NUL is a byte like any other
+        {"", "x", false}, {"*x*", "axb", true},
+        {"[]a]", "a", false},                                // ']' first closes the class
+        {"[!a]", "!", true},                                 // '!' isn't negation, '^' is
+        {"*", "", false},                                    // Redis's own quirk (SCAN skips MATCH *)
+    };
+    for(const auto& c : cases) {
+        if(globMatch(c.pattern, c.key) != c.match) {
+            std::cout << "pattern '" << c.pattern << "' on '" << c.key << "' ";
+            ASSERT_EQ(globMatch(c.pattern, c.key), c.match);
+        }
+    }
+    // Exponential patterns end quickly (skip longer matches, CVE-2022-36021)
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_FALSE(globMatch("a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b", std::string(5000, 'a')));
+    ASSERT_TRUE(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+    // Nesting stops at kMaxGlobNesting, as in the Redis 7.0.15 Ubuntu ships
+    // (measured: "a*" x 1001 matches 1001 'a's on both, x 1002 doesn't).
+    // 100,000 levels would recurse 100,000 frames deep without the limit.
+    auto stars = [](int n) {
+        std::string p;
+        for(int i = 0; i < n; i++) p += "a*";
+        return p;
+    };
+    ASSERT_TRUE(globMatch(stars(1001), std::string(1001, 'a')));
+    ASSERT_FALSE(globMatch(stars(1002), std::string(1002, 'a')));
+    ASSERT_FALSE(globMatch(stars(100000), std::string(100000, 'a')));
+}
+
+TEST(test_scan_command) {
+    InMemoryStorage s(1000);
+    CommandContext ctx{s};
+    // The keys of one SCAN reply: *2 $cursor *n $key...
+    auto scanStep = [&](const std::string& cursor, std::vector<std::string> extra, std::set<std::string>& seen) {
+        std::vector<std::string> command = {"SCAN", cursor};
+        command.insert(command.end(), extra.begin(), extra.end());
+        std::string reply = executeCommand(ctx, command);
+        ASSERT_TRUE(reply.rfind("*2\r\n$", 0) == 0);
+        size_t pos = reply.find("\r\n", 4) + 2;                 // after the cursor's length
+        size_t end = reply.find("\r\n", pos);
+        std::string next = reply.substr(pos, end - pos);
+        pos = end + 2;
+        size_t n = std::stoul(reply.substr(pos + 1, reply.find("\r\n", pos) - pos - 1));
+        pos = reply.find("\r\n", pos) + 2;
+        for(size_t i = 0; i < n; i++) {
+            size_t len = std::stoul(reply.substr(pos + 1, reply.find("\r\n", pos) - pos - 1));
+            pos = reply.find("\r\n", pos) + 2;
+            seen.insert(reply.substr(pos, len));
+            pos += len + 2;
+        }
+        ASSERT_EQ(pos, reply.size());
+        return next;
+    };
+    for(int i = 0; i < 300; i++) s.set("key:" + std::to_string(i), "v");
+    s.rpush("list:1", {"a"});
+    // A full iteration with COUNT 7 returns every key
+    std::set<std::string> seen;
+    std::string cursor = "0";
+    int calls = 0;
+    do {
+        cursor = scanStep(cursor, {"COUNT", "7"}, seen);
+        ASSERT_TRUE(++calls < 10000);
+    } while(cursor != "0");
+    ASSERT_EQ(seen.size(), size_t{301});
+    ASSERT_TRUE(calls > 1);                                    // it took several calls
+    // COUNT is how many keys a call gathers before it stops (Redis steps
+    // the table until it has them): at least 7 here, and all 301 in one call
+    seen.clear();
+    ASSERT_TRUE(scanStep("0", {"COUNT", "7"}, seen) != "0");
+    ASSERT_TRUE(seen.size() >= 7);
+    seen.clear();
+    ASSERT_EQ(scanStep("0", {"COUNT", "1000"}, seen), "0");
+    ASSERT_EQ(seen.size(), size_t{301});
+    // MATCH and TYPE filter
+    seen.clear();
+    cursor = "0";
+    do { cursor = scanStep(cursor, {"MATCH", "key:1?", "COUNT", "50"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen.size(), size_t{10});                        // key:10 .. key:19
+    seen.clear();
+    cursor = "0";
+    uint64_t hits = s.stats().keyspace_hits;
+    do { cursor = scanStep(cursor, {"TYPE", "LIST", "COUNT", "1000"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen, (std::set<std::string>{"list:1"}));
+    ASSERT_EQ(s.stats().keyspace_hits - hits, uint64_t{301});  // each type check is a read, as in Redis
+    // An expired key isn't returned, and is removed when met, counted as an expiry
+    s.set("soon", "v");
+    s.expireAt("soon", InMemoryStorage::unixTimeMs() + 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    seen.clear();
+    cursor = "0";
+    do { cursor = scanStep(cursor, {"COUNT", "1000"}, seen); } while(cursor != "0");
+    ASSERT_EQ(seen.count("soon"), size_t{0});
+    ASSERT_EQ(s.stats().keys, size_t{301});
+    ASSERT_EQ(s.stats().expired_keys, uint64_t{1});
+    // The cursor as Redis reads it
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", " 0"}), "-ERR invalid cursor\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", "18446744073709551616"}), "-ERR invalid cursor\r\n");
+    ASSERT_EQ(executeCommand(ctx, {"SCAN", "0", "COUNT", "0"}), "-ERR syntax error\r\n");
+}
+
+TEST(test_flushall_flushdb) {
+    // Redis 7.0.15's replies; afterwards the engine works as new, eviction
+    // included (SIEVE's queue and hand were reset, not left dangling)
+    for(auto policy : {EvictionPolicy::SIEVE, EvictionPolicy::LRU}) {
+        InMemoryStorage s(5, nullptr, policy);
+        CommandContext ctx{s};
+        for(int i = 0; i < 5; i++) s.set("k" + std::to_string(i), "v", 100);
+        s.rpush("k0", {"x"});
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL"}), "+OK\r\n");
+        ASSERT_EQ(s.stats().keys, size_t{0});
+        ASSERT_EQ(s.stats().expires, size_t{0});
+        ASSERT_EQ(executeCommand(ctx, {"DBSIZE"}), ":0\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"SCAN", "0"}), "*2\r\n$1\r\n0\r\n*0\r\n");
+        for(int i = 0; i < 20; i++) s.set("n" + std::to_string(i), "v");   // evicts down to 5
+        ASSERT_EQ(s.stats().keys, size_t{5});
+        ASSERT_EQ(s.get("n19").value, "v");
+        for(const char* option : {"SYNC", "async", "Async"}) {
+            ASSERT_EQ(executeCommand(ctx, {"FLUSHDB", option}), "+OK\r\n");
+            ASSERT_EQ(s.stats().keys, size_t{0});
+            s.set("a", "1");
+        }
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL", "now"}), "-ERR syntax error\r\n");
+        ASSERT_EQ(executeCommand(ctx, {"FLUSHALL", "SYNC", "ASYNC"}), "-ERR syntax error\r\n");
+        ASSERT_EQ(s.get("a").value, "1");                        // a refused flush changes nothing
+    }
+}
+
+TEST(test_aof_flushall_replays) {
+    // Logged as given, even with nothing to remove (as Redis); replay empties
+    // the data at the same point, so only what came after survives
+    const std::string aof_file = "test_aof_flushall.aof";
+    std::remove(aof_file.c_str());
+    {
+        AOFLogger aof(aof_file);
+        InMemoryStorage s(10, &aof);
+        CommandContext ctx{s, &aof};
+        for(const auto& command : std::vector<std::vector<std::string>>{
+                {"SET", "a", "1"}, {"RPUSH", "l", "x"}, {"FLUSHALL"}, {"FLUSHDB", "ASYNC"},
+                {"SET", "b", "2"}, {"FLUSHALL", "bad"}}) {
+            executeCommand(ctx, command);
+        }
+    }
+    AOFLogger aof(aof_file);
+    auto records = aofRecords(aof.readRaw());
+    using Record = std::vector<std::string>;
+    ASSERT_EQ(records.size(), size_t{5});
+    ASSERT_EQ(records[2], (Record{"FLUSHALL"}));
+    ASSERT_EQ(records[3], (Record{"FLUSHDB"}));
+    InMemoryStorage s(10, &aof);
+    ASSERT_TRUE(replayAOF(s, aof).ok);
+    ASSERT_FALSE(s.get("a").success);
+    ASSERT_FALSE(s.exists("l").success);
+    ASSERT_EQ(s.get("b").value, "2");
+    std::remove(aof_file.c_str());
+}
+
 // ==================== INFO ====================
 
 TEST(test_storage_counts_as_redis_does) {
@@ -3217,6 +3535,7 @@ int main() {
     RUN_TEST(test_keytable_one_long_chain);
     RUN_TEST(test_keytable_matches_unordered_map);
     RUN_TEST(test_keytable_rehash_is_incremental);
+    RUN_TEST(test_keytable_scan);
     RUN_TEST(test_keytable_big_table_given_back);
     RUN_TEST(test_siphash24_reference_vectors);
     RUN_TEST(test_siphash13_matches_cpython);
@@ -3344,6 +3663,18 @@ int main() {
     RUN_TEST(test_mget_mset);
     RUN_TEST(test_aof_mset_is_one_record);
     RUN_TEST(test_mset_evicts_after_its_record);
+
+    std::cout << "\n[PTTL, PEXPIRE, PERSIST, DBSIZE]\n";
+    RUN_TEST(test_pttl_pexpire_persist_dbsize);
+    RUN_TEST(test_aof_persist_and_past_expiry);
+
+    std::cout << "\n[SCAN]\n";
+    RUN_TEST(test_glob_match);
+    RUN_TEST(test_scan_command);
+
+    std::cout << "\n[FLUSHALL, FLUSHDB]\n";
+    RUN_TEST(test_flushall_flushdb);
+    RUN_TEST(test_aof_flushall_replays);
 
     std::cout << "\n[INFO]\n";
     RUN_TEST(test_storage_counts_as_redis_does);

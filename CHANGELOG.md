@@ -8,6 +8,31 @@ break a working setup raises the major number.
 Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 `v2.5-memory`), not as semantic versions; they are listed at the end.
 
+## [Unreleased]
+
+### Added
+
+- `PTTL`, `PEXPIRE`, `PERSIST` and `DBSIZE`, with Redis 7.0.15's replies.
+  `PERSIST` is written to the AOF as `PERSIST`, as Redis writes it.
+  `EXPIRE`/`PEXPIRE` options (`NX`, `XX`, `GT`, `LT`) are not supported.
+- `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]`, as Redis's: a key
+  present for the whole iteration comes back at least once, however the
+  table grows between calls. `MATCH` takes Redis's glob patterns, matched
+  as Redis matches them, with the same 1,000-level depth limit as the Redis
+  7.0.15 Ubuntu ships.
+- `FLUSHALL` and `FLUSHDB` (`[ASYNC|SYNC]`; one database, so the same; served
+  synchronously), written to the AOF.
+- CI runs tair-opensource's resp-compatibility suite against Kosh, as a report.
+- GitHub Actions pinned by commit and Docker base images by digest, kept
+  current by Dependabot.
+
+### Changed
+
+- `EXPIRE`, `PEXPIRE` and `PEXPIREAT` with a time already past delete the key
+  at once, as Redis does, logged as `DEL` and not counted in `INFO`'s
+  `expired_keys` (Redis doesn't count them either). Before, the key stayed
+  until something touched it.
+
 ## [3.0.0] - 2026-11-08
 
 The first release under the name Kosh, and the first meant for others to run.
@@ -71,4 +96,5 @@ The first release under the name Kosh, and the first meant for others to run.
   writes, absolute expiry times in the AOF.
 - **`v0-baseline`** (2026-10-31): the project before any of this work.
 
+[Unreleased]: https://github.com/madhavthesiya/kosh/compare/v3.0.0...HEAD
 [3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...v3.0.0

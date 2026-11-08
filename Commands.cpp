@@ -4,6 +4,8 @@
 #include "Version.h"
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <climits>
 #include <cstring>
 #include <fstream>
@@ -489,12 +491,89 @@ void cmdPexpireat(CommandContext& ctx, const Args& args, std::string& out) {
     RespParser::appendInteger(out, ctx.storage.expireAt(args[1], at).success ? 1 : 0);
 }
 
+// As EXPIRE, in milliseconds. Redis checks only that now + ms fits in 64 bits:
+// a time far in the past just expires the key
+void cmdPexpire(CommandContext& ctx, const Args& args, std::string& out) {
+    int64_t ms;
+    if(!parseInt64(args[2], ms)) return RespParser::appendError(out, kNotAnInteger);
+    int64_t now = InMemoryStorage::unixTimeMs();
+    if(ms > INT64_MAX - now) return RespParser::appendError(out, invalidExpireTime("pexpire"));
+    RespParser::appendInteger(out, ctx.storage.expireAt(args[1], now + ms).success ? 1 : 0);
+}
+
 void cmdTtl(CommandContext& ctx, const Args& args, std::string& out) {
     auto r = ctx.storage.ttl(args[1]);
     if(!r.success) return RespParser::appendInteger(out, -2);
     // 64-bit: an expiry set with PEXPIREAT can be further away than INT_MAX
     // seconds, and std::stoi would throw out of the event loop
     RespParser::appendInteger(out, std::stoll(r.value));
+}
+
+void cmdPttl(CommandContext& ctx, const Args& args, std::string& out) {
+    auto r = ctx.storage.pttl(args[1]);
+    if(!r.success) return RespParser::appendInteger(out, -2);
+    RespParser::appendInteger(out, std::stoll(r.value));
+}
+
+// 1 if an expiry was removed; 0 if the key is missing or has none
+void cmdPersist(CommandContext& ctx, const Args& args, std::string& out) {
+    RespParser::appendInteger(out, ctx.storage.persist(args[1]).success ? 1 : 0);
+}
+
+void cmdDbsize(CommandContext& ctx, const Args&, std::string& out) {
+    RespParser::appendInteger(out, static_cast<long long>(ctx.storage.dbsize()));
+}
+
+// FLUSHALL [ASYNC|SYNC] and FLUSHDB [ASYNC|SYNC]: Kosh has one database, so
+// both empty it. Always at once: ASYNC (free in the background) is accepted
+// and served synchronously. Any other argument is a syntax error, as in Redis.
+void flushKeys(CommandContext& ctx, const Args& args, std::string& out, const char* record) {
+    if(args.size() > 2 || (args.size() == 2 && !equalsIgnoreCase(args[1], "sync") &&
+                           !equalsIgnoreCase(args[1], "async"))) {
+        return RespParser::appendError(out, kSyntaxError);
+    }
+    ctx.storage.flushAll(record);
+    RespParser::appendSimpleString(out, "OK");
+}
+void cmdFlushall(CommandContext& ctx, const Args& args, std::string& out) { flushKeys(ctx, args, out, "FLUSHALL"); }
+void cmdFlushdb(CommandContext& ctx, const Args& args, std::string& out) { flushKeys(ctx, args, out, "FLUSHDB"); }
+
+// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type], as Redis 7.0.15's
+// (db.c, scanGenericCommand): options in any order, any case, the last of
+// each kind wins; MATCH * is no pattern at all
+void cmdScan(CommandContext& ctx, const Args& args, std::string& out) {
+    // The cursor as Redis reads it, with strtoul: "+5" and "-1" (every bit
+    // set) are accepted, so is "" (0); a leading space, anything after the
+    // digits, or more than 64 bits is not
+    const std::string& text = args[1];
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long cursor = std::strtoull(text.c_str(), &end, 10);
+    if((!text.empty() && std::isspace(static_cast<unsigned char>(text[0]))) || *end != '\0' || errno == ERANGE) {
+        return RespParser::appendError(out, "ERR invalid cursor");
+    }
+    long long count = 10;
+    const std::string* pattern = nullptr;
+    const std::string* type = nullptr;
+    for(size_t i = 2; i < args.size(); i += 2) {
+        const bool hasValue = args.size() - i >= 2;
+        if(hasValue && equalsIgnoreCase(args[i], "count")) {
+            int64_t n;
+            if(!parseInt64(args[i + 1], n)) return RespParser::appendError(out, kNotAnInteger);
+            if(n < 1) return RespParser::appendError(out, kSyntaxError);
+            count = n;
+        } else if(hasValue && equalsIgnoreCase(args[i], "match")) {
+            pattern = (args[i + 1] == "*") ? nullptr : &args[i + 1];
+        } else if(hasValue && equalsIgnoreCase(args[i], "type")) {
+            type = &args[i + 1];
+        } else {
+            return RespParser::appendError(out, kSyntaxError);
+        }
+    }
+    auto r = ctx.storage.scan(cursor, count, pattern, type);
+    RespParser::appendLength(out, '*', 2);
+    RespParser::appendBulk(out, std::to_string(r.cursor));
+    RespParser::appendArray(out, r.keys);
 }
 
 // ---- Lists ----
@@ -692,8 +771,15 @@ const Command kCommands[] = {
     {"exists",          -2,  0,         cmdExists},
     {"type",             2,  0,         cmdType},
     {"expire",           3,  kCmdWrite, cmdExpire},
+    {"pexpire",          3,  kCmdWrite, cmdPexpire},
     {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
+    {"persist",          2,  kCmdWrite, cmdPersist},
     {"ttl",              2,  0,         cmdTtl},
+    {"pttl",             2,  0,         cmdPttl},
+    {"dbsize",           1,  0,         cmdDbsize},
+    {"scan",            -2,  0,         cmdScan},
+    {"flushall",        -1,  kCmdWrite, cmdFlushall},
+    {"flushdb",         -1,  kCmdWrite, cmdFlushdb},
 
     {"lpush",           -3,  kCmdWrite, cmdLpush},
     {"rpush",           -3,  kCmdWrite, cmdRpush},

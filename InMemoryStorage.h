@@ -102,6 +102,32 @@ class InMemoryStorage final : public StorageInterface {
         Result type(const std::string& key) override;
         Result expire(const std::string& key, int ttlSeconds) override;
         Result ttl(const std::string& key) override;
+        // PTTL: the time left in milliseconds ("-1": no expiry), not rounded
+        Result pttl(const std::string& key);
+        // PERSIST: drops the key's expiry; fails if the key is missing or has none
+        Result persist(const std::string& key);
+        // SCAN, as Redis 7.0.15's: steps the key table from `cursor` until
+        // `count` keys, the end (cursor 0), or 10 x count steps; then drops
+        // the keys that don't match `pattern` (null: every key), aren't of
+        // `type` (null: any; "string", "list", "set", "hash", any case), or
+        // have expired (removing them, as Redis does when it meets them).
+        // A key present for the whole scan comes back at least once,
+        // however the table grows between calls (KeyTable::scan).
+        struct ScanResult {
+            uint64_t cursor;
+            std::vector<std::string> keys;
+        };
+        ScanResult scan(uint64_t cursor, long long count, const std::string* pattern, const std::string* type);
+        // FLUSHALL and FLUSHDB (one database here, so both empty it): frees
+        // every key, the eviction queue and the expiry index, and gives the
+        // table's memory back. Logged as the command given, as Redis logs it
+        // (always, even when there was nothing to remove).
+        void flushAll(const char* command);
+        // DBSIZE: the live keys. Expiry here is lazy, so the expired keys are
+        // removed first (soonest first, from the expiry index), where Redis's
+        // background cycle would have removed most of them already. Each key
+        // is removed once, so the work is paid once, not per call.
+        size_t dbsize();
 
         // List operations
         Result lpush(const std::string& key, const std::vector<std::string>& values) override;

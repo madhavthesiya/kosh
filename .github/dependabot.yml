@@ -1,0 +1,14 @@
+# The workflow's actions are pinned by commit and the Dockerfile's base
+# images by digest, so nothing changes under a build without a commit here.
+# Dependabot opens a pull request when a new version is out, updating the
+# pin and its version comment together; CI runs on it like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

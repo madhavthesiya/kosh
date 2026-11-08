@@ -518,9 +518,22 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 | `INCR`, `DECR`, `INCRBY`, `DECRBY`: the edges of 64 bits, values that aren't integers | 28 of 28 |
 | `DEL` and `EXISTS` with several keys | 9 of 9 |
 | `MGET`, `MSET` | 14 of 14 |
+| `PTTL`, `PEXPIRE`, `PERSIST`, `DBSIZE` (times already past, bad numbers, inside `MULTI`, RESP3) | 14 of 15; the other gives `PEXPIRE` an option, not supported |
+| `SCAN`: 36 `MATCH` patterns (ranges, escapes, unclosed brackets, NUL and high bytes, the depth limit), cursor forms, `COUNT`, `TYPE`, errors | 49 of 49 |
+| `FLUSHALL`, `FLUSHDB`: `SYNC`/`ASYNC`, bad arguments, an empty server, inside `MULTI`, RESP3 | 9 of 9 |
 | `INFO`'s counters after the same commands | 4 of 4 |
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
+
+**Redis's whole command set**, by version: CI runs tair-opensource's [resp-compatibility](https://github.com/tair-opensource/resp-compatibility) suite (pinned at `5e90c25`) against Kosh on every push. It measures how much of each Redis version a server covers, so most of it tests commands Kosh doesn't have:
+
+| Redis version | 1.0.0 | 2.8.0 | 3.2.0 | 4.0.0 | 5.0.0 | 6.0.0 | 6.2.0 | 7.0.0 | 7.2.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Tests passed | 28 of 50 | 48 of 150 | 48 of 184 | 51 of 196 | 51 of 220 | 51 of 228 | 54 of 295 | 54 of 350 | 54 of 352 |
+
+Every failure was checked. All but 13 test commands Kosh doesn't have (sorted sets, streams, Pub/Sub, `KEYS`, `RENAME` and more). The 13 that test a command Kosh has use an option it doesn't support (`EXPIRE`/`PEXPIRE`/`PEXPIREAT` with `NX`/`XX`/`GT`/`LT`; `SET` with `NX`/`XX`/`GET`/`KEEPTTL`; `LPOP`/`RPOP` with a count), or set up their key with a missing command (`scan with TYPE` starts with `GEOADD`). All are listed under Known Limitations.
+
+**Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
 
 **Client libraries**, tested through their own APIs ([`tests/integration/test_clients.py`](tests/integration/test_clients.py)):
 
@@ -538,7 +551,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 - Keys are limited by `--maxkeys`, not `maxmemory`. The AOF is the only persistence: there are no RDB snapshots.
 - `BGREWRITEAOF` is refused inside `MULTI`.
 
-**Not supported yet:** `WATCH`, `SCAN`, `PEXPIRE`/`PTTL`/`PERSIST`, `DBSIZE`, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
+**Not supported yet:** `WATCH`, `KEYS`, `SSCAN`/`HSCAN`, `SELECT` (one database), sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
 
 ---
 
@@ -562,9 +575,14 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `DEL` | `DEL key1 key2 ...` | Deletes the keys; replies how many there were |
 | `EXISTS` | `EXISTS key1 key2 ...` | How many of the keys exist; a key given twice counts twice, as in Redis |
 | `TYPE` | `TYPE key` | Get data type |
-| `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less makes the key expire at once |
+| `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less deletes the key at once, as in Redis |
+| `PEXPIRE` | `PEXPIRE key milliseconds` | Set TTL in milliseconds; 0 or less deletes the key at once |
 | `PEXPIREAT` | `PEXPIREAT key unix-milliseconds` | Set the expiry as an absolute time (the form the AOF records) |
+| `PERSIST` | `PERSIST key` | Remove the TTL; 1 if there was one, 0 if not or no key |
 | `TTL` | `TTL key` | Remaining TTL in seconds, rounded to the nearest second; -1 without a TTL, -2 if the key doesn't exist |
+| `PTTL` | `PTTL key` | Remaining TTL in milliseconds; -1 without a TTL, -2 if the key doesn't exist |
+| `DBSIZE` | `DBSIZE` | How many keys there are. Expiry is lazy, so it first removes keys whose TTL has run out (Redis's background cycle would have removed most of them) |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | Iterate the keys a few at a time; start at 0, stop when the reply's cursor is 0. A key present for the whole iteration comes back at least once, even if the table grows meanwhile (it can come twice). `MATCH` takes Redis's glob patterns (`*`, `?`, `[a-z]`, `[^x]`, `\`) |
 
 ### List Commands
 | Command | Syntax | Description |
@@ -602,6 +620,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `HELLO` | `HELLO [2\|3] [AUTH default password] [SETNAME name]`: picks the connection's protocol, RESP2 (the default) or RESP3, can authenticate and name it, and describes the server. In RESP3, a missing value is `_`, `HGETALL` and `CONFIG GET` reply with maps, `SMEMBERS` with a set, and `INFO` with a verbatim string, as in Redis. |
 | `CLIENT` | `ID`, `GETNAME`, `SETNAME name`, `HELP`. Other subcommands get Redis's "unknown subcommand" error, which clients skip. |
 | `INFO` | `INFO [section ...]`: the server's state, in Redis's format and with its field names: Server, Clients, Memory (resident memory, the key limit), Persistence, Stats (connections, commands processed, ops per second, keyspace hits and misses, expired and evicted keys) and Keyspace. The counters count what Redis counts (checked on the same commands). There's no `redis_version`: Kosh isn't a complete Redis of any version, and tools decide what to send by it. |
+| `FLUSHALL`, `FLUSHDB` | `FLUSHALL [ASYNC\|SYNC]`: removes every key and gives the key table's memory back. Kosh has one database, so `FLUSHDB` does the same. Always at once: `ASYNC` is accepted and served synchronously. Written to the AOF, so a restart replays it. |
 | `BGREWRITEAOF` | Compacts the AOF through a temporary file and an atomic rename. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled, or when the rewrite fails; the AOF is then unchanged. |
 | `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
 
@@ -645,14 +664,14 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**135 unit tests** (`tests/test_main.cpp`):
+**142 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
 [LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
-[Key Table]             9 tests    ✅  (against std::unordered_map at random, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
+[Key Table]            10 tests    ✅  (against std::unordered_map at random, SCAN's cursor while the table grows, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
 [SIEVE Eviction]        5 tests    ✅  (a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model)
 [TTL Expiration]        5 tests    ✅
 [TTL > LRU Priority]    2 tests    ✅
@@ -668,12 +687,15 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
 [Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
 [Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
+[PTTL, PEXPIRE, PERSIST, DBSIZE] 2 tests ✅  (Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed)
+[SCAN]                  2 tests    ✅  (glob patterns as Redis matches them, an exponential pattern ending fast, the 1,000-level depth limit; a full iteration, COUNT, MATCH, TYPE counted as reads, expired keys removed)
+[FLUSHALL, FLUSHDB]     2 tests    ✅  (Redis's replies; eviction works after, under SIEVE and LRU; logged as given and replayed)
 [INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 135 passed, 0 failed
+Results: 142 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -769,7 +791,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 135 unit tests
+    ├── test_main.cpp              # 142 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary
@@ -962,6 +984,8 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
+| `EXPIRE`, `PEXPIRE` and `PEXPIREAT` take no options (Redis 7.0's `NX`, `XX`, `GT`, `LT`): a third argument gets "wrong number of arguments", where Redis would apply the option or say "Unsupported option". | Implement them, with tests |
+| `LPOP` and `RPOP` take no count (Redis 6.2's `LPOP key count`, popping several at once). | Implement it, with tests |
 | `WATCH` (optimistic locking for transactions) is not supported: it gets "unknown command", which inside `MULTI` aborts the transaction. | A hook that sees every change to a watched key: writes, deletes, expiry and eviction |
 | `BGREWRITEAOF` is refused inside `MULTI`, which Redis allows. | A background rewrite, which would also lift this |
 | The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
