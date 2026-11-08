@@ -178,6 +178,51 @@ jobs:
           name: fuzz-coverage
           path: coverage-html/
 
+  # tair-opensource/resp-compatibility (MIT): Redis's commands, version by
+  # version, sent to a running server. Run, never vendored; pinned to a commit.
+  # Most of Redis's commands aren't in Kosh, so most of its tests fail by
+  # design: the job reports the pass rate per version (in the run's summary)
+  # and fails only if the tool didn't run.
+  resp-compatibility:
+    name: Redis command compatibility (report)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get resp-compatibility
+        run: |
+          git clone -q https://github.com/tair-opensource/resp-compatibility.git resp-compat
+          git -C resp-compat checkout -q 5e90c25ac65f8b0ad6838a261aab438125d0229a
+          python3 -m pip install --user --break-system-packages -r resp-compat/requirements.txt
+      - name: Build
+        run: |
+          cmake -B build
+          cmake --build build -j --target kosh-server
+      # A fresh server per version: Kosh has no FLUSHALL, so one version's
+      # keys would otherwise meet the next one's tests
+      - name: Compare, per Redis version
+        run: |
+          mkdir -p results
+          for v in 1.0.0 2.8.0 3.2.0 4.0.0 5.0.0 6.0.0 6.2.0 7.0.0 7.2.0; do
+            work="$(mktemp -d)"
+            (cd "$work" && exec "$GITHUB_WORKSPACE/build/kosh-server" --appendonly no --maxkeys 1000000) \
+              > "results/kosh-$v.log" 2>&1 &
+            timeout 10 sh -c "until grep -q 'listening on' results/kosh-$v.log; do sleep 0.2; done"
+            (cd resp-compat && python3 resp_compatibility.py --host 127.0.0.1 --port 6379 \
+                --testfile cts.json --specific-version "$v" --show-failed) > "results/redis-$v.txt" 2>&1 || true
+            kill %1 || true
+            wait %1 || true   # the port is free again before the next version
+            summary="$(grep -m1 '^Summary:' "results/redis-$v.txt" || true)"
+            if [ -z "$summary" ]; then
+              echo "resp-compatibility printed no summary for $v:"; tail -30 "results/redis-$v.txt"; exit 1
+            fi
+            echo "- $summary" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: resp-compatibility
+          path: results/
+
   docker:
     name: Docker image
     runs-on: ubuntu-24.04
