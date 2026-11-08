@@ -8,7 +8,7 @@ break a working setup raises the major number.
 Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 `v2.5-memory`), not as semantic versions; they are listed at the end.
 
-## [3.0.0] - Unreleased
+## [3.0.0] - 2026-11-08
 
 The first release under the name Kosh, and the first meant for others to run.
 
@@ -71,4 +71,4 @@ The first release under the name Kosh, and the first meant for others to run.
   writes, absolute expiry times in the AOF.
 - **`v0-baseline`** (2026-10-31): the project before any of this work.
 
-[3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...HEAD
+[3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...v3.0.0
