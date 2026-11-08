@@ -518,6 +518,7 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 | `INCR`, `DECR`, `INCRBY`, `DECRBY`: the edges of 64 bits, values that aren't integers | 28 of 28 |
 | `DEL` and `EXISTS` with several keys | 9 of 9 |
 | `MGET`, `MSET` | 14 of 14 |
+| `PTTL`, `PEXPIRE`, `PERSIST`, `DBSIZE` (times already past, bad numbers, inside `MULTI`, RESP3) | 14 of 15; the other gives `PEXPIRE` an option, not supported |
 | `INFO`'s counters after the same commands | 4 of 4 |
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
@@ -562,9 +563,13 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `DEL` | `DEL key1 key2 ...` | Deletes the keys; replies how many there were |
 | `EXISTS` | `EXISTS key1 key2 ...` | How many of the keys exist; a key given twice counts twice, as in Redis |
 | `TYPE` | `TYPE key` | Get data type |
-| `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less makes the key expire at once |
+| `EXPIRE` | `EXPIRE key seconds` | Set TTL; 0 or less deletes the key at once, as in Redis |
+| `PEXPIRE` | `PEXPIRE key milliseconds` | Set TTL in milliseconds; 0 or less deletes the key at once |
 | `PEXPIREAT` | `PEXPIREAT key unix-milliseconds` | Set the expiry as an absolute time (the form the AOF records) |
+| `PERSIST` | `PERSIST key` | Remove the TTL; 1 if there was one, 0 if not or no key |
 | `TTL` | `TTL key` | Remaining TTL in seconds, rounded to the nearest second; -1 without a TTL, -2 if the key doesn't exist |
+| `PTTL` | `PTTL key` | Remaining TTL in milliseconds; -1 without a TTL, -2 if the key doesn't exist |
+| `DBSIZE` | `DBSIZE` | How many keys there are. Expiry is lazy, so it first removes keys whose TTL has run out (Redis's background cycle would have removed most of them) |
 
 ### List Commands
 | Command | Syntax | Description |
@@ -645,7 +650,7 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**135 unit tests** (`tests/test_main.cpp`):
+**137 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
@@ -668,12 +673,13 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
 [Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
 [Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
+[PTTL, PEXPIRE, PERSIST, DBSIZE] 2 tests ✅  (Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed)
 [INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 135 passed, 0 failed
+Results: 137 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -769,7 +775,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 135 unit tests
+    ├── test_main.cpp              # 137 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary
@@ -962,6 +968,7 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 | Limitation | Planned fix |
 |---|---|
 | `SET`'s `NX`, `XX`, `GET` and `KEEPTTL` options are not supported (they return a syntax error rather than being ignored). | Implement them, with tests |
+| `EXPIRE` and `PEXPIRE` take no options (Redis 7.0's `NX`, `XX`, `GT`, `LT`): a third argument gets "wrong number of arguments", where Redis would apply the option or say "Unsupported option". | Implement them, with tests |
 | `WATCH` (optimistic locking for transactions) is not supported: it gets "unknown command", which inside `MULTI` aborts the transaction. | A hook that sees every change to a watched key: writes, deletes, expiry and eviction |
 | `BGREWRITEAOF` is refused inside `MULTI`, which Redis allows. | A background rewrite, which would also lift this |
 | The key table never shrinks: after many deletes, its buckets stay allocated (64 bytes per 7 slots), and so do spare child buckets. | Shrink incrementally when it is mostly empty, as Redis does |
