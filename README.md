@@ -519,9 +519,12 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](tests/compat/compa
 | `DEL` and `EXISTS` with several keys | 9 of 9 |
 | `MGET`, `MSET` | 14 of 14 |
 | `PTTL`, `PEXPIRE`, `PERSIST`, `DBSIZE` (times already past, bad numbers, inside `MULTI`, RESP3) | 14 of 15; the other gives `PEXPIRE` an option, not supported |
+| `SCAN`: 36 `MATCH` patterns (ranges, escapes, unclosed brackets, NUL and high bytes, the depth limit), cursor forms, `COUNT`, `TYPE`, errors | 49 of 49 |
 | `INFO`'s counters after the same commands | 4 of 4 |
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
+
+**Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
 
 **Client libraries**, tested through their own APIs ([`tests/integration/test_clients.py`](tests/integration/test_clients.py)):
 
@@ -539,7 +542,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 - Keys are limited by `--maxkeys`, not `maxmemory`. The AOF is the only persistence: there are no RDB snapshots.
 - `BGREWRITEAOF` is refused inside `MULTI`.
 
-**Not supported yet:** `WATCH`, `SCAN`, `PEXPIRE`/`PTTL`/`PERSIST`, `DBSIZE`, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
+**Not supported yet:** `WATCH`, `KEYS`, `SSCAN`/`HSCAN`, `FLUSHALL`, sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
 
 ---
 
@@ -570,6 +573,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 | `TTL` | `TTL key` | Remaining TTL in seconds, rounded to the nearest second; -1 without a TTL, -2 if the key doesn't exist |
 | `PTTL` | `PTTL key` | Remaining TTL in milliseconds; -1 without a TTL, -2 if the key doesn't exist |
 | `DBSIZE` | `DBSIZE` | How many keys there are. Expiry is lazy, so it first removes keys whose TTL has run out (Redis's background cycle would have removed most of them) |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | Iterate the keys a few at a time; start at 0, stop when the reply's cursor is 0. A key present for the whole iteration comes back at least once, even if the table grows meanwhile (it can come twice). `MATCH` takes Redis's glob patterns (`*`, `?`, `[a-z]`, `[^x]`, `\`) |
 
 ### List Commands
 | Command | Syntax | Description |
@@ -650,14 +654,14 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 
 ## Tests
 
-**137 unit tests** (`tests/test_main.cpp`):
+**140 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Kosh Test Suite ==========
 
 [Basic Operations]      7 tests    ✅
 [LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
-[Key Table]             9 tests    ✅  (against std::unordered_map at random, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
+[Key Table]            10 tests    ✅  (against std::unordered_map at random, SCAN's cursor while the table grows, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
 [SIEVE Eviction]        5 tests    ✅  (a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model)
 [TTL Expiration]        5 tests    ✅
 [TTL > LRU Priority]    2 tests    ✅
@@ -674,12 +678,13 @@ N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = ele
 [Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
 [Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
 [PTTL, PEXPIRE, PERSIST, DBSIZE] 2 tests ✅  (Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed)
+[SCAN]                  2 tests    ✅  (glob patterns as Redis matches them, an exponential pattern ending fast, a 100,000-deep pattern stopped, not crashing; a full iteration, MATCH, TYPE counted as reads, expired keys removed)
 [INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
 [RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
 [Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
 [RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
 
-Results: 137 passed, 0 failed
+Results: 140 passed, 0 failed
 ```
 
 The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
@@ -775,7 +780,7 @@ kosh/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 137 unit tests
+    ├── test_main.cpp              # 140 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     ├── integration/
     │   ├── test_server.py         # Integration tests against the real server binary

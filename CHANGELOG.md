@@ -15,6 +15,11 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 - `PTTL`, `PEXPIRE`, `PERSIST` and `DBSIZE`, with Redis 7.0.15's replies.
   `PERSIST` is written to the AOF as `PERSIST`, as Redis writes it.
   `EXPIRE`/`PEXPIRE` options (`NX`, `XX`, `GT`, `LT`) are not supported.
+- `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]`, as Redis's: a key
+  present for the whole iteration comes back at least once, however the
+  table grows between calls. `MATCH` takes Redis's glob patterns, matched
+  as Redis matches them, with the same 1,000-level depth limit as the Redis
+  7.0.15 Ubuntu ships.
 
 ### Changed
 
