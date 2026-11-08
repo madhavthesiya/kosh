@@ -71,15 +71,15 @@ void raiseOpenFileLimit(rlim_t wanted) {
 
 }  // namespace
 
-Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof,
-               std::unique_ptr<Poller> poller, size_t max_clients, size_t threads)
-    : port_(port), max_clients_(max_clients) {
+Server::Server(int port, const std::vector<InMemoryStorage*>& shards, AOFLogger* aof,
+               std::unique_ptr<Poller> poller, size_t max_clients)
+    : port_(port), max_clients_(max_clients), router_(shards.size()) {
     if(!poller) poller = makePoller(defaultPollerName());
     if(!poller) poller = makePoller("select");      // epoll_create1() failed: select() always works
     const std::string poller_name = poller->name();
-    for(size_t i = 0; i < threads; i++) {
+    for(size_t i = 0; i < shards.size(); i++) {
         loops_.push_back(std::make_unique<EventLoop>(
-            *this, storage, aof, i == 0 ? std::move(poller) : makePoller(poller_name), threads > 1));
+            *this, i, shards.size(), *shards[i], aof, i == 0 ? std::move(poller) : makePoller(poller_name)));
         loops_.back()->stats().tcp_port = port;
         loops_.back()->stats().max_clients = max_clients;
     }
@@ -220,8 +220,9 @@ bool Server::start() {
     else std::cout << ", " << loops_.size() << " threads";
     std::cout << " | maxclients " << max_clients_ << "\n";
     if(loops_.size() > 1) {
-        std::cout << "WARNING: more than one thread is unfinished: they share one locked map, "
-                     "MULTI is not atomic between threads, and INFO shows one thread's counts\n";
+        std::cout << "WARNING: more than one thread is unfinished: no AOF, MULTI and the whole-server "
+                     "commands are refused, MGET, DEL and EXISTS need their keys on one thread, and "
+                     "INFO shows one thread's counts\n";
     }
     return true;
 }

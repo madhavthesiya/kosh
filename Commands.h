@@ -34,6 +34,7 @@ struct ServerStats {
     uint64_t rejected_connections = 0;      // refused: maxclients, protected mode, out of files
     uint64_t commands_processed = 0;        // commands that ran (executeCommand counts them)
     uint64_t ops_per_sec = 0;               // commands per second, recently (see EventLoop.cpp)
+    uint64_t peak_pending_replies = 0;      // most replies one client has been waiting for from other threads
 };
 
 // What a command can use besides its arguments
@@ -83,6 +84,12 @@ struct Command {
     int arity;              // arguments including the name; -N means at least N
     unsigned flags;
     CommandHandler handler;
+    // Which arguments are keys, as in Redis's command table: first_key,
+    // first_key + key_step, ... up to last_key (-1: the last argument). 0: no
+    // keys. With several threads, this decides which one runs the command.
+    int first_key = 0;
+    int last_key = 0;
+    int key_step = 0;
 };
 
 // The command changes data. Only these are logged, so only these can be replayed.
@@ -96,6 +103,9 @@ constexpr unsigned kCmdNotQueued = 1u << 2;
 // Refused inside MULTI, which it then aborts: "Command not allowed inside a
 // transaction", Redis's no-multi flag
 constexpr unsigned kCmdNoMulti = 1u << 3;
+// Concerns every key, not named ones (SCAN, DBSIZE, FLUSHALL...), so with
+// several threads no single one can run it
+constexpr unsigned kCmdWholeServer = 1u << 4;
 
 // Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
 // bound, the comparison below can always take the same time.
@@ -116,6 +126,7 @@ bool constantTimeEquals(std::string_view given, std::string_view secret);
 // Case-insensitive; nullptr if there is no such command
 const Command* lookupCommand(std::string_view name);
 bool arityMatches(const Command& cmd, size_t argc);
+std::vector<const Command*> allCommands();      // Every entry in the table
 
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.

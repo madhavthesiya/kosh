@@ -10,6 +10,7 @@
 
 #include "EventLoop.h"
 #include "InMemoryStorage.h"
+#include "Router.h"
 
 // The server as a whole: the listening socket, the settings, starting and
 // stopping. The work of serving clients is in EventLoop.
@@ -21,11 +22,10 @@ public:
     // `poller`: how to wait for sockets; the system's best (epoll on Linux,
     // select() elsewhere) if none is given. Beyond `max_clients` clients, or
     // what the poller can watch, a new client gets "-ERR max number of clients
-    // reached" and is disconnected. `threads`: event loops, each on its own
-    // thread (above 1 needs epoll).
-    Server(int port, InMemoryStorage& storage, AOFLogger* aof = nullptr,
-           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients,
-           size_t threads = 1);
+    // reached" and is disconnected. `shards`: one storage per thread; each
+    // thread owns the keys of its shard (above 1 needs epoll).
+    Server(int port, const std::vector<InMemoryStorage*>& shards, AOFLogger* aof = nullptr,
+           std::unique_ptr<Poller> poller = nullptr, size_t max_clients = kDefaultMaxClients);
     ~Server();
 
     // Set these before start().
@@ -54,6 +54,8 @@ private:
     void wakeAllLoops();                             // So that each notices the server stopping
     bool keepRunning() const;                        // False once stopped or asked to stop
     size_t connectedClients() const { return connected_; }
+    EventLoop& loop(size_t index) { return *loops_[index]; }
+    const Router& router() const { return router_; }
     size_t clientRemoved() { return --connected_; }  // How many remain
     bool running() const { return running_; }
     void stopWithError(const std::string& why);      // Says why; the exit code becomes 1
@@ -87,6 +89,8 @@ private:
     // Clients connected, across all loops: the accepting loop adds, every
     // loop subtracts. One counter, touched only when a client comes or goes.
     std::atomic<size_t> connected_{0};
+
+    Router router_;                     // which thread owns a key
 
     // One per thread. The first runs on the thread that calls run() and accepts
     // connections; the others get them dealt to them in turn.

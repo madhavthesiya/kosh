@@ -50,11 +50,7 @@ uint64_t receive(Side& self, Counts& counts) {
     uint64_t message = 0;
     while(true) {
         if(self.inbox.tryPop(message)) return message;
-        self.wakeup.aboutToSleep();
-        if(self.inbox.tryPop(message)) {
-            self.wakeup.awake();
-            return message;
-        }
+        if(self.wakeup.goingToSleep([&] { return self.inbox.tryPop(message); })) return message;
         if(readable(self.wakeup.fd(), 2)) {
             self.wakeup.awake();
             self.wakeup.consume();

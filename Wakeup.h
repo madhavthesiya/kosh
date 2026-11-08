@@ -49,11 +49,18 @@ public:
     // For the receiver's poller to watch, for readability
     int fd() const { return fd_; }
 
-    // The receiver, before its last check for work. If it finds none, it may
-    // then sleep.
-    void aboutToSleep() {
+    // The receiver, when it has run out of work: says it is going to sleep,
+    // then makes its last check for work, has_work(). The order is the whole
+    // protocol, so it is fixed here and a caller can't get it wrong. True: there
+    // is work, and the receiver is marked awake again. False: it may sleep in
+    // its poller, and calls awake() when that returns.
+    template<typename Check>
+    bool goingToSleep(Check&& has_work) {
         asleep_.store(true, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        if(!has_work()) return false;
+        awake();
+        return true;
     }
 
     // The receiver, once awake
@@ -89,7 +96,8 @@ private:
 class Wakeup {
 public:
     int fd() const { return -1; }
-    void aboutToSleep() {}
+    template<typename Check>
+    bool goingToSleep(Check&& has_work) { return has_work(); }
     void awake() {}
     void consume() {}
     void notify() {}

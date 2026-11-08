@@ -1,18 +1,26 @@
 #include "EventLoop.h"
 #include "Server.h"
 #include <iostream>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 // The server batches AOF writes (group commit, see run()): the logger only
 // buffers records, and the loop writes them before sending any reply.
-EventLoop::EventLoop(Server& server, InMemoryStorage& storage, AOFLogger* aof,
-                     std::unique_ptr<Poller> poller, bool threaded)
-    : server_(server), storage_(storage), aof_(aof), poller_(std::move(poller)) {
+EventLoop::EventLoop(Server& server, size_t index, size_t loops, InMemoryStorage& storage, AOFLogger* aof,
+                     std::unique_ptr<Poller> poller)
+    : server_(server), index_(index), loops_(loops), storage_(storage), aof_(aof), poller_(std::move(poller)) {
     if(aof_) aof_->setDeferred(true);
-    if(threaded) {
+    if(loops_ > 1) {
         wakeup_ = std::make_unique<Wakeup>();
         new_clients_ = std::make_unique<SpscRing<NewClient>>(kNewClientQueue);
         poller_->add(static_cast<socket_t>(wakeup_->fd()));
+        inbound_.resize(loops_);
+        for(size_t from = 0; from < loops_; from++) {
+            if(from != index_) inbound_[from] = std::make_unique<SpscRing<Batch*>>(kBatchRingSize);
+        }
+        open_batches_.resize(loops_, nullptr);
+        batches_out_.resize(loops_, 0);
     }
 }
 
@@ -58,6 +66,10 @@ void EventLoop::run() {
         if(wakeup_) wakeup_->awake();
         sampleOpsPerSec();
 
+        // 0. What other threads sent: their commands to run, and the replies
+        //    to commands this thread sent them.
+        processBatches();
+
         // 1. Read from every ready client and run its commands. Their replies
         //    wait in each client's output buffer, their AOF records in the AOF's.
         //    (`ready` is a separate list, so removing a client while going
@@ -82,6 +94,12 @@ void EventLoop::run() {
         //    Redis does the same in beforeSleep().
         if(!flushAof()) break;
 
+        // Commands for other threads go out, and so do the replies to theirs,
+        // now that those commands' AOF records are written: a thread's reply
+        // carries the same promise as a reply to a client.
+        publishReplies();
+        publishRequests();
+
         // 3. Only now send the replies, so none leaves before its record is
         //    with the OS. (serveClient() flushes again before sending replies to
         //    commands it runs itself.)
@@ -92,6 +110,9 @@ void EventLoop::run() {
             serveClient(fd);
         }
         to_serve_.clear();
+
+        // Serving a client can run more of its commands
+        publishRequests();
     }
     // A signal reaches only one thread, and an error stops only the loop that
     // met it: the others may be asleep
@@ -103,9 +124,208 @@ void EventLoop::run() {
 // that: the server stops by setting a flag and then waking the loops.
 int EventLoop::prepareToWait() {
     if(!wakeup_) return kIdleWaitMs;
-    wakeup_->aboutToSleep();
-    const bool adopted = adoptNewClients();
-    return adopted || !server_.keepRunning() ? 0 : kIdleWaitMs;
+    const bool work = wakeup_->goingToSleep([this] {
+        const bool adopted = adoptNewClients();
+        const bool batches = collectBatches();
+        return adopted || batches || !server_.keepRunning();
+    });
+    return work ? 0 : kIdleWaitMs;
+}
+
+bool EventLoop::collectBatches() {
+    Batch* batch = nullptr;
+    bool any = false;
+    for(size_t from = 0; from < loops_; from++) {
+        if(from == index_) continue;
+        while(inbound_[from]->tryPop(batch)) {
+            inbox_.push_back(batch);
+            any = true;
+        }
+    }
+    return any;
+}
+
+void EventLoop::processBatches() {
+    for(Batch* batch : inbox_) {
+        if(batch->answered) {
+            deliverReplies(*batch);
+            batches_out_[batch->owner]--;
+            recycleBatch(batch);
+        } else {
+            runBatch(*batch);
+            batch->answered = true;
+            replies_ready_.push_back(batch);
+        }
+    }
+    inbox_.clear();
+}
+
+// Runs another thread's commands on this thread's keys, through the same
+// command table as any other. The home thread already checked that each is
+// allowed for its client, and it parsed these same bytes, so they parse here.
+void EventLoop::runBatch(Batch& batch) {
+    CommandContext ctx{storage_, aof_, server_.connectedClients()};
+    ctx.server = &stats_;
+    batch.replies.clear();
+    size_t pos = 0;
+    for(Item& item : batch.items) {
+        auto parsed = RespParser::parseInto(std::string_view(batch.requests).substr(pos), args_);
+        pos += parsed.consumed;
+        ctx.protocol = item.protocol;
+        executeCommand(ctx, Args(args_.data(), parsed.argc), batch.replies);
+        item.reply_end = batch.replies.size();
+        releaseLargeArgs(parsed.argc);
+    }
+}
+
+void EventLoop::deliverReplies(Batch& batch) {
+    const std::string_view replies(batch.replies);
+    size_t start = 0;
+    for(const Item& item : batch.items) {
+        auto it = clients_.find(item.fd);
+        // It may have left, and the socket number been given to a new client
+        if(it != clients_.end() && it->second.id == item.client_id) {
+            deliverReply(it->second, item.number, replies.substr(start, item.reply_end - start));
+            queueToServe(item.fd, it->second);
+        }
+        start = item.reply_end;
+    }
+}
+
+// The usual case is the oldest reply arriving, which goes straight to the
+// output, followed by any later ones that had been waiting for it.
+void EventLoop::deliverReply(Client& client, uint64_t number, std::string_view reply) {
+    if(number != client.slots_head) {
+        ReplySlot& slot = client.slot(number);
+        slot.bytes.assign(reply);
+        slot.ready = true;
+        client.slot_bytes += reply.size();
+        return;
+    }
+    client.out.append(reply);
+    client.slots_head++;
+    while(client.slots_head != client.slots_tail) {
+        ReplySlot& slot = client.slot(client.slots_head);
+        if(!slot.ready) break;
+        client.out += slot.bytes;
+        client.slot_bytes -= slot.bytes.size();
+        slot.ready = false;
+        if(slot.bytes.capacity() > kKeepSlotBytes) std::string().swap(slot.bytes);
+        else slot.bytes.clear();
+        client.slots_head++;
+    }
+}
+
+void EventLoop::publishReplies() {
+    for(Batch* batch : replies_ready_) sendBatch(batch->home, batch);
+    replies_ready_.clear();
+}
+
+// A batch waits if too many are already out at that thread, and more commands
+// join it meanwhile; it goes when one of them returns, which wakes this loop.
+void EventLoop::publishRequests() {
+    for(size_t to = 0; to < open_batches_.size(); to++) {
+        if(!open_batches_[to] || batches_out_[to] >= kMaxBatchesOut) continue;
+        open_batches_[to]->owner = to;
+        sendBatch(to, open_batches_[to]);
+        open_batches_[to] = nullptr;
+        batches_out_[to]++;
+    }
+}
+
+void EventLoop::sendBatch(size_t to, Batch* batch) {
+    EventLoop& target = server_.loop(to);
+    // Can't fail: see kMaxBatchesOut. If it did, a batch would be lost and
+    // its client would wait for ever, so stop instead.
+    if(!target.inbound_[index_]->tryPush(batch)) {
+        std::cerr << "A ring between threads is full, which the batch limit should prevent\n";
+        std::abort();
+    }
+    target.wakeup_->notify();
+}
+
+EventLoop::Batch* EventLoop::takeBatch() {
+    if(free_batches_.empty()) {
+        all_batches_.push_back(std::make_unique<Batch>());
+        all_batches_.back()->home = index_;
+        return all_batches_.back().get();
+    }
+    Batch* batch = free_batches_.back();
+    free_batches_.pop_back();
+    return batch;
+}
+
+void EventLoop::recycleBatch(Batch* batch) {
+    if(batch->requests.capacity() > kKeepBatchBytes) std::string().swap(batch->requests);
+    else batch->requests.clear();
+    if(batch->replies.capacity() > kKeepBatchBytes) std::string().swap(batch->replies);
+    else batch->replies.clear();
+    batch->items.clear();
+    batch->answered = false;
+    free_batches_.push_back(batch);
+}
+
+// Which thread runs this command. Anything that will be refused is refused
+// here, so it runs here: only the home thread knows the client's state.
+size_t EventLoop::routeOf(const CommandContext& ctx, const Args& args) const {
+    const Command* cmd = lookupCommand(args[0]);
+    if(!cmd || !arityMatches(*cmd, args.size()) || (!ctx.authenticated && !(cmd->flags & kCmdNoAuth))) return kRunHere;
+    if(cmd->flags & kCmdWholeServer) return kWholeServer;
+    if(cmd->first_key == 0) return kRunHere;
+
+    const Router& router = server_.router();
+    const size_t argc = args.size();
+    const size_t first = static_cast<size_t>(cmd->first_key);
+    const size_t step = static_cast<size_t>(cmd->key_step);
+    const size_t last = cmd->last_key < 0 ? argc - 1 : static_cast<size_t>(cmd->last_key);
+    // Key and value pairs that don't pair up: the command itself says so
+    if(step > 1 && (argc - first) % step != 0) return kRunHere;
+    const size_t owner = router.shardOf(args[first]);
+    for(size_t i = first + step; i <= last; i += step) {
+        if(router.shardOf(args[i]) != owner) return kCrossThread;
+    }
+    return owner;
+}
+
+// Sends one command to the thread that owns its key, and keeps its place in
+// the client's replies. Commands to one thread stay in order: they go in one
+// batch, batches go through one ring, and a ring is first-in, first-out. So
+// two commands on one key run in the order they were sent. Commands on
+// different keys may run in either order, which no client can observe.
+void EventLoop::forward(Client& client, size_t owner, std::string_view command, int protocol) {
+    if(!open_batches_[owner]) open_batches_[owner] = takeBatch();
+    Batch& batch = *open_batches_[owner];
+    batch.requests.append(command);
+    const uint64_t number = client.slots_tail;
+    reserveSlot(client);
+    batch.items.push_back(Item{client.fd, client.id, number, 0, protocol});
+}
+
+EventLoop::ReplySlot& EventLoop::reserveSlot(Client& client) {
+    if(client.pendingReplies() == client.slots.size()) {
+        std::vector<ReplySlot> bigger(client.slots.empty() ? 8 : client.slots.size() * 2);
+        for(uint64_t number = client.slots_head; number != client.slots_tail; number++) {
+            bigger[number & (bigger.size() - 1)] = std::move(client.slot(number));
+        }
+        client.slots = std::move(bigger);
+    }
+    ReplySlot& slot = client.slot(client.slots_tail++);
+    stats_.peak_pending_replies = std::max<uint64_t>(stats_.peak_pending_replies, client.pendingReplies());
+    return slot;
+}
+
+// With nothing outstanding, a reply goes straight to the output. Otherwise it
+// must wait its turn behind the replies still on other threads.
+std::string& EventLoop::replyBuffer(Client& client) {
+    if(client.pendingReplies() == 0) return client.out;
+    return reserveSlot(client).bytes;
+}
+
+void EventLoop::replyDone(Client& client) {
+    if(client.pendingReplies() == 0) return;
+    ReplySlot& slot = client.slot(client.slots_tail - 1);
+    slot.ready = true;
+    client.slot_bytes += slot.bytes.size();
 }
 
 bool EventLoop::adoptNewClients() {
@@ -155,6 +375,7 @@ void EventLoop::sampleOpsPerSec() {
 // password set, it must AUTH first.
 void EventLoop::addClient(socket_t fd, uint64_t id) {
     Client& added = clients_[fd];
+    added.fd = fd;
     added.authenticated = !server_.password();
     added.id = id;
     poller_->add(fd);
@@ -193,7 +414,15 @@ void EventLoop::handleReadable(socket_t fd) {
     long long n = recvSome(fd, buffer, sizeof(buffer));
 
     if(n == 0) {            // the client closed the connection
-        removeClient(fd);
+        if(client.pendingReplies() == 0) {
+            removeClient(fd);
+            return;
+        }
+        // It may only have closed its sending side and still be reading, so
+        // finish what other threads are running for it first
+        client.close_after_reply = true;
+        client.in.clear();
+        queueToServe(fd, client);
         return;
     }
     if(n < 0) {
@@ -215,7 +444,7 @@ void EventLoop::handleReadable(socket_t fd) {
     // Run its commands now; the replies are sent once the pass has written
     // the AOF (see run())
     runCommands(client);
-    if(!client.out.empty()) queueToServe(fd, client);
+    if(!client.out.empty() || client.pendingReplies() >= kMaxPendingReplies) queueToServe(fd, client);
 }
 
 // Hands the AOF records of the commands run so far to the OS, and with
@@ -256,7 +485,8 @@ void EventLoop::serveClient(socket_t fd) {
             }
             if(status == SendStatus::Blocked) break;   // the poller will say when there is room
         }
-        if(client.close_after_reply) {             // QUIT or protocol error, reply sent
+        // QUIT or protocol error, reply sent, and nothing still to come
+        if(client.close_after_reply && client.pendingReplies() == 0) {
             removeClient(fd);
             return;
         }
@@ -284,7 +514,8 @@ void EventLoop::runCommands(Client& client) {
     ctx.client_name = &client.name;
     ctx.transaction = &client.transaction;
     ctx.server = &stats_;
-    while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
+    while(client.out.size() + client.slot_bytes < kOutputHighWater &&
+          client.pendingReplies() < kMaxPendingReplies && !client.close_after_reply) {
         // Into args_, whose strings are reused from command to command. Until
         // the client authenticates, smaller limits apply (see RespParser); an
         // AUTH lifts them for the next command in the same read.
@@ -294,16 +525,38 @@ void EventLoop::runCommands(Client& client) {
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
             // can be trusted, because where the bad command ends is unknown.
-            client.out += RespParser::error("ERR Protocol error: " + parsed.error);
+            replyBuffer(client) += RespParser::error("ERR Protocol error: " + parsed.error);
+            replyDone(client);
             client.close_after_reply = true;
             client.in.clear();
             return;
         }
+        const std::string_view raw = std::string_view(client.in).substr(pos, parsed.consumed);
         pos += parsed.consumed;
         if(parsed.argc == 0) continue;
 
-        // The reply goes straight into the client's buffer
-        executeCommand(ctx, Args(args_.data(), parsed.argc), client.out);
+        const Args args(args_.data(), parsed.argc);
+        if(loops_ > 1) {
+            const size_t owner = routeOf(ctx, args);
+            if(owner < loops_ && owner != index_) {
+                forward(client, owner, raw, ctx.protocol);
+                releaseLargeArgs(parsed.argc);
+                continue;
+            }
+            if(owner == kCrossThread || owner == kWholeServer) {
+                RespParser::appendError(replyBuffer(client), owner == kCrossThread
+                    ? "CROSSSLOT Keys in request don't hash to the same slot"
+                    : "ERR this command isn't available with more than one thread yet");
+                replyDone(client);
+                releaseLargeArgs(parsed.argc);
+                continue;
+            }
+        }
+
+        // Straight into the client's buffer, unless earlier replies are still
+        // on other threads
+        executeCommand(ctx, args, replyBuffer(client));
+        replyDone(client);
         client.authenticated = ctx.authenticated;   // AUTH or HELLO may have succeeded
         client.protocol = ctx.protocol;             // HELLO may have switched it
         releaseLargeArgs(parsed.argc);
@@ -356,7 +609,7 @@ EventLoop::SendStatus EventLoop::sendReplies(socket_t fd, Client& client) {
 // Reads while nothing waits to be sent; waits for writability while something does.
 void EventLoop::updateInterest(socket_t fd, Client& client) {
     bool pending = client.out_sent < client.out.size();
-    bool want_read = !pending && !client.close_after_reply;
+    bool want_read = !pending && !client.close_after_reply && client.pendingReplies() < kMaxPendingReplies;
     bool want_write = pending;
     if(want_read != client.want_read || want_write != client.want_write) {
         poller_->setInterest(fd, want_read, want_write);

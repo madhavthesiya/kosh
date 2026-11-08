@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <memory>
+#include <vector>
 #include "InMemoryStorage.h"
 #include "AOFLogger.h"
 #include "Commands.h"
@@ -188,6 +190,15 @@ static ParseResult parseArgs(int argc, char* argv[], ServerConfig& config) {
         std::cerr << "--threads above 1 needs epoll (Linux); the poller here is " << config.poller << "\n";
         return ParseResult::Error;
     }
+    // Each thread holds its share of the keys, and a share of none can't hold any
+    if(config.maxKeys < config.threads) {
+        std::cerr << "--maxkeys must be at least --threads: each thread holds its share of the keys\n";
+        return ParseResult::Error;
+    }
+    if(config.threads > 1 && config.appendOnly) {
+        std::cerr << "--threads above 1 needs --appendonly no for now\n";
+        return ParseResult::Error;
+    }
     return ParseResult::Run;
 }
 
@@ -227,7 +238,16 @@ int main(int argc, char* argv[]) {
     }
     AOFLogger* aofLogger = aof ? &*aof : nullptr;
 
-    InMemoryStorage storage(config.maxKeys, aofLogger, config.eviction);
+    // One storage per thread. The limit is split so that the shares add up to
+    // exactly --maxkeys.
+    std::vector<std::unique_ptr<InMemoryStorage>> shards;
+    std::vector<InMemoryStorage*> shardPointers;
+    for(size_t i = 0; i < config.threads; i++) {
+        const size_t share = config.maxKeys / config.threads + (i < config.maxKeys % config.threads ? 1 : 0);
+        shards.push_back(std::make_unique<InMemoryStorage>(share, aofLogger, config.eviction));
+        shardPointers.push_back(shards.back().get());
+    }
+    InMemoryStorage& storage = *shards[0];
 
     // Restore state from previous session
     if(aofLogger) {
@@ -254,7 +274,7 @@ int main(int argc, char* argv[]) {
               << " | AOF: "
               << (aofLogger ? config.appendFilename + " (fsync: " + fsync_name + ")" : "disabled") << "\n";
 
-    Server server(config.port, storage, aofLogger, makePoller(config.poller), config.maxClients, config.threads);
+    Server server(config.port, shardPointers, aofLogger, makePoller(config.poller), config.maxClients);
     server.setBindAddress(config.bindAddress);
     server.setProtectedMode(config.protectedMode);
     if(config.password) {

@@ -345,6 +345,8 @@ void cmdInfo(CommandContext& ctx, const Args& args, std::string& out) {
         number("total_commands_processed", server.commands_processed);
         number("instantaneous_ops_per_sec", server.ops_per_sec);
         number("rejected_connections", server.rejected_connections);
+        // Only ever above 0 with several threads
+        if(server.peak_pending_replies > 0) number("peak_pending_replies", server.peak_pending_replies);
         number("expired_keys", keys.expired_keys);
         number("evicted_keys", keys.evicted_keys);
         number("keyspace_hits", keys.keyspace_hits);
@@ -744,12 +746,12 @@ void cmdExec(CommandContext& ctx, const Args&, std::string& out) {
 }
 
 const Command kCommands[] = {
-    // name           arity  flags      handler
+    // name           arity  flags      handler, first key, last key, key step
     {"ping",            -1,  0,         cmdPing},
     {"auth",            -2,  kCmdNoAuth, cmdAuth},
     {"hello",           -1,  kCmdNoAuth, cmdHello},
     {"quit",            -1,  kCmdNoAuth | kCmdNotQueued, cmdQuit},
-    {"multi",            1,  kCmdNotQueued, cmdMulti},
+    {"multi",            1,  kCmdNotQueued | kCmdWholeServer, cmdMulti},
     {"exec",             1,  kCmdNotQueued, cmdExec},
     {"discard",          1,  kCmdNotQueued, cmdDiscard},
     {"command",         -1,  0,         cmdCommand},
@@ -757,54 +759,54 @@ const Command kCommands[] = {
     {"config",          -2,  0,         cmdConfig},
     {"info",            -1,  0,         cmdInfo},
 
-    {"set",             -3,  kCmdWrite, cmdSet},
-    {"get",              2,  0,         cmdGet},
-    {"setex",            4,  kCmdWrite, cmdSetex},
-    {"mget",            -2,  0,         cmdMget},
-    {"mset",            -3,  kCmdWrite, cmdMset},
-    {"incr",            2,  kCmdWrite, cmdIncr},
-    {"decr",             2,  kCmdWrite, cmdDecr},
-    {"incrby",           3,  kCmdWrite, cmdIncrby},
-    {"decrby",           3,  kCmdWrite, cmdDecrby},
+    {"set",             -3,  kCmdWrite, cmdSet, 1, 1, 1},
+    {"get",              2,  0,         cmdGet, 1, 1, 1},
+    {"setex",            4,  kCmdWrite, cmdSetex, 1, 1, 1},
+    {"mget",            -2,  0,         cmdMget, 1, -1, 1},
+    {"mset",            -3,  kCmdWrite, cmdMset, 1, -1, 2},
+    {"incr",            2,  kCmdWrite, cmdIncr, 1, 1, 1},
+    {"decr",             2,  kCmdWrite, cmdDecr, 1, 1, 1},
+    {"incrby",           3,  kCmdWrite, cmdIncrby, 1, 1, 1},
+    {"decrby",           3,  kCmdWrite, cmdDecrby, 1, 1, 1},
 
-    {"del",             -2,  kCmdWrite, cmdDel},
-    {"exists",          -2,  0,         cmdExists},
-    {"type",             2,  0,         cmdType},
-    {"expire",           3,  kCmdWrite, cmdExpire},
-    {"pexpire",          3,  kCmdWrite, cmdPexpire},
-    {"pexpireat",        3,  kCmdWrite, cmdPexpireat},
-    {"persist",          2,  kCmdWrite, cmdPersist},
-    {"ttl",              2,  0,         cmdTtl},
-    {"pttl",             2,  0,         cmdPttl},
-    {"dbsize",           1,  0,         cmdDbsize},
-    {"scan",            -2,  0,         cmdScan},
-    {"flushall",        -1,  kCmdWrite, cmdFlushall},
-    {"flushdb",         -1,  kCmdWrite, cmdFlushdb},
+    {"del",             -2,  kCmdWrite, cmdDel, 1, -1, 1},
+    {"exists",          -2,  0,         cmdExists, 1, -1, 1},
+    {"type",             2,  0,         cmdType, 1, 1, 1},
+    {"expire",           3,  kCmdWrite, cmdExpire, 1, 1, 1},
+    {"pexpire",          3,  kCmdWrite, cmdPexpire, 1, 1, 1},
+    {"pexpireat",        3,  kCmdWrite, cmdPexpireat, 1, 1, 1},
+    {"persist",          2,  kCmdWrite, cmdPersist, 1, 1, 1},
+    {"ttl",              2,  0,         cmdTtl, 1, 1, 1},
+    {"pttl",             2,  0,         cmdPttl, 1, 1, 1},
+    {"dbsize",           1,  kCmdWholeServer, cmdDbsize},
+    {"scan",            -2,  kCmdWholeServer, cmdScan},
+    {"flushall",        -1,  kCmdWrite | kCmdWholeServer, cmdFlushall},
+    {"flushdb",         -1,  kCmdWrite | kCmdWholeServer, cmdFlushdb},
 
-    {"lpush",           -3,  kCmdWrite, cmdLpush},
-    {"rpush",           -3,  kCmdWrite, cmdRpush},
-    {"lpop",             2,  kCmdWrite, cmdLpop},
-    {"rpop",             2,  kCmdWrite, cmdRpop},
-    {"lrange",           4,  0,         cmdLrange},
-    {"llen",             2,  0,         cmdLlen},
+    {"lpush",           -3,  kCmdWrite, cmdLpush, 1, 1, 1},
+    {"rpush",           -3,  kCmdWrite, cmdRpush, 1, 1, 1},
+    {"lpop",             2,  kCmdWrite, cmdLpop, 1, 1, 1},
+    {"rpop",             2,  kCmdWrite, cmdRpop, 1, 1, 1},
+    {"lrange",           4,  0,         cmdLrange, 1, 1, 1},
+    {"llen",             2,  0,         cmdLlen, 1, 1, 1},
 
-    {"sadd",            -3,  kCmdWrite, cmdSadd},
-    {"srem",            -3,  kCmdWrite, cmdSrem},
-    {"smembers",         2,  0,         cmdSmembers},
-    {"sismember",        3,  0,         cmdSismember},
-    {"scard",            2,  0,         cmdScard},
+    {"sadd",            -3,  kCmdWrite, cmdSadd, 1, 1, 1},
+    {"srem",            -3,  kCmdWrite, cmdSrem, 1, 1, 1},
+    {"smembers",         2,  0,         cmdSmembers, 1, 1, 1},
+    {"sismember",        3,  0,         cmdSismember, 1, 1, 1},
+    {"scard",            2,  0,         cmdScard, 1, 1, 1},
 
-    {"hset",            -4,  kCmdWrite, cmdHset},
-    {"hget",             3,  0,         cmdHget},
-    {"hdel",            -3,  kCmdWrite, cmdHdel},
-    {"hgetall",          2,  0,         cmdHgetall},
-    {"hlen",             2,  0,         cmdHlen},
+    {"hset",            -4,  kCmdWrite, cmdHset, 1, 1, 1},
+    {"hget",             3,  0,         cmdHget, 1, 1, 1},
+    {"hdel",            -3,  kCmdWrite, cmdHdel, 1, 1, 1},
+    {"hgetall",          2,  0,         cmdHgetall, 1, 1, 1},
+    {"hlen",             2,  0,         cmdHlen, 1, 1, 1},
 
     // Refused inside MULTI, unlike in Redis: Kosh rewrites in the foreground,
     // so a rewrite in the middle of EXEC would start the new file after the
     // transaction's MULTI record, and replay would find an EXEC without one
-    {"bgrewriteaof",    -1,  kCmdNoMulti, cmdRewriteAof},
-    {"aofrewrite",      -1,  kCmdNoMulti, cmdRewriteAof},
+    {"bgrewriteaof",    -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof},
+    {"aofrewrite",      -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof},
 };
 
 struct CommandIndex {
@@ -860,6 +862,12 @@ bool constantTimeEquals(std::string_view given, std::string_view secret) {
     }
     // Lengths matter too: "abc" padded with zeros equals "abc\0"
     return diff == 0 && given.size() == secret.size();
+}
+
+std::vector<const Command*> allCommands() {
+    std::vector<const Command*> all;
+    for(const auto& cmd : kCommands) all.push_back(&cmd);
+    return all;
 }
 
 bool arityMatches(const Command& cmd, size_t argc) {

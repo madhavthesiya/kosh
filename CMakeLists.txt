@@ -94,6 +94,10 @@ target_link_libraries(test_threads Threads::Threads)
 add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
 target_link_libraries(test_spsc_ring Threads::Threads)
 
+# Which thread owns a key, and where the command table says the keys are
+add_executable(test_router tests/test_router.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+target_link_libraries(test_router Threads::Threads)
+
 # Prints sizeof() of the storage types and the heap cost of one key (see bench/README.md)
 add_executable(memory_layout
     bench/memory_layout.cpp
@@ -181,6 +185,7 @@ enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
 add_test(NAME spsc_ring_tests COMMAND test_spsc_ring)
+add_test(NAME router_tests COMMAND test_router)
 if(TARGET test_loadgen)
     add_test(NAME loadgen_unit_tests COMMAND test_loadgen)
     add_test(NAME wakeup_tests COMMAND test_wakeup)
