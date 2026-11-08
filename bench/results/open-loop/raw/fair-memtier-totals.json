@@ -1,0 +1,17 @@
+{
+ "Count": 277515,
+ "Ops/sec": 8672.21,
+ "Hits/sec": 7804.88,
+ "Misses/sec": 0.0,
+ "Connection Errors/sec": 0.0,
+ "Connection Errors": 0,
+ "Latency": 0.884,
+ "Average Latency": 0.884,
+ "Accumulated Latency": 245395,
+ "Min Latency": 0.168,
+ "Max Latency": 1003.519,
+ "KB/sec": 884.07,
+ "KB/sec RX/TX": 884.07,
+ "KB/sec RX": 545.39,
+ "KB/sec TX": 338.67
+}
