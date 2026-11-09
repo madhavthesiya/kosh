@@ -23,7 +23,7 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 ./build/kosh-server                       # 127.0.0.1:6379, 10,000 keys, AOF in ./appendonly.aof
 ./build/kosh-server --port 6380 --maxkeys 1000000 --appendonly no
 ./build/kosh-server --help
-./build/kosh-server --version             # kosh-server 3.1.0
+./build/kosh-server --version             # kosh-server 4.0.0
 
 # Connect with redis-cli (in another terminal)
 redis-cli -p 6379

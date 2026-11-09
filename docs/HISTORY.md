@@ -32,7 +32,7 @@ From October 2026 the project went through a plan with one rule: nothing is clai
 
 **An honest latency tool.** `kosh-loadgen`, which measures from each request's intended send time, and refuses to print a percentile it can't support. When Redis was frozen for a second, `memtier` reported a p99 of 1.43 ms; `kosh-loadgen` reported 713 ms, where the arithmetic says 700. [Results](../bench/results/open-loop/README.md).
 
-**Several threads.** Shard-per-core with `--threads N`, in small steps: a lock-free ring, one event loop per thread, a wakeup protocol that can't lose a wakeup, forwarding with replies kept in order, one AOF per thread with a manifest, commands that span threads, and every test suite run at 4 threads. A first benchmark showed threads making things slower, which led to two findings: 48 connections hid the effect of threads, and sending a pipeline's replies in pieces wasted most of the gain. [Results](../bench/results/shard-per-core/README.md), [how it works](ARCHITECTURE.md#several-threads).
+**Several threads (4.0.0).** Shard-per-core with `--threads N`, in small steps: a lock-free ring, one event loop per thread, a wakeup protocol that can't lose a wakeup, forwarding with replies kept in order, one AOF per thread with a manifest, commands that span threads, and every test suite run at 4 threads. A first benchmark showed threads making things slower, which led to two findings: 48 connections hid the effect of threads, and sending a pipeline's replies in pieces wasted most of the gain. [Results](../bench/results/shard-per-core/README.md), [how it works](ARCHITECTURE.md#several-threads).
 
 ## What was left out on purpose
 

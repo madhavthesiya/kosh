@@ -10,6 +10,12 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-09
+
+A new major version because the server's design changed: it can now run on
+several threads, each owning its keys. Nothing breaks a working setup: with one
+thread, the default, the server behaves as before.
+
 ### Added
 
 - `kosh-loadgen` (Linux): an open-loop load generator for Redis-compatible
@@ -22,6 +28,8 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
   `MULTI` with keys on several threads are refused with `-CROSSSLOT`; `MGET`,
   `DEL` and `EXISTS` are split across threads.
 - `kosh-loadgen --ports` drives several separate servers.
+- `INFO` reports `peak_pending_replies`, the most replies one client has had in
+  flight between threads.
 
 ### Changed
 
@@ -115,6 +123,7 @@ The first release under the name Kosh, and the first meant for others to run.
   writes, absolute expiry times in the AOF.
 - **`v0-baseline`** (2026-10-31): the project before any of this work.
 
-[Unreleased]: https://github.com/madhavthesiya/kosh/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/madhavthesiya/kosh/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/madhavthesiya/kosh/compare/v3.1.0...v4.0.0
 [3.1.0]: https://github.com/madhavthesiya/kosh/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/madhavthesiya/kosh/compare/v2.5-memory...v3.0.0
