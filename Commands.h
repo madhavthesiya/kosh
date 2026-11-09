@@ -23,6 +23,9 @@ struct Transaction {
     bool aborted = false;       // a command was refused while queuing: EXEC refuses (EXECABORT)
     bool writes = false;        // a queued command changes data
     std::vector<std::vector<std::string>> queued;
+    // With several threads: the one that owns the keys so far. A transaction
+    // runs as one task on one thread, so all its keys must be on that thread.
+    size_t owner = SIZE_MAX;    // SIZE_MAX: no key yet
 };
 
 // What INFO reports about the server, which keeps it (see EventLoop.cpp)
@@ -80,6 +83,30 @@ private:
 // Appends the command's RESP reply to `out`
 using CommandHandler = void (*)(CommandContext& ctx, const Args& args, std::string& out);
 
+// Everything INFO reports, gathered from one thread. Plain data, so that a
+// thread can hand it to another as bytes.
+struct InfoData {
+    ServerStats server;
+    bool has_server = false;
+    InMemoryStorage::Stats keys;
+    size_t clients = 0;
+    bool aof_enabled = false;
+    bool aof_failing = false;
+};
+InfoData localInfo(const CommandContext& ctx);
+void mergeInfo(InfoData& into, const InfoData& other);      // Adds another thread's counts
+void appendInfo(const InfoData& info, const Args& args, int protocol, std::string& out);
+
+// How the answers of several threads to one command become one reply
+enum class Merge : uint8_t {
+    None,       // it can't be split: all its keys must be on one thread
+    Sum,        // integers, added (DEL, EXISTS, DBSIZE)
+    Values,     // one value per key, put back in the order the keys were given (MGET)
+    AllOk,      // +OK, unless one of them failed (FLUSHALL, BGREWRITEAOF)
+    Info,       // each thread's counts, added (INFO)
+    ScanStep,   // one thread's SCAN at a time, its cursor marked with the thread (SCAN)
+};
+
 struct Command {
     const char* name;       // lower case, as Redis's error messages quote it
     int arity;              // arguments including the name; -N means at least N
@@ -91,6 +118,7 @@ struct Command {
     int first_key = 0;
     int last_key = 0;
     int key_step = 0;
+    Merge merge = Merge::None;
 };
 
 // The command changes data. Only these are logged, so only these can be replayed.
@@ -107,6 +135,9 @@ constexpr unsigned kCmdNoMulti = 1u << 3;
 // Concerns every key, not named ones (SCAN, DBSIZE, FLUSHALL...), so with
 // several threads no single one can run it
 constexpr unsigned kCmdWholeServer = 1u << 4;
+// Reads or changes the connection's own state, which only its home thread
+// has, so with several threads a transaction can't carry it to another
+constexpr unsigned kCmdConnection = 1u << 5;
 
 // Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
 // bound, the comparison below can always take the same time.
@@ -128,6 +159,13 @@ bool constantTimeEquals(std::string_view given, std::string_view secret);
 const Command* lookupCommand(std::string_view name);
 bool arityMatches(const Command& cmd, size_t argc);
 std::vector<const Command*> allCommands();      // Every entry in the table
+
+// With several threads, a SCAN cursor holds the thread in its top 8 bits and
+// that thread's own cursor in the rest (a table has far fewer than 2^56 buckets)
+constexpr unsigned kScanThreadShift = 56;
+constexpr uint64_t kScanCursorMask = (uint64_t{1} << kScanThreadShift) - 1;
+// A SCAN cursor as Redis reads it; false if it is invalid
+bool parseScanCursor(const std::string& text, uint64_t& cursor);
 
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.

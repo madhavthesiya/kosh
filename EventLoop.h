@@ -2,6 +2,7 @@
 #include "Socket.h"     // first: on Windows it must set FD_SETSIZE before winsock2.h is included
 #include "Poller.h"
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -98,12 +99,43 @@ private:
     // that fills a batch (its home) owns it: the batch goes to the other
     // thread, comes back with the replies in it, and is used again. So once
     // batches have grown to their usual size, nothing is allocated per command.
+    //
+    // A command that needs several threads is a Gather: its reply slot, what
+    // has come back so far, and the rule for combining it (Merge). Each thread's
+    // part is an Item pointing at the Gather, which only its home thread reads.
+    struct Gather {
+        std::list<Gather>::iterator self;   // for removing it
+        Merge merge = Merge::None;
+        socket_t fd = INVALID_SOCKET;
+        uint64_t client_id = 0;
+        uint64_t number = 0;
+        int protocol = 2;
+        size_t waiting = 0;                 // parts not back yet
+        std::string error;                  // the first part that failed
+        long long sum = 0;                  // Sum
+        std::vector<std::string> values;    // Values: each key's reply
+        std::vector<std::vector<uint32_t>> keys_of_part;    // Values: which keys
+        InfoData info;                      // Info
+        std::vector<std::string> args;      // Info: its sections
+        size_t thread = 0;                  // ScanStep: which thread ran it
+        std::string scan_reply;             // ScanStep
+    };
+    enum class ItemKind : uint8_t {
+        Command,        // the bytes of one command
+        Info,           // no bytes: answer with this thread's InfoData
+        Transaction,    // `commands` commands, to run as one EXEC
+    };
     struct Item {
-        socket_t fd;            // whose reply, checked against client_id: the
-        uint64_t client_id;     // fd may be reused if the client has gone
-        uint64_t number;        // its reply slot
-        size_t reply_end;       // where its reply ends in Batch::replies
-        int protocol;           // RESP version to answer in
+        socket_t fd = INVALID_SOCKET;   // whose reply, checked against client_id:
+        uint64_t client_id = 0;         // the fd may be reused if the client has gone
+        uint64_t number = 0;            // its reply slot
+        size_t reply_end = 0;           // where its reply ends in Batch::replies
+        int protocol = 2;               // RESP version to answer in
+        ItemKind kind = ItemKind::Command;
+        Gather* gather = nullptr;       // a part of this, rather than a client's reply
+        uint32_t part = 0;
+        uint32_t commands = 0;          // Transaction
+        bool writes = false;            // Transaction: a queued command changes data
     };
     struct Batch {
         std::string requests;   // the commands, as the client sent them
@@ -114,10 +146,15 @@ private:
         bool answered = false;
     };
 
-    // Where a command runs, besides a thread's number
-    static constexpr size_t kRunHere = SIZE_MAX;       // no keys, or it will be refused
+    // Where a command's keys are, besides a thread's number
+    static constexpr size_t kRunHere = SIZE_MAX;       // nothing to route: it says what is wrong
     static constexpr size_t kCrossThread = SIZE_MAX - 1;
-    static constexpr size_t kWholeServer = SIZE_MAX - 2;
+
+    // What became of a command that may need other threads
+    enum class Routed {
+        RunHere,        // run it here, as usual
+        Handled,        // sent on, or refused, and its reply slot arranged
+    };
 
     enum class SendStatus { Done, Blocked, Failed };
 
@@ -132,8 +169,21 @@ private:
     void publishReplies();                           // Once their AOF records are written
     void publishRequests();
     void sendBatch(size_t to, Batch* batch);
-    size_t routeOf(const CommandContext& ctx, const Args& args) const;
+    size_t ownerOf(const Command& cmd, const Args& args) const;
+    Routed routeCommand(Client& client, CommandContext& ctx, const Args& args, std::string_view raw);
+    Routed routeInTransaction(Client& client, CommandContext& ctx, const Command& cmd, const Args& args);
+    void refuse(Client& client, std::string_view error);
     void forward(Client& client, size_t owner, std::string_view command, int protocol);
+    void forwardTransaction(Client& client, int protocol);
+    void splitCommand(Client& client, CommandContext& ctx, const Command& cmd, const Args& args);
+    void fanOut(Client& client, CommandContext& ctx, const Command& cmd, const Args& args);
+    Routed scanStep(Client& client, CommandContext& ctx, const Args& args);
+    Gather* newGather(Client& client, Merge merge, int protocol, size_t waiting);
+    void sendPart(size_t owner, Gather* gather, uint32_t part, const std::vector<std::string>& command, ItemKind kind);
+    void runPartHere(Gather* gather, uint32_t part, CommandContext& ctx, const std::vector<std::string>& command);
+    void applyPart(Gather& gather, uint32_t part, std::string_view reply);
+    void partDone(Gather& gather);
+    Batch& openBatch(size_t owner);
     Batch* takeBatch();
     void recycleBatch(Batch* batch);
     // Space for the client's next reply; call replyDone() once it is written
@@ -213,6 +263,7 @@ private:
     std::vector<size_t> batches_out_;       // per thread: sent and not returned yet
     std::vector<Batch*> free_batches_;
     std::vector<std::unique_ptr<Batch>> all_batches_;
+    std::list<Gather> gathers_;             // commands waiting for other threads' parts
 
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;

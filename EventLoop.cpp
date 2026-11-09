@@ -2,7 +2,9 @@
 #include "Server.h"
 #include <iostream>
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 
 // The server batches AOF writes (group commit, see run()): the logger only
@@ -165,16 +167,44 @@ void EventLoop::processBatches() {
 // allowed for its client, and it parsed these same bytes, so they parse here.
 void EventLoop::runBatch(Batch& batch) {
     CommandContext ctx{storage_, aof_, server_.connectedClients()};
-    ctx.server = &stats_;
     batch.replies.clear();
     size_t pos = 0;
-    for(Item& item : batch.items) {
+    const auto nextCommand = [&] {
         auto parsed = RespParser::parseInto(std::string_view(batch.requests).substr(pos), args_);
         pos += parsed.consumed;
+        return parsed.argc;
+    };
+    static const std::vector<std::string> kExec{"EXEC"};
+    for(Item& item : batch.items) {
         ctx.protocol = item.protocol;
-        executeCommand(ctx, Args(args_.data(), parsed.argc), batch.replies);
+        // A part of a split command is counted once, at home, when it finishes
+        ctx.server = item.gather ? nullptr : &stats_;
+        if(item.kind == ItemKind::Info) {
+            CommandContext own = ctx;
+            own.server = &stats_;
+            const InfoData info = localInfo(own);
+            batch.replies.append(reinterpret_cast<const char*>(&info), sizeof(info));
+        } else if(item.kind == ItemKind::Transaction) {
+            // The home thread queued and checked it. Running it here through
+            // EXEC makes it one task on this thread, and logs it between
+            // MULTI and EXEC in this thread's file, as with one thread.
+            Transaction transaction;
+            transaction.active = true;
+            transaction.writes = item.writes;
+            for(uint32_t i = 0; i < item.commands; i++) {
+                const size_t argc = nextCommand();
+                transaction.queued.emplace_back(args_.begin(), args_.begin() + static_cast<long>(argc));
+                releaseLargeArgs(argc);
+            }
+            ctx.transaction = &transaction;
+            executeCommand(ctx, kExec, batch.replies);
+            ctx.transaction = nullptr;
+        } else {
+            const size_t argc = nextCommand();
+            executeCommand(ctx, Args(args_.data(), argc), batch.replies);
+            releaseLargeArgs(argc);
+        }
         item.reply_end = batch.replies.size();
-        releaseLargeArgs(parsed.argc);
     }
 }
 
@@ -182,14 +212,318 @@ void EventLoop::deliverReplies(Batch& batch) {
     const std::string_view replies(batch.replies);
     size_t start = 0;
     for(const Item& item : batch.items) {
+        const std::string_view reply = replies.substr(start, item.reply_end - start);
+        start = item.reply_end;
+        if(item.gather) {
+            applyPart(*item.gather, item.part, reply);
+            partDone(*item.gather);
+            continue;
+        }
         auto it = clients_.find(item.fd);
         // It may have left, and the socket number been given to a new client
         if(it != clients_.end() && it->second.id == item.client_id) {
-            deliverReply(it->second, item.number, replies.substr(start, item.reply_end - start));
+            deliverReply(it->second, item.number, reply);
             queueToServe(item.fd, it->second);
         }
-        start = item.reply_end;
     }
+}
+
+// ==================== Commands that need several threads ====================
+
+// Reserves the client's reply slot now, so the combined reply takes the place
+// of the command in its pipeline however long the parts take
+EventLoop::Gather* EventLoop::newGather(Client& client, Merge merge, int protocol, size_t waiting) {
+    gathers_.emplace_back();
+    Gather& gather = gathers_.back();
+    gather.self = std::prev(gathers_.end());
+    gather.merge = merge;
+    gather.fd = client.fd;
+    gather.client_id = client.id;
+    gather.number = client.slots_tail;
+    gather.protocol = protocol;
+    gather.waiting = waiting;
+    reserveSlot(client);
+    return &gather;
+}
+
+EventLoop::Batch& EventLoop::openBatch(size_t owner) {
+    if(!open_batches_[owner]) open_batches_[owner] = takeBatch();
+    return *open_batches_[owner];
+}
+
+void EventLoop::sendPart(size_t owner, Gather* gather, uint32_t part, const std::vector<std::string>& command,
+                         ItemKind kind) {
+    Batch& batch = openBatch(owner);
+    if(kind == ItemKind::Command) RespParser::appendArray(batch.requests, command);
+    Item item;
+    item.kind = kind;
+    item.gather = gather;
+    item.part = part;
+    item.protocol = gather->protocol;
+    batch.items.push_back(item);
+}
+
+void EventLoop::runPartHere(Gather* gather, uint32_t part, CommandContext& ctx,
+                            const std::vector<std::string>& command) {
+    std::string reply;
+    ServerStats* server = ctx.server;
+    ctx.server = nullptr;       // counted once, when the whole command finishes
+    executeCommand(ctx, command, reply);
+    ctx.server = server;
+    applyPart(*gather, part, reply);
+}
+
+// Takes in one thread's answer. These replies come from this server, in the
+// format the merge expects, unless the part failed.
+void EventLoop::applyPart(Gather& gather, uint32_t part, std::string_view reply) {
+    if(gather.merge == Merge::Info) {
+        InfoData info;
+        std::memcpy(static_cast<void*>(&info), reply.data(), sizeof(info));
+        mergeInfo(gather.info, info);
+        return;
+    }
+    if(!reply.empty() && reply[0] == '-') {
+        if(gather.error.empty()) gather.error.assign(reply);
+        return;
+    }
+    switch(gather.merge) {
+        case Merge::Sum: {
+            long long value = 0;
+            std::from_chars(reply.data() + 1, reply.data() + reply.size(), value);
+            gather.sum += value;
+            break;
+        }
+        case Merge::Values: {
+            // An array of one value per key of this part: put each back in
+            // the position its key had in the command
+            size_t pos = reply.find("\r\n") + 2;
+            for(uint32_t key : gather.keys_of_part[part]) {
+                const size_t start = pos;
+                if(reply[pos] == '_') {             // RESP3's null
+                    pos += 3;
+                } else {                            // $<length>, or $-1
+                    const size_t end_of_line = reply.find("\r\n", pos);
+                    long long length = 0;
+                    std::from_chars(reply.data() + pos + 1, reply.data() + end_of_line, length);
+                    pos = end_of_line + 2;
+                    if(length >= 0) pos += static_cast<size_t>(length) + 2;
+                }
+                gather.values[key].assign(reply.substr(start, pos - start));
+            }
+            break;
+        }
+        case Merge::ScanStep: {
+            // *2, then the thread's next cursor, then the keys. A cursor of 0
+            // means this thread is done, so the next one starts.
+            const size_t bulk_header = reply.find("\r\n") + 2;
+            const size_t cursor_start = reply.find("\r\n", bulk_header) + 2;
+            const size_t cursor_end = reply.find("\r\n", cursor_start);
+            uint64_t cursor = 0;
+            std::from_chars(reply.data() + cursor_start, reply.data() + cursor_end, cursor);
+            uint64_t next = 0;
+            if(cursor != 0) next = (uint64_t{gather.thread} << kScanThreadShift) | cursor;
+            else if(gather.thread + 1 < loops_) next = uint64_t{gather.thread + 1} << kScanThreadShift;
+            RespParser::appendLength(gather.scan_reply, '*', 2);
+            RespParser::appendBulk(gather.scan_reply, std::to_string(next));
+            gather.scan_reply.append(reply.substr(cursor_end + 2));
+            break;
+        }
+        default:    // AllOk: nothing to keep
+            break;
+    }
+}
+
+// When the last part is in: the one reply, into the slot kept for it
+void EventLoop::partDone(Gather& gather) {
+    if(--gather.waiting != 0) return;
+    stats_.commands_processed++;
+    std::string reply;
+    if(gather.merge == Merge::Info) {
+        appendInfo(gather.info, Args(gather.args), gather.protocol, reply);
+    } else if(!gather.error.empty()) {
+        reply = gather.error;
+    } else if(gather.merge == Merge::Sum) {
+        RespParser::appendInteger(reply, gather.sum);
+    } else if(gather.merge == Merge::AllOk) {
+        RespParser::appendSimpleString(reply, "OK");
+    } else if(gather.merge == Merge::Values) {
+        RespParser::appendLength(reply, '*', gather.values.size());
+        for(const std::string& value : gather.values) reply += value;
+    } else {
+        reply = std::move(gather.scan_reply);
+    }
+    auto it = clients_.find(gather.fd);
+    if(it != clients_.end() && it->second.id == gather.client_id) {
+        deliverReply(it->second, gather.number, reply);
+        queueToServe(gather.fd, it->second);
+    }
+    gathers_.erase(gather.self);
+}
+
+// MGET, DEL or EXISTS with keys on several threads: one command per thread, with
+// that thread's keys. Each part is atomic on its thread; the whole is not.
+void EventLoop::splitCommand(Client& client, CommandContext& ctx, const Command& cmd, const Args& args) {
+    const Router& router = server_.router();
+    std::vector<std::vector<uint32_t>> keys_of_thread(loops_);
+    for(size_t i = 1; i < args.size(); i++) keys_of_thread[router.shardOf(args[i])].push_back(static_cast<uint32_t>(i - 1));
+    size_t parts = 0;
+    for(const auto& keys : keys_of_thread) parts += keys.empty() ? 0 : 1;
+
+    Gather* gather = newGather(client, cmd.merge, ctx.protocol, parts);
+    gather->values.resize(cmd.merge == Merge::Values ? args.size() - 1 : 0);
+    gather->keys_of_part.reserve(parts);
+    std::vector<std::string> own_part;
+    uint32_t own_number = 0;
+    for(size_t thread = 0; thread < loops_; thread++) {
+        if(keys_of_thread[thread].empty()) continue;
+        std::vector<std::string> part{args[0]};
+        for(uint32_t key : keys_of_thread[thread]) part.push_back(args[key + 1]);
+        const uint32_t number = static_cast<uint32_t>(gather->keys_of_part.size());
+        gather->keys_of_part.push_back(std::move(keys_of_thread[thread]));
+        if(thread == index_) {
+            own_part = std::move(part);
+            own_number = number;
+        } else {
+            sendPart(thread, gather, number, part, ItemKind::Command);
+        }
+    }
+    if(!own_part.empty()) {
+        runPartHere(gather, own_number, ctx, own_part);
+        partDone(*gather);
+    }
+}
+
+// The same command on every thread: DBSIZE, FLUSHALL, BGREWRITEAOF, INFO
+void EventLoop::fanOut(Client& client, CommandContext& ctx, const Command& cmd, const Args& args) {
+    Gather* gather = newGather(client, cmd.merge, ctx.protocol, loops_);
+    const std::vector<std::string> command(args.begin(), args.end());
+    const ItemKind kind = cmd.merge == Merge::Info ? ItemKind::Info : ItemKind::Command;
+    for(size_t thread = 0; thread < loops_; thread++) {
+        if(thread != index_) sendPart(thread, gather, static_cast<uint32_t>(thread), command, kind);
+    }
+    if(cmd.merge == Merge::Info) {
+        gather->args = command;
+        gather->info = localInfo(ctx);
+    } else {
+        runPartHere(gather, 0, ctx, command);
+    }
+    partDone(*gather);
+}
+
+// One call of SCAN covers part of one thread's table. The cursor says which
+// thread, and when a thread is finished the cursor moves to the next, so
+// every key present for the whole scan is returned, as each table guarantees.
+EventLoop::Routed EventLoop::scanStep(Client& client, CommandContext& ctx, const Args& args) {
+    uint64_t cursor = 0;
+    if(!parseScanCursor(args[1], cursor)) return Routed::RunHere;       // it says why
+    const size_t thread = static_cast<size_t>(cursor >> kScanThreadShift);
+    if(thread >= loops_) {      // no such thread: nothing left to scan
+        std::string& out = replyBuffer(client);
+        RespParser::appendLength(out, '*', 2);
+        RespParser::appendBulk(out, "0");
+        RespParser::appendLength(out, '*', 0);
+        replyDone(client);
+        return Routed::Handled;
+    }
+    std::vector<std::string> command(args.begin(), args.end());
+    command[1] = std::to_string(cursor & kScanCursorMask);
+    Gather* gather = newGather(client, Merge::ScanStep, ctx.protocol, 1);
+    gather->thread = thread;
+    if(thread == index_) {
+        runPartHere(gather, 0, ctx, command);
+        partDone(*gather);
+    } else {
+        sendPart(thread, gather, 0, command, ItemKind::Command);
+    }
+    return Routed::Handled;
+}
+
+void EventLoop::refuse(Client& client, std::string_view error) {
+    RespParser::appendError(replyBuffer(client), error);
+    replyDone(client);
+}
+
+// Decides where a command runs, with more than one thread. Anything that will
+// be refused is refused on the home thread, which alone knows the client's state.
+EventLoop::Routed EventLoop::routeCommand(Client& client, CommandContext& ctx, const Args& args, std::string_view raw) {
+    const Command* cmd = lookupCommand(args[0]);
+    if(!cmd || !arityMatches(*cmd, args.size()) || (!ctx.authenticated && !(cmd->flags & kCmdNoAuth))) return Routed::RunHere;
+    if(client.transaction.active) return routeInTransaction(client, ctx, *cmd, args);
+
+    if(cmd->flags & kCmdWholeServer) {
+        if(cmd->merge == Merge::ScanStep) return scanStep(client, ctx, args);
+        // No need to wait for this client's earlier commands. Every thread
+        // gets them in the order they were sent, by one first-in first-out
+        // ring, and this thread ran its own as they were parsed. So on each
+        // thread DBSIZE or FLUSHALL lands after those commands and before the
+        // later ones, and the client's replies are in order by their slots.
+        fanOut(client, ctx, *cmd, args);
+        return Routed::Handled;
+    }
+    if(cmd->first_key == 0) return Routed::RunHere;
+    const size_t owner = ownerOf(*cmd, args);
+    if(owner == kRunHere) return Routed::RunHere;
+    if(owner == kCrossThread) {
+        if(cmd->merge == Merge::None) refuse(client, "CROSSSLOT Keys in request don't hash to the same slot");
+        else splitCommand(client, ctx, *cmd, args);
+        return Routed::Handled;
+    }
+    if(owner == index_) return Routed::RunHere;
+    forward(client, owner, raw, ctx.protocol);
+    return Routed::Handled;
+}
+
+// A transaction runs as one task on one thread, so that nothing can come between
+// its commands. So every key must be on that thread; anything else is refused
+// as it is queued, which aborts the transaction, and EXEC then says so.
+EventLoop::Routed EventLoop::routeInTransaction(Client& client, CommandContext& ctx, const Command& cmd, const Args& args) {
+    Transaction& transaction = client.transaction;
+    if(cmd.flags & kCmdNotQueued) {             // EXEC, DISCARD, QUIT, a nested MULTI
+        const bool exec = std::strcmp(cmd.name, "exec") == 0;
+        if(!exec || transaction.aborted || transaction.owner == SIZE_MAX || transaction.owner == index_) return Routed::RunHere;
+        forwardTransaction(client, ctx.protocol);
+        return Routed::Handled;
+    }
+    if(cmd.flags & (kCmdWholeServer | kCmdConnection)) {
+        transaction.aborted = true;
+        refuse(client, "ERR Command not allowed inside a transaction with more than one thread");
+        return Routed::Handled;
+    }
+    if(cmd.first_key != 0) {
+        const size_t owner = ownerOf(cmd, args);
+        const bool other_thread = owner == kCrossThread ||
+                                  (owner < loops_ && transaction.owner != SIZE_MAX && owner != transaction.owner);
+        if(other_thread) {
+            transaction.aborted = true;
+            refuse(client, "CROSSSLOT Keys in request don't hash to the same slot");
+            return Routed::Handled;
+        }
+        if(owner < loops_) transaction.owner = owner;
+    }
+    // Queued here. Whether the AOF can be written is asked at EXEC, of the
+    // thread that will write it, not of this one.
+    ctx.aof = nullptr;
+    executeCommand(ctx, args, replyBuffer(client));
+    replyDone(client);
+    ctx.aof = aof_;
+    return Routed::Handled;
+}
+
+void EventLoop::forwardTransaction(Client& client, int protocol) {
+    Transaction& transaction = client.transaction;
+    Batch& batch = openBatch(transaction.owner);
+    for(const auto& command : transaction.queued) RespParser::appendArray(batch.requests, command);
+    Item item;
+    item.fd = client.fd;
+    item.client_id = client.id;
+    item.number = client.slots_tail;
+    item.protocol = protocol;
+    item.kind = ItemKind::Transaction;
+    item.commands = static_cast<uint32_t>(transaction.queued.size());
+    item.writes = transaction.writes;
+    batch.items.push_back(item);
+    reserveSlot(client);
+    transaction = Transaction{};
 }
 
 // The usual case is the oldest reply arriving, which goes straight to the
@@ -265,19 +599,14 @@ void EventLoop::recycleBatch(Batch* batch) {
     free_batches_.push_back(batch);
 }
 
-// Which thread runs this command. Anything that will be refused is refused
-// here, so it runs here: only the home thread knows the client's state.
-size_t EventLoop::routeOf(const CommandContext& ctx, const Args& args) const {
-    const Command* cmd = lookupCommand(args[0]);
-    if(!cmd || !arityMatches(*cmd, args.size()) || (!ctx.authenticated && !(cmd->flags & kCmdNoAuth))) return kRunHere;
-    if(cmd->flags & kCmdWholeServer) return kWholeServer;
-    if(cmd->first_key == 0) return kRunHere;
-
+// The thread that owns this command's keys, or kCrossThread if they are on
+// several
+size_t EventLoop::ownerOf(const Command& cmd, const Args& args) const {
     const Router& router = server_.router();
     const size_t argc = args.size();
-    const size_t first = static_cast<size_t>(cmd->first_key);
-    const size_t step = static_cast<size_t>(cmd->key_step);
-    const size_t last = cmd->last_key < 0 ? argc - 1 : static_cast<size_t>(cmd->last_key);
+    const size_t first = static_cast<size_t>(cmd.first_key);
+    const size_t step = static_cast<size_t>(cmd.key_step);
+    const size_t last = cmd.last_key < 0 ? argc - 1 : static_cast<size_t>(cmd.last_key);
     // Key and value pairs that don't pair up: the command itself says so
     if(step > 1 && (argc - first) % step != 0) return kRunHere;
     const size_t owner = router.shardOf(args[first]);
@@ -293,12 +622,15 @@ size_t EventLoop::routeOf(const CommandContext& ctx, const Args& args) const {
 // two commands on one key run in the order they were sent. Commands on
 // different keys may run in either order, which no client can observe.
 void EventLoop::forward(Client& client, size_t owner, std::string_view command, int protocol) {
-    if(!open_batches_[owner]) open_batches_[owner] = takeBatch();
-    Batch& batch = *open_batches_[owner];
+    Batch& batch = openBatch(owner);
     batch.requests.append(command);
-    const uint64_t number = client.slots_tail;
+    Item item;
+    item.fd = client.fd;
+    item.client_id = client.id;
+    item.number = client.slots_tail;
+    item.protocol = protocol;
+    batch.items.push_back(item);
     reserveSlot(client);
-    batch.items.push_back(Item{client.fd, client.id, number, 0, protocol});
 }
 
 EventLoop::ReplySlot& EventLoop::reserveSlot(Client& client) {
@@ -531,27 +863,22 @@ void EventLoop::runCommands(Client& client) {
             client.in.clear();
             return;
         }
-        const std::string_view raw = std::string_view(client.in).substr(pos, parsed.consumed);
-        pos += parsed.consumed;
-        if(parsed.argc == 0) continue;
+        if(parsed.argc == 0) {
+            pos += parsed.consumed;
+            continue;
+        }
 
         const Args args(args_.data(), parsed.argc);
         if(loops_ > 1) {
-            const size_t owner = routeOf(ctx, args);
-            if(owner < loops_ && owner != index_) {
-                forward(client, owner, raw, ctx.protocol);
-                releaseLargeArgs(parsed.argc);
-                continue;
-            }
-            if(owner == kCrossThread || owner == kWholeServer) {
-                RespParser::appendError(replyBuffer(client), owner == kCrossThread
-                    ? "CROSSSLOT Keys in request don't hash to the same slot"
-                    : "ERR this command isn't available with more than one thread yet");
-                replyDone(client);
+            const std::string_view raw = std::string_view(client.in).substr(pos, parsed.consumed);
+            const Routed routed = routeCommand(client, ctx, args, raw);
+            if(routed == Routed::Handled) {
+                pos += parsed.consumed;
                 releaseLargeArgs(parsed.argc);
                 continue;
             }
         }
+        pos += parsed.consumed;
 
         // Straight into the client's buffer, unless earlier replies are still
         // on other threads

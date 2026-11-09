@@ -15,7 +15,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_threads import Client, SERVER, check, failures, free_port     # noqa: E402
+from test_threads import Client, SERVER, check, encode, failures, free_port     # noqa: E402
 
 AOF = "appendonly.aof"
 UNDER_TSAN = "TSAN_OPTIONS" in os.environ
@@ -344,6 +344,78 @@ def test_an_incomplete_last_record_costs_only_that_record():
         check("incomplete record" in server.output() and "shard-2" in server.output(), "the warning names the file")
         found = present(server.port, [f"key{i}" for i in range(2000)])
         check(found == 1999, f"exactly the cut-off record is gone ({found} of 2000)")
+        server.term()
+
+
+# A transaction is one block in its thread's file
+def test_a_transaction_is_replayed_whole():
+    with tempfile.TemporaryDirectory() as d:
+        server = AofServer(d, "--threads", "4")
+        client = Client(server.port)
+        client.sock.sendall(b"".join(encode(*c) for c in (("MULTI",), ("SET", "{t}a", "1"), ("SET", "{t}b", "2"), ("EXEC",))))
+        for _ in range(3):
+            client.read_reply()
+        check(client.read_value() == [b"+OK", b"+OK"], "EXEC")
+        client.close()
+        check(server.term() == 0, "a clean stop")
+        files = [shard_file(d, i) for i in range(4)]
+        holder = [p for p in files if os.path.getsize(p) > 0]
+        check(len(holder) == 1, "the transaction is in one file")
+        with open(holder[0], "rb") as f:
+            text = f.read()
+        check(text.startswith(b"*1\r\n$5\r\nMULTI\r\n") and text.endswith(b"*1\r\n$4\r\nEXEC\r\n"), "between MULTI and EXEC")
+
+        server = AofServer(d, "--threads", "4")
+        check(present(server.port, ["{t}a"], b"1") == 1 and present(server.port, ["{t}b"], b"2") == 1, "it comes back")
+        server.term()
+
+        # The server stopped while writing it: none of it survives
+        with open(holder[0], "r+b") as f:
+            f.truncate(os.path.getsize(holder[0]) - 3)
+        server = AofServer(d, "--threads", "4")
+        check(present(server.port, ["{t}a"], b"1") == 0 and present(server.port, ["{t}b"], b"2") == 0, "half a transaction leaves nothing")
+        server.term()
+
+
+def test_flushall_and_a_split_delete_survive_a_restart():
+    with tempfile.TemporaryDirectory() as d:
+        fill(d, 500)
+        server = AofServer(d, "--threads", "4")
+        client = Client(server.port)
+        check(client.call("DEL", *[f"key{i}" for i in range(100)]) == b":100", "DEL")
+        client.close()
+        server.term()
+        server = AofServer(d, "--threads", "4")
+        check(present(server.port, [f"key{i}" for i in range(500)]) == 400, "the split DEL is kept")
+        client = Client(server.port)
+        check(client.call("FLUSHALL") == b"+OK", "FLUSHALL")
+        check(client.call("SET", "after", "v") == b"+OK", "SET")
+        client.close()
+        server.term()
+        server = AofServer(d, "--threads", "4")
+        client = Client(server.port)
+        check(client.call("DBSIZE") == b":1", "FLUSHALL is kept on every thread")
+        check(client.call("GET", "after") == b"v", "and what came after it")
+        client.close()
+        server.term()
+
+
+def test_bgrewriteaof_compacts_every_file():
+    with tempfile.TemporaryDirectory() as d:
+        server = AofServer(d, "--threads", "4")
+        client = Client(server.port)
+        for _ in range(30):
+            client.sock.sendall(b"".join(encode("SET", f"k{i}", "v") for i in range(200)))
+            check(all(client.read_reply() == b"+OK" for _ in range(200)), "SET")
+        sizes = [os.path.getsize(shard_file(d, i)) for i in range(4)]
+        check(client.call("BGREWRITEAOF") == b"+OK", "BGREWRITEAOF")
+        after = [os.path.getsize(shard_file(d, i)) for i in range(4)]
+        check(all(a < b / 5 for a, b in zip(after, sizes)), f"every file shrinks: {sizes} to {after}")
+        check(client.call("SET", "later", "v") == b"+OK", "writes go on")
+        client.close()
+        server.term()
+        server = AofServer(d, "--threads", "4")
+        check(present(server.port, [f"k{i}" for i in range(200)] + ["later"]) == 201, "everything comes back")
         server.term()
 
 

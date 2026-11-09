@@ -220,11 +220,6 @@ bool Server::start() {
     if(loops_.size() == 1) std::cout << ", single-threaded";
     else std::cout << ", " << loops_.size() << " threads";
     std::cout << " | maxclients " << max_clients_ << "\n";
-    if(loops_.size() > 1) {
-        std::cout << "WARNING: more than one thread is unfinished: MULTI and the whole-server "
-                     "commands are refused, MGET, DEL and EXISTS need their keys on one thread, and "
-                     "INFO shows one thread's counts\n";
-    }
     return true;
 }
 

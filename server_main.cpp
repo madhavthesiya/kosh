@@ -62,8 +62,8 @@ static void printUsage(std::ostream& out) {
            "  --maxclients <n>         Clients served at once; more are refused (default 10000)\n"
            "  --poller <epoll|select>  How to wait for sockets (default: epoll on Linux,\n"
            "                           select elsewhere; select serves about 1,000 clients)\n"
-           "  --threads <1-256>        Event loops, one per thread (default 1). Above 1 needs\n"
-           "                           Linux and epoll, and is unfinished\n"
+           "  --threads <1-256>        Event loops, one per thread, each owning a share of the\n"
+           "                           keys (default 1). Above 1 needs Linux and epoll\n"
            "  --version                Print the version and exit\n"
            "  --help                   Show this message\n";
 }

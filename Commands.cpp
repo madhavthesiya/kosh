@@ -283,82 +283,7 @@ uint64_t processId() {
 // - used_memory (glibc's count would miss the key table), and avg_ttl, which
 //   Kosh doesn't track. Kosh's limit is maxkeys, not maxmemory.
 void cmdInfo(CommandContext& ctx, const Args& args, std::string& out) {
-    auto wanted = [&](const char* section) {
-        if(args.size() == 1) return true;
-        for(size_t i = 1; i < args.size(); i++) {
-            if(equalsIgnoreCase(args[i], section) || equalsIgnoreCase(args[i], "all") ||
-               equalsIgnoreCase(args[i], "default") || equalsIgnoreCase(args[i], "everything")) {
-                return true;
-            }
-        }
-        return false;
-    };
-    const ServerStats no_server{};
-    const ServerStats& server = ctx.server ? *ctx.server : no_server;
-    const InMemoryStorage::Stats keys = ctx.storage.stats();
-    std::string text;
-    auto section = [&](const char* name) {
-        if(!text.empty()) text += "\r\n";
-        text += "# ";
-        text += name;
-        text += "\r\n";
-    };
-    auto field = [&](const char* name, std::string_view value) {
-        text += name;
-        text += ':';
-        text += value;
-        text += "\r\n";
-    };
-    auto number = [&](const char* name, uint64_t value) { field(name, std::to_string(value)); };
-
-    if(wanted("server")) {
-        section("Server");
-        field("kosh_version", kKoshVersion);
-        number("process_id", processId());
-        number("tcp_port", static_cast<uint64_t>(server.tcp_port));
-        uint64_t uptime = 0;
-        if(ctx.server) {
-            uptime = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - server.started).count());
-        }
-        number("uptime_in_seconds", uptime);
-        number("uptime_in_days", uptime / 86400);
-    }
-    if(wanted("clients")) {
-        section("Clients");
-        number("connected_clients", ctx.clients);
-        number("maxclients", server.max_clients);
-    }
-    if(wanted("memory")) {
-        section("Memory");
-        if(size_t rss = residentBytes()) number("used_memory_rss", rss);
-        number("maxkeys", keys.max_keys);
-    }
-    if(wanted("persistence")) {
-        section("Persistence");
-        number("aof_enabled", ctx.aof ? 1 : 0);
-        field("aof_last_write_status", ctx.aof && ctx.aof->failing() ? "err" : "ok");
-    }
-    if(wanted("stats")) {
-        section("Stats");
-        number("total_connections_received", server.connections_received);
-        number("total_commands_processed", server.commands_processed);
-        number("instantaneous_ops_per_sec", server.ops_per_sec);
-        number("rejected_connections", server.rejected_connections);
-        // Only ever above 0 with several threads
-        if(server.peak_pending_replies > 0) number("peak_pending_replies", server.peak_pending_replies);
-        number("expired_keys", keys.expired_keys);
-        number("evicted_keys", keys.evicted_keys);
-        number("keyspace_hits", keys.keyspace_hits);
-        number("keyspace_misses", keys.keyspace_misses);
-    }
-    if(wanted("keyspace")) {
-        section("Keyspace");
-        if(keys.keys > 0) {
-            field("db0", "keys=" + std::to_string(keys.keys) + ",expires=" + std::to_string(keys.expires));
-        }
-    }
-    RespParser::appendVerbatim(out, text, ctx.protocol);
+    appendInfo(localInfo(ctx), args, ctx.protocol, out);
 }
 
 // ---- Strings ----
@@ -544,16 +469,8 @@ void cmdFlushdb(CommandContext& ctx, const Args& args, std::string& out) { flush
 // (db.c, scanGenericCommand): options in any order, any case, the last of
 // each kind wins; MATCH * is no pattern at all
 void cmdScan(CommandContext& ctx, const Args& args, std::string& out) {
-    // The cursor as Redis reads it, with strtoul: "+5" and "-1" (every bit
-    // set) are accepted, so is "" (0); a leading space, anything after the
-    // digits, or more than 64 bits is not
-    const std::string& text = args[1];
-    char* end = nullptr;
-    errno = 0;
-    unsigned long long cursor = std::strtoull(text.c_str(), &end, 10);
-    if((!text.empty() && std::isspace(static_cast<unsigned char>(text[0]))) || *end != '\0' || errno == ERANGE) {
-        return RespParser::appendError(out, "ERR invalid cursor");
-    }
+    uint64_t cursor;
+    if(!parseScanCursor(args[1], cursor)) return RespParser::appendError(out, "ERR invalid cursor");
     long long count = 10;
     const std::string* pattern = nullptr;
     const std::string* type = nullptr;
@@ -748,29 +665,29 @@ void cmdExec(CommandContext& ctx, const Args&, std::string& out) {
 const Command kCommands[] = {
     // name           arity  flags      handler, first key, last key, key step
     {"ping",            -1,  0,         cmdPing},
-    {"auth",            -2,  kCmdNoAuth, cmdAuth},
-    {"hello",           -1,  kCmdNoAuth, cmdHello},
+    {"auth",            -2,  kCmdNoAuth | kCmdConnection, cmdAuth},
+    {"hello",           -1,  kCmdNoAuth | kCmdConnection, cmdHello},
     {"quit",            -1,  kCmdNoAuth | kCmdNotQueued, cmdQuit},
-    {"multi",            1,  kCmdNotQueued | kCmdWholeServer, cmdMulti},
+    {"multi",            1,  kCmdNotQueued, cmdMulti},
     {"exec",             1,  kCmdNotQueued, cmdExec},
     {"discard",          1,  kCmdNotQueued, cmdDiscard},
     {"command",         -1,  0,         cmdCommand},
-    {"client",          -2,  0,         cmdClient},
+    {"client",          -2,  kCmdConnection, cmdClient},
     {"config",          -2,  0,         cmdConfig},
-    {"info",            -1,  0,         cmdInfo},
+    {"info",            -1,  kCmdWholeServer, cmdInfo, 0, 0, 0, Merge::Info},
 
     {"set",             -3,  kCmdWrite, cmdSet, 1, 1, 1},
     {"get",              2,  0,         cmdGet, 1, 1, 1},
     {"setex",            4,  kCmdWrite, cmdSetex, 1, 1, 1},
-    {"mget",            -2,  0,         cmdMget, 1, -1, 1},
+    {"mget",            -2,  0,         cmdMget, 1, -1, 1, Merge::Values},
     {"mset",            -3,  kCmdWrite, cmdMset, 1, -1, 2},
     {"incr",            2,  kCmdWrite, cmdIncr, 1, 1, 1},
     {"decr",             2,  kCmdWrite, cmdDecr, 1, 1, 1},
     {"incrby",           3,  kCmdWrite, cmdIncrby, 1, 1, 1},
     {"decrby",           3,  kCmdWrite, cmdDecrby, 1, 1, 1},
 
-    {"del",             -2,  kCmdWrite, cmdDel, 1, -1, 1},
-    {"exists",          -2,  0,         cmdExists, 1, -1, 1},
+    {"del",             -2,  kCmdWrite, cmdDel, 1, -1, 1, Merge::Sum},
+    {"exists",          -2,  0,         cmdExists, 1, -1, 1, Merge::Sum},
     {"type",             2,  0,         cmdType, 1, 1, 1},
     {"expire",           3,  kCmdWrite, cmdExpire, 1, 1, 1},
     {"pexpire",          3,  kCmdWrite, cmdPexpire, 1, 1, 1},
@@ -778,10 +695,10 @@ const Command kCommands[] = {
     {"persist",          2,  kCmdWrite, cmdPersist, 1, 1, 1},
     {"ttl",              2,  0,         cmdTtl, 1, 1, 1},
     {"pttl",             2,  0,         cmdPttl, 1, 1, 1},
-    {"dbsize",           1,  kCmdWholeServer, cmdDbsize},
-    {"scan",            -2,  kCmdWholeServer, cmdScan},
-    {"flushall",        -1,  kCmdWrite | kCmdWholeServer, cmdFlushall},
-    {"flushdb",         -1,  kCmdWrite | kCmdWholeServer, cmdFlushdb},
+    {"dbsize",           1,  kCmdWholeServer, cmdDbsize, 0, 0, 0, Merge::Sum},
+    {"scan",            -2,  kCmdWholeServer, cmdScan, 0, 0, 0, Merge::ScanStep},
+    {"flushall",        -1,  kCmdWrite | kCmdWholeServer, cmdFlushall, 0, 0, 0, Merge::AllOk},
+    {"flushdb",         -1,  kCmdWrite | kCmdWholeServer, cmdFlushdb, 0, 0, 0, Merge::AllOk},
 
     {"lpush",           -3,  kCmdWrite, cmdLpush, 1, 1, 1},
     {"rpush",           -3,  kCmdWrite, cmdRpush, 1, 1, 1},
@@ -805,8 +722,8 @@ const Command kCommands[] = {
     // Refused inside MULTI, unlike in Redis: Kosh rewrites in the foreground,
     // so a rewrite in the middle of EXEC would start the new file after the
     // transaction's MULTI record, and replay would find an EXEC without one
-    {"bgrewriteaof",    -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof},
-    {"aofrewrite",      -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof},
+    {"bgrewriteaof",    -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof, 0, 0, 0, Merge::AllOk},
+    {"aofrewrite",      -1,  kCmdNoMulti | kCmdWholeServer, cmdRewriteAof, 0, 0, 0, Merge::AllOk},
 };
 
 struct CommandIndex {
@@ -835,6 +752,123 @@ struct LoadingGuard {
 };
 
 }  // namespace
+
+// As Redis reads a cursor, with strtoul: "+5" and "-1" (every bit set) are
+// accepted, so is "" (0); a leading space, anything after the digits, or more
+// than 64 bits is not
+bool parseScanCursor(const std::string& text, uint64_t& cursor) {
+    char* end = nullptr;
+    errno = 0;
+    cursor = std::strtoull(text.c_str(), &end, 10);
+    return !((!text.empty() && std::isspace(static_cast<unsigned char>(text[0]))) || *end != '\0' || errno == ERANGE);
+}
+
+InfoData localInfo(const CommandContext& ctx) {
+    InfoData info;
+    if(ctx.server) info.server = *ctx.server;
+    info.has_server = ctx.server != nullptr;
+    info.keys = ctx.storage.stats();
+    info.clients = ctx.clients;
+    info.aof_enabled = ctx.aof != nullptr;
+    info.aof_failing = ctx.aof && ctx.aof->failing();
+    return info;
+}
+
+// The server-wide fields (port, uptime, the client count, already a total) are
+// the receiving thread's own
+void mergeInfo(InfoData& into, const InfoData& other) {
+    into.server.connections_received += other.server.connections_received;
+    into.server.rejected_connections += other.server.rejected_connections;
+    into.server.commands_processed += other.server.commands_processed;
+    into.server.ops_per_sec += other.server.ops_per_sec;
+    into.server.peak_pending_replies = std::max(into.server.peak_pending_replies, other.server.peak_pending_replies);
+    into.keys.keyspace_hits += other.keys.keyspace_hits;
+    into.keys.keyspace_misses += other.keys.keyspace_misses;
+    into.keys.expired_keys += other.keys.expired_keys;
+    into.keys.evicted_keys += other.keys.evicted_keys;
+    into.keys.keys += other.keys.keys;
+    into.keys.expires += other.keys.expires;
+    into.keys.max_keys += other.keys.max_keys;
+    into.aof_failing = into.aof_failing || other.aof_failing;
+}
+
+void appendInfo(const InfoData& info, const Args& args, int protocol, std::string& out) {
+    auto wanted = [&](const char* section) {
+        if(args.size() == 1) return true;
+        for(size_t i = 1; i < args.size(); i++) {
+            if(equalsIgnoreCase(args[i], section) || equalsIgnoreCase(args[i], "all") ||
+               equalsIgnoreCase(args[i], "default") || equalsIgnoreCase(args[i], "everything")) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const ServerStats& server = info.server;
+    const InMemoryStorage::Stats& keys = info.keys;
+    std::string text;
+    auto section = [&](const char* name) {
+        if(!text.empty()) text += "\r\n";
+        text += "# ";
+        text += name;
+        text += "\r\n";
+    };
+    auto field = [&](const char* name, std::string_view value) {
+        text += name;
+        text += ':';
+        text += value;
+        text += "\r\n";
+    };
+    auto number = [&](const char* name, uint64_t value) { field(name, std::to_string(value)); };
+
+    if(wanted("server")) {
+        section("Server");
+        field("kosh_version", kKoshVersion);
+        number("process_id", processId());
+        number("tcp_port", static_cast<uint64_t>(server.tcp_port));
+        uint64_t uptime = 0;
+        if(info.has_server) {
+            uptime = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - server.started).count());
+        }
+        number("uptime_in_seconds", uptime);
+        number("uptime_in_days", uptime / 86400);
+    }
+    if(wanted("clients")) {
+        section("Clients");
+        number("connected_clients", info.clients);
+        number("maxclients", server.max_clients);
+    }
+    if(wanted("memory")) {
+        section("Memory");
+        if(size_t rss = residentBytes()) number("used_memory_rss", rss);
+        number("maxkeys", keys.max_keys);
+    }
+    if(wanted("persistence")) {
+        section("Persistence");
+        number("aof_enabled", info.aof_enabled ? 1 : 0);
+        field("aof_last_write_status", info.aof_failing ? "err" : "ok");
+    }
+    if(wanted("stats")) {
+        section("Stats");
+        number("total_connections_received", server.connections_received);
+        number("total_commands_processed", server.commands_processed);
+        number("instantaneous_ops_per_sec", server.ops_per_sec);
+        number("rejected_connections", server.rejected_connections);
+        // Only ever above 0 with several threads
+        if(server.peak_pending_replies > 0) number("peak_pending_replies", server.peak_pending_replies);
+        number("expired_keys", keys.expired_keys);
+        number("evicted_keys", keys.evicted_keys);
+        number("keyspace_hits", keys.keyspace_hits);
+        number("keyspace_misses", keys.keyspace_misses);
+    }
+    if(wanted("keyspace")) {
+        section("Keyspace");
+        if(keys.keys > 0) {
+            field("db0", "keys=" + std::to_string(keys.keys) + ",expires=" + std::to_string(keys.expires));
+        }
+    }
+    RespParser::appendVerbatim(out, text, protocol);
+}
 
 const Command* lookupCommand(std::string_view name) {
     const CommandIndex& index = commandIndex();
