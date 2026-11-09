@@ -1,42 +1,58 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <a href="RUNNING.md">Running</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <a href="COMMANDS.md">Commands</a> &nbsp;·&nbsp;
+  <a href="COMPATIBILITY.md">Compatibility</a> &nbsp;·&nbsp;
+  <b>Testing</b> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="HISTORY.md">History</a>
+</p>
+
 # Testing
 
 The test suites, continuous integration and sanitizers.
+
+**On this page:** [Tests](#tests) &nbsp;·&nbsp; [Several threads](#several-threads) &nbsp;·&nbsp; [Continuous integration](#continuous-integration)
 
 ## Tests
 
 **142 unit tests** (`tests/test_main.cpp`):
 
-```
-========== Kosh Test Suite ==========
-
-[Basic Operations]      7 tests    ✅
-[LRU Eviction]          7 tests    ✅  (includes: the table starts empty and grows with the keys)
-[Key Table]            10 tests    ✅  (against std::unordered_map at random, SCAN's cursor while the table grows, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key)
-[SIEVE Eviction]        5 tests    ✅  (a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model)
-[TTL Expiration]        5 tests    ✅
-[TTL > LRU Priority]    2 tests    ✅
-[Persistence]           4 tests    ✅  (the CLI's SAVE/LOAD)
-[Controller Validation] 1 test     ✅
-[List Operations]       6 tests    ✅
-[Set Operations]        5 tests    ✅
-[Hash Operations]       5 tests    ✅
-[Type Safety]           4 tests    ✅
-[LRU with Mixed Types]  1 test     ✅
-[AOF Persistence]      26 tests    ✅  (absolute expiry, logged removals, randomized replay check under both eviction policies, damaged files, failed writes, group commit, fsync policies)
-[Command Table]        13 tests    ✅  (arity, SET options, integers read as Redis reads them, error replies, PING's message, replies appended in place)
-[Authentication]        4 tests    ✅  (constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH)
-[Transactions]          4 tests    ✅  (Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay)
-[Counters and Several Keys] 7 tests ✅  (the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU)
-[PTTL, PEXPIRE, PERSIST, DBSIZE] 2 tests ✅  (Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed)
-[SCAN]                  2 tests    ✅  (glob patterns as Redis matches them, an exponential pattern ending fast, the 1,000-level depth limit; a full iteration, COUNT, MATCH, TYPE counted as reads, expired keys removed)
-[FLUSHALL, FLUSHDB]     2 tests    ✅  (Redis's replies; eviction works after, under SIEVE and LRU; logged as given and replayed)
-[INFO]                  2 tests    ✅  (hits and misses on every read path, expiries and evictions, sections, which commands count)
-[RESP3 and HELLO]       4 tests    ✅  (each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids)
-[Pollers]               2 tests    ✅  (select() and epoll pass the same checks)
-[RESP Parser]          12 tests    ✅  (malformed input, size limits, limits before AUTH, every split point, reused argument strings)
-
-Results: 142 passed, 0 failed
-```
+| Area | Tests | What they cover |
+|---|---:|---|
+| Basic Operations | 7 |  |
+| LRU Eviction | 7 | includes: the table starts empty and grows with the keys |
+| Key Table | 10 | against std::unordered_map at random, SCAN's cursor while the table grows, every key in one chain, rehash bounded, a mapped table given back mid-rehash; SipHash against the reference vectors and CPython, each table and storage with its own key |
+| SIEVE Eviction | 5 | a case where SIEVE and LRU differ, the hand on a deleted key, 50,000 random operations per policy against a model |
+| TTL Expiration | 5 |  |
+| TTL > LRU Priority | 2 |  |
+| Persistence | 4 | the CLI's SAVE/LOAD |
+| Controller Validation | 1 |  |
+| List Operations | 6 |  |
+| Set Operations | 5 |  |
+| Hash Operations | 5 |  |
+| Type Safety | 4 |  |
+| LRU with Mixed Types | 1 |  |
+| AOF Persistence | 26 | absolute expiry, logged removals, randomized replay check under both eviction policies, damaged files, failed writes, group commit, fsync policies |
+| Command Table | 13 | arity, SET options, integers read as Redis reads them, error replies, PING's message, replies appended in place |
+| Authentication | 4 | constant-time comparison, NOAUTH and AUTH as Redis replies, QUIT before AUTH |
+| Transactions | 4 | Redis's replies, every way to abort, the AOF's MULTI/EXEC records, an incomplete transaction cut off at replay |
+| Counters and Several Keys | 7 | the edges of 64 bits, one AOF record per command, MSET's evictions after its record under SIEVE and LRU |
+| PTTL, PEXPIRE, PERSIST, DBSIZE | 2 | Redis's replies; a time already past deletes at once, uncounted; DBSIZE removes keys that ran out; PERSIST and DEL in the AOF, replayed |
+| SCAN | 2 | glob patterns as Redis matches them, an exponential pattern ending fast, the 1,000-level depth limit; a full iteration, COUNT, MATCH, TYPE counted as reads, expired keys removed |
+| FLUSHALL, FLUSHDB | 2 | Redis's replies; eviction works after, under SIEVE and LRU; logged as given and replayed |
+| INFO | 2 | hits and misses on every read path, expiries and evictions, sections, which commands count |
+| RESP3 and HELLO | 4 | each reply type in RESP2 and RESP3, every HELLO error, HELLO AUTH, CLIENT names and ids |
+| Pollers | 2 | select() and epoll pass the same checks |
+| RESP Parser | 12 | malformed input, size limits, limits before AUTH, every split point, reused argument strings |
 
 The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_TEST_SEEDS=300 ./build/tests` runs more. It compares wall-clock expiry times, so a seed whose results differ while the wall clock was stepped (WSL2 steps it every 30 s, by up to about a third of a second) is run again; a difference on a steady clock fails at once.
 
@@ -77,7 +93,7 @@ The randomized replay test runs 4 seeds per eviction policy by default; `RANDOM_
 - The fuzzer was checked first, with three planted bugs: a header split across reads, an inline limit set too low, and `AUTH` reading past its arguments. It found each within 1.2 s.
 - Then 10 minutes of random mutation of the real code under ASan + UBSan: 22.4 million inputs, no failures. Random mutation explores less than coverage-guided fuzzing, which CI runs on every push (below).
 
-All seven `ctest` runs pass with AddressSanitizer + UndefinedBehaviorSanitizer, the client libraries' and the comparison with Redis included. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
+All 17 `ctest` suites pass with AddressSanitizer + UndefinedBehaviorSanitizer, the client libraries' and the comparison with Redis included. The thread-safety and unit tests also pass under ThreadSanitizer, and so does the integration suite against a ThreadSanitizer build of the server (where the `everysec` sync thread runs alongside the event loop). The Windows build is compile-checked with MinGW-w64 (GCC 13). Only `tests/windows/port_test.ps1` runs it, on Windows 11: a second server on a port in use is refused, a restart right after closing connections works, and a failed bind reports its real error.
 
 ### Several threads
 
@@ -103,3 +119,9 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on Git
 Each job was first run in a local copy of GitHub's Ubuntu 24.04 runner. The checks new with CI (static analysis, the Docker smoke test) were each shown to fail when a fix is undone, as the test suites were when they were written. That first run found two bugs: a test race (a test could start before the server had dropped the connection that checked it was up; 22 of 200 runs failed) and a CI step that failed at random (`ctest -N | grep -q` under `pipefail`: `grep` exits at the first match and `ctest` gets `SIGPIPE`).
 
 Not in CI: clang's static analyzer, which ran past 10 minutes on `InMemoryStorage.cpp` and on `Commands.cpp` without finishing (it found nothing in the other sources).
+
+<br>
+
+<p align="center">
+  <sub><a href="COMPATIBILITY.md">← Compatibility</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="BENCHMARKS.md">Benchmarks →</a></sub>
+</p>

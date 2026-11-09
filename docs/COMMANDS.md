@@ -1,10 +1,30 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <a href="RUNNING.md">Running</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <b>Commands</b> &nbsp;·&nbsp;
+  <a href="COMPATIBILITY.md">Compatibility</a> &nbsp;·&nbsp;
+  <a href="TESTING.md">Testing</a> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="HISTORY.md">History</a>
+</p>
+
 # Commands
 
 Every command Kosh supports, the data types, and what each costs.
 
-## Supported Data Types
+**On this page:** [Data types](#data-types) &nbsp;·&nbsp; [Full command reference](#full-command-reference) &nbsp;·&nbsp; [String commands](#string-commands) &nbsp;·&nbsp; [Key commands](#key-commands) &nbsp;·&nbsp; [List commands](#list-commands) &nbsp;·&nbsp; [Set commands](#set-commands) &nbsp;·&nbsp; [Hash commands](#hash-commands) &nbsp;·&nbsp; [Server commands](#server-commands) &nbsp;·&nbsp; [Transactions](#transactions) &nbsp;·&nbsp; [Complexity](#complexity)
 
-| Type | Commands | Internal Structure |
+## Data types
+
+| Type | Commands | Internal structure |
 |------|----------|-------------------|
 | **String** | `SET`, `GET`, `SETEX`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY` | `std::string` |
 | **List** | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN` | `std::deque<string>` |
@@ -28,10 +48,10 @@ Measured on x86-64 Linux with GCC 13 (libstdc++):
 
 A key costs one allocation: its `CacheEntry` with the key's bytes right after it. With 16-byte keys and 3-byte values, that is 100–113 bytes per key in all, about what Redis uses (see [the key table](ARCHITECTURE.md#4-the-key-table-and-eviction)). Other compilers and standard libraries give different sizes.
 
+## Full command reference
 
-## Full Command Reference
+### String commands
 
-### String Commands
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `SET` | `SET key value` | Set key-value pair |
@@ -43,7 +63,8 @@ A key costs one allocation: its `CacheEntry` with the key's bytes right after it
 | `INCR` / `DECR` | `INCR key` | Adds 1 (or -1) to the integer in the key; a missing key counts from 0. A TTL stays |
 | `INCRBY` / `DECRBY` | `INCRBY key n` | Adds `n` (or `-n`). An integer means its canonical form, as in Redis: `"05"` isn't one, so `INCR` never rewrites a string like a zip code. A sum outside 64 bits is an error that changes nothing |
 
-### Key Commands
+### Key commands
+
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `DEL` | `DEL key1 key2 ...` | Deletes the keys; replies how many there were |
@@ -58,7 +79,8 @@ A key costs one allocation: its `CacheEntry` with the key's bytes right after it
 | `DBSIZE` | `DBSIZE` | How many keys there are. Expiry is lazy, so it first removes keys whose TTL has run out (Redis's background cycle would have removed most of them) |
 | `SCAN` | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | Iterate the keys a few at a time; start at 0, stop when the reply's cursor is 0. A key present for the whole iteration comes back at least once, even if the table grows meanwhile (it can come twice). `MATCH` takes Redis's glob patterns (`*`, `?`, `[a-z]`, `[^x]`, `\`) |
 
-### List Commands
+### List commands
+
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `LPUSH` | `LPUSH key val1 val2 ...` | Push to head |
@@ -68,7 +90,8 @@ A key costs one allocation: its `CacheEntry` with the key's bytes right after it
 | `LRANGE` | `LRANGE key start stop` | Get range (supports negative indices) |
 | `LLEN` | `LLEN key` | Get list length |
 
-### Set Commands
+### Set commands
+
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `SADD` | `SADD key m1 m2 ...` | Add members |
@@ -77,7 +100,8 @@ A key costs one allocation: its `CacheEntry` with the key's bytes right after it
 | `SISMEMBER` | `SISMEMBER key member` | Check membership |
 | `SCARD` | `SCARD key` | Get set size |
 
-### Hash Commands
+### Hash commands
+
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `HSET` | `HSET key f1 v1 f2 v2 ...` | Set fields |
@@ -86,7 +110,8 @@ A key costs one allocation: its `CacheEntry` with the key's bytes right after it
 | `HGETALL` | `HGETALL key` | Get all field-value pairs |
 | `HLEN` | `HLEN key` | Get number of fields |
 
-### Server Commands
+### Server commands
+
 | Command | Description |
 |---------|-------------|
 | `PING` | `PING [message]`: PONG, or the message back |
@@ -113,7 +138,6 @@ They behave as Redis's, replies included (redis-py's `pipeline()` uses them by d
 - **In the AOF, a transaction that writes is logged between `MULTI` and `EXEC` records.** At startup it is applied only once its `EXEC` is read. One the server stopped writing partway is cut off, so none of it comes back, not a part of it.
 - **Not supported:** `WATCH`. `BGREWRITEAOF` is refused inside a transaction (Redis allows it), because Kosh's rewrite runs in the foreground and would split the transaction's records in the AOF.
 
-
 ## Complexity
 
 | Operation | Time | Space |
@@ -132,3 +156,9 @@ They behave as Redis's, replies included (redis-py's `pipeline()` uses them by d
 | SAVE / LOAD (CLI only) | O(N) | O(N) |
 
 N = number of stored keys (bounded by `--maxkeys`), T = keys with a TTL, K = elements returned, F = size of the AOF: replay reads the whole file into memory first. Overall space: **O(N)**.
+
+<br>
+
+<p align="center">
+  <sub><a href="DECISIONS.md">← Decisions</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="COMPATIBILITY.md">Compatibility →</a></sub>
+</p>
