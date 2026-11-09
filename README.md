@@ -2,15 +2,19 @@
 
 A Redis-compatible in-memory key-value server, written from scratch in C++17. It speaks RESP2 and RESP3, works with `redis-cli`, `redis-py` and `node-redis`, and every performance number here links to how it was measured.
 
+On a laptop VM with 4 fast cores: 694,000 GET/s at 4 threads, 1.4× Redis 8 with `io-threads`. With the AOF on, SET beats Redis 8, Valkey and four separate Redis processes. Without the AOF, those four processes still win.
+
 [![CI](https://github.com/madhavthesiya/kosh/actions/workflows/ci.yml/badge.svg)](https://github.com/madhavthesiya/kosh/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/madhavthesiya/kosh)](https://github.com/madhavthesiya/kosh/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 *Kosh (कोश) is Sanskrit and Hindi for a treasury. Formerly Mini-Redis.*
 
-**This is a learning project, not production software.** It has no replication, Lua, Pub/Sub, sorted sets or TLS. [What it doesn't do](docs/COMPATIBILITY.md#known-limitations).
+**This is a learning project, not production software.** It has no replication, Lua, Pub/Sub, sorted sets or TLS. [What it doesn't do](docs/COMPATIBILITY.md#known-limitations). For production, use Redis or Valkey. Use Kosh to see how a server like this is built and proven, or run `kosh-loadgen` to test any Redis-compatible server.
 
 **What's in it:** strings, lists, sets and hashes; TTLs; `MULTI`/`EXEC`; `SCAN`; `INFO`; an append-only file with three sync policies; SIEVE or LRU eviction; `AUTH` and protected mode; `epoll` on Linux and `select()` elsewhere; a Docker image, and binaries for Linux and Windows. [All commands](docs/COMMANDS.md).
+
+**If you read one page:** [the bugs that shaped it](docs/DECISIONS.md), such as the 1,021st client that crashed the server, and a stall that turned out to be the memory allocator.
 
 ## Why it's interesting
 
