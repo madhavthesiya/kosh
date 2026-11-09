@@ -80,6 +80,7 @@ Server::Server(int port, const std::vector<InMemoryStorage*>& shards, const std:
     for(size_t i = 0; i < shards.size(); i++) {
         loops_.push_back(std::make_unique<EventLoop>(
             *this, i, shards.size(), *shards[i], aofs.empty() ? nullptr : aofs[i],
+            // cppcheck-suppress accessMoved ; only the first pass moves it, and later passes don't read it
             i == 0 ? std::move(poller) : makePoller(poller_name)));
         loops_.back()->stats().tcp_port = port;
         loops_.back()->stats().max_clients = max_clients;
