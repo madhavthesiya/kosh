@@ -1,5 +1,5 @@
 # clang-tidy for the server's sources, run in CI (.github/workflows/ci.yml):
-#   run-clang-tidy -p build "<repo>/[A-Za-z_]+\.cpp$"
+#   run-clang-tidy -p build "<repo>/src/[A-Za-z_]+\.cpp$"
 # Every finding fails the build; a check is off only for a reason given here.
 #
 # bugprone-easily-swappable-parameters: flags every function taking two
