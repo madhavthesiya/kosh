@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 #include "InMemoryStorage.h"
+#include "Router.h"
 
 // The command table, shared by the server and AOF replay.
 //
@@ -22,9 +23,12 @@ struct Transaction {
     bool aborted = false;       // a command was refused while queuing: EXEC refuses (EXECABORT)
     bool writes = false;        // a queued command changes data
     std::vector<std::vector<std::string>> queued;
+    // With several threads: the one that owns the keys so far. A transaction
+    // runs as one task on one thread, so all its keys must be on that thread.
+    size_t owner = SIZE_MAX;    // SIZE_MAX: no key yet
 };
 
-// What INFO reports about the server, which keeps it (see Server.cpp)
+// What INFO reports about the server, which keeps it (see EventLoop.cpp)
 struct ServerStats {
     int tcp_port = 0;
     size_t max_clients = 0;
@@ -33,7 +37,8 @@ struct ServerStats {
     uint64_t connections_received = 0;      // accepted and served
     uint64_t rejected_connections = 0;      // refused: maxclients, protected mode, out of files
     uint64_t commands_processed = 0;        // commands that ran (executeCommand counts them)
-    uint64_t ops_per_sec = 0;               // commands per second, recently (see Server.cpp)
+    uint64_t ops_per_sec = 0;               // commands per second, recently (see EventLoop.cpp)
+    uint64_t peak_pending_replies = 0;      // most replies one client has been waiting for from other threads
 };
 
 // What a command can use besides its arguments
@@ -78,11 +83,42 @@ private:
 // Appends the command's RESP reply to `out`
 using CommandHandler = void (*)(CommandContext& ctx, const Args& args, std::string& out);
 
+// Everything INFO reports, gathered from one thread. Plain data, so that a
+// thread can hand it to another as bytes.
+struct InfoData {
+    ServerStats server;
+    bool has_server = false;
+    InMemoryStorage::Stats keys;
+    size_t clients = 0;
+    bool aof_enabled = false;
+    bool aof_failing = false;
+};
+InfoData localInfo(const CommandContext& ctx);
+void mergeInfo(InfoData& into, const InfoData& other);      // Adds another thread's counts
+void appendInfo(const InfoData& info, const Args& args, int protocol, std::string& out);
+
+// How the answers of several threads to one command become one reply
+enum class Merge : uint8_t {
+    None,       // it can't be split: all its keys must be on one thread
+    Sum,        // integers, added (DEL, EXISTS, DBSIZE)
+    Values,     // one value per key, put back in the order the keys were given (MGET)
+    AllOk,      // +OK, unless one of them failed (FLUSHALL, BGREWRITEAOF)
+    Info,       // each thread's counts, added (INFO)
+    ScanStep,   // one thread's SCAN at a time, its cursor marked with the thread (SCAN)
+};
+
 struct Command {
     const char* name;       // lower case, as Redis's error messages quote it
     int arity;              // arguments including the name; -N means at least N
     unsigned flags;
     CommandHandler handler;
+    // Which arguments are keys, as in Redis's command table: first_key,
+    // first_key + key_step, ... up to last_key (-1: the last argument). 0: no
+    // keys. With several threads, this decides which one runs the command.
+    int first_key = 0;
+    int last_key = 0;
+    int key_step = 0;
+    Merge merge = Merge::None;
 };
 
 // The command changes data. Only these are logged, so only these can be replayed.
@@ -96,6 +132,12 @@ constexpr unsigned kCmdNotQueued = 1u << 2;
 // Refused inside MULTI, which it then aborts: "Command not allowed inside a
 // transaction", Redis's no-multi flag
 constexpr unsigned kCmdNoMulti = 1u << 3;
+// Concerns every key, not named ones (SCAN, DBSIZE, FLUSHALL...), so with
+// several threads no single one can run it
+constexpr unsigned kCmdWholeServer = 1u << 4;
+// Reads or changes the connection's own state, which only its home thread
+// has, so with several threads a transaction can't carry it to another
+constexpr unsigned kCmdConnection = 1u << 5;
 
 // Longest password accepted (Redis 5's CONFIG_AUTHPASS_MAX_LEN). With a
 // bound, the comparison below can always take the same time.
@@ -116,6 +158,14 @@ bool constantTimeEquals(std::string_view given, std::string_view secret);
 // Case-insensitive; nullptr if there is no such command
 const Command* lookupCommand(std::string_view name);
 bool arityMatches(const Command& cmd, size_t argc);
+std::vector<const Command*> allCommands();      // Every entry in the table
+
+// With several threads, a SCAN cursor holds the thread in its top 8 bits and
+// that thread's own cursor in the rest (a table has far fewer than 2^56 buckets)
+constexpr unsigned kScanThreadShift = 56;
+constexpr uint64_t kScanCursorMask = (uint64_t{1} << kScanThreadShift) - 1;
+// A SCAN cursor as Redis reads it; false if it is invalid
+bool parseScanCursor(const std::string& text, uint64_t& cursor);
 
 // Runs one command (args[0] is its name) and appends its RESP reply to `out`.
 // The server passes the client's output buffer, so a reply is built in place.
@@ -142,5 +192,7 @@ struct AofLoadResult {
 // table. An incomplete last record (the server stopped while writing it) is
 // cut off the file, so new records start at a record boundary. Damage before
 // the end, or a command the server never logs, is an error: loading only the
-// part before it would silently drop everything after.
-AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof);
+// part before it would silently drop everything after. With `router`, the file
+// is thread number `shard`'s, and a record whose key belongs to another thread
+// is damage too: the files were mixed up, or the routing key is wrong.
+AofLoadResult replayAOF(InMemoryStorage& storage, AOFLogger& aof, const Router* router = nullptr, size_t shard = 0);

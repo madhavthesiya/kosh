@@ -15,6 +15,17 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 - `kosh-loadgen` (Linux): an open-loop load generator for Redis-compatible
   servers. Latency counts from each request's intended send time, and a
   percentile the run can't support prints as N/A.
+- `--threads N` (Linux, `epoll`): shard-per-core. Each thread owns its keys,
+  its share of `--maxkeys` and its own AOF file; commands for another thread
+  travel through lock-free rings. With one thread, the default, nothing changes.
+- A `{tag}` in a key routes it by the tag, as in Redis Cluster. `MSET` and
+  `MULTI` with keys on several threads are refused with `-CROSSSLOT`; `MGET`,
+  `DEL` and `EXISTS` are split across threads.
+- `kosh-loadgen --ports` drives several separate servers.
+
+### Changed
+
+- The README is now a short front page, and the detail moved to `docs/`.
 
 ## [3.1.0] - 2026-11-08
 

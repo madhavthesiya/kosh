@@ -41,6 +41,11 @@ def describe_exit(returncode):
     return f"exit code {returncode}"
 
 
+# Run with KOSH_THREADS, a test that depends on one thread says why it can't run
+def one_thread_only(reason):
+    return unittest.skipIf(os.environ.get("KOSH_THREADS"), reason)
+
+
 class ServerProcess:
     """A running kosh-server on a free port, working in `workdir`.
     `nofile` limits its open files (POSIX): a soft limit, or (soft, hard).
@@ -72,6 +77,12 @@ class ServerProcess:
         poller = os.environ.get("KOSH_POLLER")
         if poller and "--poller" not in args:
             args = (*args, "--poller", poller)
+        # ctest also runs the suite with KOSH_THREADS=4, so that the commands
+        # are tested with several threads too. A test that names a poller or a
+        # thread count keeps it.
+        threads = os.environ.get("KOSH_THREADS")
+        if threads and "--threads" not in args and "--poller" not in args:
+            args = (*args, "--threads", threads)
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
@@ -533,6 +544,7 @@ class AofDamageTest(ServerTestCase):
     new records after the partial bytes: at the next restart they were read as
     the rest of the broken record, and lost."""
 
+    @one_thread_only("reads the single AOF file; test_shard_aof.py covers one file per thread")
     def test_incomplete_last_record_is_cut_off(self):
         with tempfile.TemporaryDirectory() as workdir:
             aof = os.path.join(workdir, "appendonly.aof")
@@ -581,6 +593,7 @@ class SeveralKeysAndCountersTest(ServerTestCase):
     """MSET, DEL with several keys and the counters, through a real server and
     a restart: each command is one AOF record, and replay gives the same data"""
 
+    @one_thread_only("MSET with keys on several threads is refused")
     def test_they_survive_a_restart(self):
         with tempfile.TemporaryDirectory() as workdir:
             first = self.start_server(workdir=workdir)
@@ -655,6 +668,7 @@ class AofWriteErrorTest(ServerTestCase):
     """A full disk, played by a 4 KB limit on the size of the files the server
     writes: writes past it fail with EFBIG, as they would with ENOSPC."""
 
+    @one_thread_only("fills one file; test_shard_aof.py fills one per thread")
     def test_writes_are_refused_until_the_aof_can_be_written(self):
         # The server used to ignore the failed write and reply OK, so the AOF
         # silently lost every write from then on. (Without SIGXFSZ ignored, the
@@ -706,6 +720,7 @@ class AofWriteErrorTest(ServerTestCase):
                 self.assertEqual(c.call("GET", "after"), b"1")
             restarted.stop()
 
+    @one_thread_only("fills one file; test_shard_aof.py fills one per thread")
     def test_appendfsync_always_stops_the_server_when_the_aof_fails(self):
         # With "always", a reply means the write is on the disk. Once a write
         # fails, that can't be promised any more: the server must not reply,
@@ -915,6 +930,7 @@ class InfoTest(ServerTestCase):
 class TransactionTest(ServerTestCase):
     """MULTI/EXEC/DISCARD over real connections (redis-py's pipeline() uses them by default)."""
 
+    @one_thread_only("a transaction with keys on several threads is refused")
     def test_transaction_runs_at_exec_and_survives_a_restart(self):
         with tempfile.TemporaryDirectory() as workdir:
             server = self.start_server(workdir=workdir)
@@ -944,6 +960,7 @@ class TransactionTest(ServerTestCase):
         with Client(server.port) as b:
             self.assertIsNone(b.call("GET", "gone"))
 
+    @one_thread_only("writes a single AOF file; test_shard_aof.py covers a cut-off transaction")
     def test_incomplete_transaction_in_the_aof_is_cut_off_at_startup(self):
         with tempfile.TemporaryDirectory() as workdir:
             before = Client.encode(["SET", "x", "1"])
@@ -1020,6 +1037,7 @@ class AuthTest(ServerTestCase):
         server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")
         self.assertIn("can read --requirepass in the process list", server.output())
 
+    @one_thread_only("reads the single AOF file")
     def test_password_is_never_written_down(self):
         # Neither in the log nor in the AOF: AUTH changes no data, so it isn't logged
         with tempfile.TemporaryDirectory() as workdir:
@@ -1122,6 +1140,7 @@ class CommandLineTest(ServerTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"Cannot open AOF file", result.stderr)
 
+    @one_thread_only("uses a key limit smaller than the thread count")
     def test_maxkeys_limits_key_count(self):
         server = self.start_server("--appendonly", "no", "--maxkeys", "2")
         with Client(server.port) as c:
@@ -1130,6 +1149,7 @@ class CommandLineTest(ServerTestCase):
             self.assertIsNone(c.call("GET", "a"))  # least recently used, so evicted
             self.assertEqual(c.call("GET", "c"), b"1")
 
+    @one_thread_only("uses a key limit smaller than the thread count")
     def test_eviction_option_picks_the_policy(self):
         # Both keys read, b then a, and c needs room. LRU evicts b, the less
         # recently used; SIEVE evicts a, the oldest: a hit doesn't move a key.
@@ -1154,6 +1174,7 @@ class CommandLineTest(ServerTestCase):
             c.call("SET", "k", "v")
         self.assertFalse(os.path.exists(os.path.join(server.workdir, "appendonly.aof")))
 
+    @one_thread_only("checks the single AOF file's name")
     def test_appendfilename_is_written_and_replayed_after_restart(self):
         with tempfile.TemporaryDirectory() as workdir:
             first = self.start_server("--appendfilename", "custom.aof", workdir=workdir)

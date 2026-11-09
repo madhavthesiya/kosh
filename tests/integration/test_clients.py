@@ -67,8 +67,8 @@ class RedisPyTest(ServerTestCase):
                 self.assertTrue(r.set("k2", "v"))
                 self.assertEqual(r.exists("t", "k2", "missing"), 2)
                 self.assertEqual(r.delete("t", "k2", "missing"), 2)
-                self.assertTrue(r.mset({"m1": "1", "m2": "2"}))
-                self.assertEqual(r.mget("m1", "missing", "m2"), [b"1", None, b"2"])
+                self.assertTrue(r.mset({"{m}1": "1", "{m}2": "2"}))
+                self.assertEqual(r.mget("{m}1", "missing", "{m}2"), [b"1", None, b"2"])
                 # Counters: redis-py's incr() and decr() send INCRBY and DECRBY
                 self.assertEqual(r.incr("c"), 1)
                 self.assertEqual(r.incr("c", 5), 6)
@@ -117,7 +117,7 @@ class RedisPyTest(ServerTestCase):
                 r = self.connect(server, protocol)
                 # pipeline() is a MULTI/EXEC transaction by default
                 with r.pipeline() as p:
-                    self.assertEqual(p.set("a", "1").get("a").rpush("pl", "x").execute(), [True, b"1", 1])
+                    self.assertEqual(p.set("{p}a", "1").get("{p}a").rpush("{p}l", "x").execute(), [True, b"1", 1])
                 with r.pipeline(transaction=False) as p:
                     for i in range(100):
                         p.set(f"p{i}", i)
@@ -128,7 +128,7 @@ class RedisPyTest(ServerTestCase):
                 self.assertEqual(results[0], True)
                 self.assertIsInstance(results[1], redis.ResponseError)
                 self.assertEqual(results[2], b"v")
-                r.delete("pl")
+                r.delete("{p}l")
 
     def test_password(self):
         server = self.start_server("--appendonly", "no", "--requirepass", "s3cret")

@@ -318,9 +318,9 @@ GROUPS = {
 
 # Differences Kosh makes on purpose, and why
 EXPECTED = {
-    ("Transactions", "WATCH inside MULTI"): "WATCH isn't supported (see the README's Known Limitations)",
+    ("Transactions", "WATCH inside MULTI"): "WATCH isn't supported (see docs/COMPATIBILITY.md)",
     ("PTTL, PEXPIRE, PERSIST, DBSIZE", "wrong arity"): "EXPIRE and PEXPIRE take no options (Redis 7.0's NX, XX, GT, LT): "
-        "a third argument is an arity error, not Redis's 'Unsupported option' (see the README's Known Limitations)",
+        "a third argument is an arity error, not Redis's 'Unsupported option' (see docs/COMPATIBILITY.md)",
 }
 
 
@@ -350,6 +350,8 @@ def start(binary, kind, password, workdir):
                 "--dir", workdir]
     else:
         argv = [binary, "--port", str(port), "--appendonly", "no"]
+        if os.environ.get("KOSH_THREADS"):
+            argv += ["--threads", os.environ["KOSH_THREADS"]]
     if password:
         argv += ["--requirepass", password]
     proc = subprocess.Popen(argv, cwd=workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -372,6 +374,18 @@ def ask(port, data, quiet=0.3):
         return out
 
 
+def comparable_with_threads(data):
+    """With several threads (KOSH_THREADS), keys land on threads at random, so
+    the commands below differ from Redis by design, and differently from run to
+    run: MSET and MULTI are refused when their keys are on several threads, and
+    one SCAN call covers one thread. Such a case is sent to neither server, so
+    the two stay in step. tests/integration/test_threads.py covers them."""
+    if not os.environ.get("KOSH_THREADS"):
+        return True
+    upper = data.upper()
+    return not any(word in upper for word in (b"MSET", b"MULTI", b"SCAN"))
+
+
 def normalize(reply):
     # HELLO's server name, version and connection id differ by design
     reply = re.sub(rb"\$6\r\nserver\r\n\$\d+\r\n[^\r]*\r\n", b"$6\r\nserver\r\n<server>", reply)
@@ -391,6 +405,8 @@ COUNTED = [("SET", "a", "1"), ("GET", "a"), ("GET", "b"), ("EXISTS", "a"), ("EXI
            ("EXISTS", "a", "b", "a"), ("INCR", "n"), ("MSET", "x", 1, "y", 2), ("DEL", "x", "y", "z"),
            ("SET", "e", "v", "PX", 50), ("SCAN", 0, "TYPE", "string", "COUNT", 100)]
 COUNTED_AFTER_EXPIRY = [("GET", "e"), ("DEL", "a"), ("LPOP", "l")]
+if os.environ.get("KOSH_THREADS"):      # as comparable_with_threads()
+    COUNTED = [c for c in COUNTED if c[0] not in ("MSET", "SCAN")]
 COUNTERS = ("total_commands_processed", "keyspace_hits", "keyspace_misses", "expired_keys")
 
 
@@ -432,7 +448,7 @@ def main():
 
     version = subprocess.run([args.redis, "--version"], capture_output=True, text=True).stdout.strip()
     print(f"Redis: {version}\nKosh: {os.path.abspath(args.kosh)}\n")
-    total_same = total_expected = 0
+    total_same = total_expected = total_skipped = 0
     unexpected = []
     with tempfile.TemporaryDirectory() as workdir, ThreadPoolExecutor(2) as pool:
         for group, (cases, password) in GROUPS.items():
@@ -441,6 +457,9 @@ def main():
             same = 0
             try:
                 for name, data in cases.items():
+                    if not comparable_with_threads(data):
+                        total_skipped += 1
+                        continue
                     from_redis, from_kosh = pool.map(lambda port: normalize(ask(port, data)),
                                                      (redis_port, kosh_port))
                     if from_redis == from_kosh:
@@ -465,6 +484,8 @@ def main():
     total = total_same + total_expected + len(unexpected)
     print(f"\nAll: {total_same} of {total} identical, {total_expected} expected difference(s), "
           f"{len(unexpected)} unexpected")
+    if total_skipped:
+        print(f"{total_skipped} cases weren't sent to either server: see comparable_with_threads()")
     return 1 if unexpected else 0
 
 

@@ -30,6 +30,13 @@ if(SANITIZE)
     endif()
     add_compile_options(-fsanitize=${SANITIZE} -fno-sanitize-recover=all -fno-omit-frame-pointer)
     add_link_options(-fsanitize=${SANITIZE})
+    # GCC warns that TSan doesn't model atomic_thread_fence. Wakeup.h's fences
+    # exist to prevent lost wakeups, which TSan can't see in any case; every
+    # ordering of the data itself comes from acquire and release, which it does
+    # model. tests/test_wakeup.cpp tests the fences.
+    if(SANITIZE MATCHES "thread" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-tsan)
+    endif()
 endif()
 
 find_package(Threads REQUIRED)
@@ -48,6 +55,7 @@ target_link_libraries(kosh-cli Threads::Threads)
 add_executable(kosh-server
     server_main.cpp
     Server.cpp
+    EventLoop.cpp
     Poller.cpp
     Commands.cpp
     InMemoryStorage.cpp
@@ -81,6 +89,14 @@ add_executable(test_threads
     RedisLite.cpp
 )
 target_link_libraries(test_threads Threads::Threads)
+
+# The queue between threads: exact behaviour, then two threads at full speed
+add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
+target_link_libraries(test_spsc_ring Threads::Threads)
+
+# Which thread owns a key, and where the command table says the keys are
+add_executable(test_router tests/test_router.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+target_link_libraries(test_router Threads::Threads)
 
 # Prints sizeof() of the storage types and the heap cost of one key (see bench/README.md)
 add_executable(memory_layout
@@ -141,6 +157,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(kosh-loadgen bench/loadgen.cpp)
     target_link_libraries(kosh-loadgen Threads::Threads)
     add_executable(test_loadgen tests/test_loadgen.cpp)
+    # No wakeup between threads may be lost (eventfd, so Linux only)
+    add_executable(test_wakeup tests/test_wakeup.cpp)
+    target_link_libraries(test_wakeup Threads::Threads)
+    # What a cross-thread queue costs, and what each part of SpscRing buys (see bench/README.md)
+    add_executable(ring_bench bench/ring_bench.cpp)
+    target_link_libraries(ring_bench Threads::Threads)
 endif()
 
 # Fuzz target: client bytes through the parser and the command table
@@ -162,8 +184,11 @@ target_link_libraries(fuzz_commands Threads::Threads)
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+add_test(NAME spsc_ring_tests COMMAND test_spsc_ring)
+add_test(NAME router_tests COMMAND test_router)
 if(TARGET test_loadgen)
     add_test(NAME loadgen_unit_tests COMMAND test_loadgen)
+    add_test(NAME wakeup_tests COMMAND test_wakeup)
 endif()
 if(NOT KOSH_LIBFUZZER)
     add_test(NAME fuzz_corpus COMMAND fuzz_commands ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
@@ -183,6 +208,17 @@ if(Python3_FOUND)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+        # The same suite with several threads; a test that depends on one says why
+        add_test(NAME integration_tests_threads
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(integration_tests_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
+        add_test(NAME shard_aof_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_shard_aof.py
+                         $<TARGET_FILE:kosh-server>)
+        add_test(NAME threads_integration_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_threads.py
+                         $<TARGET_FILE:kosh-server>)
         add_test(NAME loadgen_integration_tests
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_loadgen.py
                          $<TARGET_FILE:kosh-loadgen> $<TARGET_FILE:kosh-server>)
@@ -192,6 +228,12 @@ if(Python3_FOUND)
     add_test(NAME client_library_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
                      $<TARGET_FILE:kosh-server>)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME client_library_tests_threads
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(client_library_tests_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
+    endif()
     # The same commands to real Redis and to Kosh, replies compared byte for
     # byte; registered only where redis-server is installed
     find_program(REDIS_SERVER redis-server)
@@ -199,6 +241,12 @@ if(Python3_FOUND)
         add_test(NAME redis_compatibility
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
                          --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME redis_compatibility_threads
+                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
+                             --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
+            set_tests_properties(redis_compatibility_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
+        endif()
     endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")

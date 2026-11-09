@@ -311,6 +311,28 @@ bool AOFLogger::rewrite(const std::vector<std::string>& commands) {
     return true;
 }
 
+std::string AOFLogger::writeFileAtomically(const std::string& path, std::string_view contents) {
+    const std::string temp = path + ".tmp";
+    std::error_code ignored;
+    int out = openFile(temp, kTruncateFlags);
+    if(out < 0) return "cannot create " + temp + ": " + std::generic_category().message(errno);
+    const bool written = writeAll(out, contents.data(), contents.size()) == contents.size() && syncFile(out);
+    int error = errno;
+    closeFile(out);
+    if(!written) {
+        std::filesystem::remove(temp, ignored);
+        return "cannot write " + temp + ": " + std::generic_category().message(error);
+    }
+    std::error_code renamed;
+    std::filesystem::rename(temp, path, renamed);
+    if(renamed) {
+        std::filesystem::remove(temp, ignored);
+        return "cannot replace " + path + ": " + renamed.message();
+    }
+    if(!syncDirectory(path)) return "cannot sync the directory of " + path;
+    return "";
+}
+
 bool AOFLogger::truncate(size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     if(fd_ < 0) {

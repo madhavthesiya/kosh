@@ -220,9 +220,46 @@ class FailureTest(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("prefill failed", done.stderr)
 
+    def test_several_instances_each_get_their_own_keys(self):
+        first, second = ServerProcess(), ServerProcess()
+        try:
+            status, data, out = run_loadgen(first.port, "--ports", f"{first.port},{second.port}", "--rate", 2000,
+                                            "--duration", 1, "--warmup", 0, "--connections", 4, "--set-ratio", 0)
+            self.assertEqual(status, 0, out)
+            with test_server.Client(first.port) as a, test_server.Client(second.port) as b:
+                self.assertEqual(a.call("DBSIZE"), 500)
+                self.assertEqual(b.call("DBSIZE"), 500)
+                self.assertIsNotNone(a.call("GET", "key:000000000000"))
+                self.assertIsNone(a.call("GET", "key:000000000001"))
+                self.assertIsNotNone(b.call("GET", "key:000000000001"))
+                self.assertIsNone(b.call("GET", "key:000000000000"))
+                # Every GET found its key, on both: none went to the wrong instance
+                for client in (a, b):
+                    fields = dict(line.split(":", 1) for line in client.call("INFO", "stats").decode().split("\r\n") if ":" in line)
+                    self.assertGreater(int(fields["keyspace_hits"]), 500)
+                    self.assertLessEqual(int(fields["keyspace_misses"]), 1)
+        finally:
+            first.stop()
+            second.stop()
+
+    # Replies wait only for the commands outstanding when the last ones left. One
+    # connection that never stops sending always has commands outstanding, so if
+    # replies waited for none to be, it would hear nothing until it stopped.
+    def test_a_stream_on_one_connection_keeps_getting_replies(self):
+        server = ServerProcess("--threads", "4", "--appendonly", "no")
+        try:
+            status, data, out = run_loadgen(server.port, "--rate", 20000, "--duration", 2, "--warmup", 0,
+                                            "--connections", 1, "--set-ratio", 0)
+        finally:
+            server.stop()
+        self.assertEqual(status, 0, out)
+        self.assertLess(percentile(data["actual"], "p50")["value_ns"] / 1e9, 0.2, out)
+
     def test_bad_arguments(self):
         for args in (["--rate", "0"], ["--rate", "-5"], ["--rate", "100", "--connections", "1", "--threads", "2"],
-                     ["--rate", "100", "--set-ratio", "2"], ["--nonsense", "1"]):
+                     ["--rate", "100", "--set-ratio", "2"], ["--nonsense", "1"],
+                     ["--rate", "100", "--ports", "1,2,3", "--connections", "2"],
+                     ["--rate", "100", "--ports", "1,2", "--keyspace", "1"]):
             done = subprocess.run([LOADGEN, *args], capture_output=True, text=True, timeout=10)
             self.assertEqual(done.returncode, 1, args)
 

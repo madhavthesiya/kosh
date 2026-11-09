@@ -1,0 +1,728 @@
+
+### kosh, 1 core: 20000 req/s (peak 45,921)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     630.8 us    95% CI [626.7 us, 630.8 us]  in 10 of 10 s
+  p90     987.1 us    95% CI [983.0 us, 987.1 us]  in 10 of 10 s
+  p99     1.47 ms     95% CI [1.45 ms, 1.47 ms]  in 10 of 10 s
+  p99.9   3.65 ms     95% CI [3.29 ms, 3.85 ms]  in 4 of 10 s
+  p99.99  6.32 ms     95% CI [5.96 ms, 6.62 ms]  in 2 of 10 s
+  max     7.51 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     622.6 us
+  p90     974.8 us
+  p99     1.45 ms
+  p99.9   3.64 ms
+  p99.99  6.32 ms
+  max     7.50 ms
+
+generator's own lateness: p50 150 ns, p99 50.7 us, max 877.1 us
+
+### kosh, 1 core: 22960 req/s (peak 45,921)
+kosh-loadgen  127.0.0.1:7500  target 22960 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 229600 scheduled, 229600 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     766.0 us    95% CI [761.9 us, 766.0 us]  in 10 of 10 s
+  p90     1.32 ms     95% CI [1.31 ms, 1.32 ms]  in 10 of 10 s
+  p99     2.59 ms     95% CI [2.54 ms, 2.64 ms]  in 9 of 10 s
+  p99.9   10.68 ms    95% CI [10.35 ms, 11.21 ms]  in 2 of 10 s
+  p99.99  N/A: generator was 6.42 ms late here, over 1/10 of the 17.17 ms measured
+  max     20.01 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     753.7 us
+  p90     1.29 ms
+  p99     2.54 ms
+  p99.9   9.83 ms
+  p99.99  14.42 ms
+  max     16.04 ms
+
+generator's own lateness: p50 166 ns, p99 152.6 us, max 8.13 ms
+
+### kosh, 1 core: 41328 req/s (peak 45,921)
+kosh-loadgen  127.0.0.1:7500  target 41328 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 413280 scheduled, 413280 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     3.49 ms     95% CI [3.47 ms, 3.51 ms]  in 10 of 10 s
+  p90     11.08 ms    95% CI [11.01 ms, 11.08 ms]  in 10 of 10 s
+  p99     20.71 ms    95% CI [20.58 ms, 20.84 ms]  in 10 of 10 s
+  p99.9   26.74 ms    95% CI [26.48 ms, 26.87 ms]  in 9 of 10 s
+  p99.99  N/A: generator was 5.64 ms late here, over 1/10 of the 30.02 ms measured
+  max     35.05 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     3.46 ms
+  p90     11.08 ms
+  p99     20.71 ms
+  p99.9   26.61 ms
+  p99.99  30.02 ms
+  max     35.05 ms
+
+generator's own lateness: p50 203 ns, p99 573.4 us, max 6.46 ms
+
+### redis8, 1 core, io-threads 1: 20000 req/s (peak 40,750)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     614.4 us    95% CI [614.4 us, 618.5 us]  in 10 of 10 s
+  p90     1.02 ms     95% CI [1.01 ms, 1.02 ms]  in 10 of 10 s
+  p99     1.59 ms     95% CI [1.57 ms, 1.60 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 364.5 us late here, over 1/10 of the 2.47 ms measured
+  p99.99  N/A: generator was 929.8 us late here, over 1/10 of the 3.59 ms measured
+  max     4.89 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     610.3 us
+  p90     1.00 ms
+  p99     1.56 ms
+  p99.9   2.41 ms
+  p99.99  3.52 ms
+  max     4.82 ms
+
+generator's own lateness: p50 149 ns, p99 53.0 us, max 1.56 ms
+
+### redis8, 1 core, io-threads 1: 20374 req/s (peak 40,750)
+kosh-loadgen  127.0.0.1:7500  target 20374 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 203740 scheduled, 203740 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     688.1 us    95% CI [688.1 us, 688.1 us]  in 10 of 10 s
+  p90     1.10 ms     95% CI [1.10 ms, 1.11 ms]  in 10 of 10 s
+  p99     1.62 ms     95% CI [1.61 ms, 1.63 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 235.5 us late here, over 1/10 of the 2.11 ms measured
+  p99.99  N/A: generator was 675.8 us late here, over 1/10 of the 2.67 ms measured
+  max     3.12 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     679.9 us
+  p90     1.10 ms
+  p99     1.61 ms
+  p99.9   2.09 ms
+  p99.99  2.65 ms
+  max     3.12 ms
+
+generator's own lateness: p50 147 ns, p99 32.8 us, max 861.6 us
+
+### redis8, 1 core, io-threads 1: 36674 req/s (peak 40,750)
+kosh-loadgen  127.0.0.1:7500  target 36674 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 366740 scheduled, 366740 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     3.70 ms     95% CI [3.69 ms, 3.72 ms]  in 10 of 10 s
+  p90     10.22 ms    95% CI [10.16 ms, 10.22 ms]  in 10 of 10 s
+  p99     16.52 ms    95% CI [16.38 ms, 16.58 ms]  in 10 of 10 s
+  p99.9   23.20 ms    95% CI [23.07 ms, 23.46 ms]  in 9 of 10 s
+  p99.99  27.00 ms    95% CI [26.74 ms, 27.53 ms]  in 5 of 10 s
+  max     32.66 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     3.69 ms
+  p90     10.22 ms
+  p99     16.45 ms
+  p99.9   23.20 ms
+  p99.99  27.00 ms
+  max     32.66 ms
+
+generator's own lateness: p50 198 ns, p99 230.4 us, max 2.95 ms
+
+### valkey, 1 core, io-threads 1: 20000 req/s (peak 41,226)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     741.4 us    95% CI [737.3 us, 741.4 us]  in 10 of 10 s
+  p90     1.20 ms     95% CI [1.20 ms, 1.21 ms]  in 10 of 10 s
+  p99     1.85 ms     95% CI [1.84 ms, 1.87 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 407.6 us late here, over 1/10 of the 2.61 ms measured
+  p99.99  N/A: generator was 790.5 us late here, over 1/10 of the 3.38 ms measured
+  max     4.96 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     733.2 us
+  p90     1.20 ms
+  p99     1.84 ms
+  p99.9   2.57 ms
+  p99.99  3.15 ms
+  max     4.31 ms
+
+generator's own lateness: p50 151 ns, p99 50.4 us, max 2.27 ms
+
+### valkey, 1 core, io-threads 1: 20612 req/s (peak 41,226)
+kosh-loadgen  127.0.0.1:7500  target 20612 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 206120 scheduled, 206120 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     741.4 us    95% CI [741.4 us, 745.5 us]  in 10 of 10 s
+  p90     1.24 ms     95% CI [1.24 ms, 1.25 ms]  in 10 of 10 s
+  p99     1.98 ms     95% CI [1.97 ms, 2.00 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 378.9 us late here, over 1/10 of the 3.06 ms measured
+  p99.99  N/A: generator was 823.3 us late here, over 1/10 of the 7.83 ms measured
+  max     11.99 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     733.2 us
+  p90     1.23 ms
+  p99     1.97 ms
+  p99.9   3.05 ms
+  p99.99  7.83 ms
+  max     11.98 ms
+
+generator's own lateness: p50 148 ns, p99 51.7 us, max 2.07 ms
+
+### valkey, 1 core, io-threads 1: 37103 req/s (peak 41,226)
+kosh-loadgen  127.0.0.1:7500  target 37103 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 371030 scheduled, 371030 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     2.34 ms     95% CI [2.33 ms, 2.34 ms]  in 10 of 10 s
+  p90     9.90 ms     95% CI [9.83 ms, 9.96 ms]  in 10 of 10 s
+  p99     18.87 ms    95% CI [18.61 ms, 19.01 ms]  in 10 of 10 s
+  p99.9   27.00 ms    95% CI [26.74 ms, 27.13 ms]  in 8 of 10 s
+  p99.99  30.15 ms    95% CI [29.75 ms, 30.67 ms]  in 6 of 10 s
+  max     35.83 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     2.31 ms
+  p90     9.83 ms
+  p99     18.74 ms
+  p99.9   26.87 ms
+  p99.99  30.15 ms
+  max     35.67 ms
+
+generator's own lateness: p50 207 ns, p99 264.2 us, max 2.67 ms
+
+### kosh, 4 cores: 20000 req/s (peak 51,751)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     966.7 us    95% CI [962.6 us, 966.7 us]  in 10 of 10 s
+  p90     1.56 ms     95% CI [1.56 ms, 1.56 ms]  in 10 of 10 s
+  p99     2.28 ms     95% CI [2.28 ms, 2.29 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 522.2 us late here, over 1/10 of the 3.01 ms measured
+  p99.99  N/A: generator was 778.2 us late here, over 1/10 of the 4.13 ms measured
+  max     6.58 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     950.3 us
+  p90     1.54 ms
+  p99     2.26 ms
+  p99.9   3.00 ms
+  p99.99  4.13 ms
+  max     6.57 ms
+
+generator's own lateness: p50 169 ns, p99 184.3 us, max 902.5 us
+
+### kosh, 4 cores: 25875 req/s (peak 51,751)
+kosh-loadgen  127.0.0.1:7500  target 25875 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 258750 scheduled, 258750 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.25 ms     95% CI [1.24 ms, 1.25 ms]  in 10 of 10 s
+  p90     2.46 ms     95% CI [2.44 ms, 2.46 ms]  in 10 of 10 s
+  p99     5.28 ms     95% CI [5.21 ms, 5.31 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 946.2 us late here, over 1/10 of the 8.32 ms measured
+  p99.99  N/A: generator was 1.45 ms late here, over 1/10 of the 11.01 ms measured
+  max     11.94 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.21 ms
+  p90     2.41 ms
+  p99     5.24 ms
+  p99.9   8.32 ms
+  p99.99  11.01 ms
+  max     11.92 ms
+
+generator's own lateness: p50 186 ns, p99 411.6 us, max 2.59 ms
+
+### kosh, 4 cores: 46575 req/s (peak 51,751)
+kosh-loadgen  127.0.0.1:7500  target 46575 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 465750 scheduled, 465750 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     4.85 ms     95% CI [4.82 ms, 4.85 ms]  in 10 of 10 s
+  p90     13.57 ms    95% CI [13.50 ms, 13.57 ms]  in 10 of 10 s
+  p99     23.72 ms    95% CI [23.59 ms, 23.86 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 5.70 ms late here, over 1/10 of the 32.64 ms measured
+  p99.99  N/A: generator was 9.83 ms late here, over 1/10 of the 40.11 ms measured
+  max     53.28 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     4.75 ms
+  p90     13.50 ms
+  p99     23.72 ms
+  p99.9   32.51 ms
+  p99.99  40.11 ms
+  max     53.28 ms
+
+generator's own lateness: p50 244 ns, p99 1.37 ms, max 10.53 ms
+
+### redis8, 4 cores, io-threads 4: 20000 req/s (peak 51,706)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.06 ms     95% CI [1.06 ms, 1.06 ms]  in 10 of 10 s
+  p90     1.79 ms     95% CI [1.79 ms, 1.79 ms]  in 10 of 10 s
+  p99     8.16 ms     95% CI [7.77 ms, 8.52 ms]  in 1 of 10 s  *
+  p99.9   N/A: generator was 5.28 ms late here, over 1/10 of the 20.71 ms measured
+  p99.99  N/A: generator was 7.44 ms late here, over 1/10 of the 26.87 ms measured
+  max     33.74 ms
+  * one second produced all of this tail: a single event, so the run can't say how often it recurs
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.04 ms
+  p90     1.75 ms
+  p99     6.72 ms
+  p99.9   19.27 ms
+  p99.99  25.17 ms
+  max     29.75 ms
+
+generator's own lateness: p50 186 ns, p99 577.5 us, max 8.68 ms
+
+### redis8, 4 cores, io-threads 4: 25853 req/s (peak 51,706)
+kosh-loadgen  127.0.0.1:7500  target 25853 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 258530 scheduled, 258530 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     2.29 ms     95% CI [2.29 ms, 2.31 ms]  in 10 of 10 s
+  p90     6.39 ms     95% CI [6.36 ms, 6.42 ms]  in 9 of 10 s
+  p99     N/A: generator was 2.28 ms late here, over 1/10 of the 19.14 ms measured
+  p99.9   N/A: generator was 10.42 ms late here, over 1/10 of the 29.62 ms measured
+  p99.99  N/A: generator was 17.96 ms late here, over 1/10 of the 42.99 ms measured
+  max     51.60 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     2.23 ms
+  p90     6.06 ms
+  p99     18.09 ms
+  p99.9   29.62 ms
+  p99.99  42.99 ms
+  max     51.59 ms
+
+generator's own lateness: p50 375 ns, p99 2.28 ms, max 19.20 ms
+
+### redis8, 4 cores, io-threads 4: 46535 req/s (peak 51,706)
+kosh-loadgen  127.0.0.1:7500  target 46535 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 465350 scheduled, 465350 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     5.08 ms     95% CI [5.05 ms, 5.08 ms]  in 10 of 10 s
+  p90     11.99 ms    95% CI [11.99 ms, 12.06 ms]  in 10 of 10 s
+  p99     N/A: generator was 4.46 ms late here, over 1/10 of the 24.64 ms measured
+  p99.9   N/A: generator was 43.52 ms late here, over 1/10 of the 63.70 ms measured
+  p99.99  N/A: generator was 49.28 ms late here, over 1/10 of the 79.69 ms measured
+  max     84.38 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     4.92 ms
+  p90     11.73 ms
+  p99     21.36 ms
+  p99.9   32.51 ms
+  p99.99  37.75 ms
+  max     50.53 ms
+
+generator's own lateness: p50 305 ns, p99 4.46 ms, max 49.94 ms
+
+### valkey, 4 cores, io-threads 4: 20000 req/s (peak 49,423)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     876.5 us    95% CI [876.5 us, 880.6 us]  in 10 of 10 s
+  p90     1.48 ms     95% CI [1.47 ms, 1.48 ms]  in 10 of 10 s
+  p99     N/A: generator was 327.7 us late here, over 1/10 of the 2.47 ms measured
+  p99.9   49.02 ms    95% CI [46.14 ms, 53.22 ms]  in 1 of 10 s  *
+  p99.99  70.25 ms    95% CI [69.21 ms, 73.40 ms]  in 1 of 10 s  *
+  max     81.90 ms
+  * one second produced all of this tail: a single event, so the run can't say how often it recurs
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     856.1 us
+  p90     1.44 ms
+  p99     2.39 ms
+  p99.9   49.02 ms
+  p99.99  70.25 ms
+  max     81.90 ms
+
+generator's own lateness: p50 213 ns, p99 327.7 us, max 1.76 ms
+
+### valkey, 4 cores, io-threads 4: 24711 req/s (peak 49,423)
+kosh-loadgen  127.0.0.1:7500  target 24711 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 247110 scheduled, 247110 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     884.7 us    95% CI [884.7 us, 888.8 us]  in 10 of 10 s
+  p90     1.50 ms     95% CI [1.50 ms, 1.50 ms]  in 10 of 10 s
+  p99     N/A: generator was 352.3 us late here, over 1/10 of the 2.41 ms measured
+  p99.9   N/A: generator was 831.5 us late here, over 1/10 of the 3.78 ms measured
+  p99.99  N/A: generator was 1.37 ms late here, over 1/10 of the 5.67 ms measured
+  max     8.04 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     864.3 us
+  p90     1.47 ms
+  p99     2.34 ms
+  p99.9   3.74 ms
+  p99.99  5.64 ms
+  max     8.03 ms
+
+generator's own lateness: p50 204 ns, p99 352.3 us, max 1.63 ms
+
+### valkey, 4 cores, io-threads 4: 44481 req/s (peak 49,423)
+kosh-loadgen  127.0.0.1:7500  target 44481 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 444810 scheduled, 444810 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     4.10 ms     95% CI [4.10 ms, 4.11 ms]  in 10 of 10 s
+  p90     10.94 ms    95% CI [10.94 ms, 11.01 ms]  in 10 of 10 s
+  p99     N/A: generator was 4.36 ms late here, over 1/10 of the 18.22 ms measured
+  p99.9   N/A: generator was 9.57 ms late here, over 1/10 of the 24.90 ms measured
+  p99.99  N/A: generator was 15.01 ms late here, over 1/10 of the 32.77 ms measured
+  max     39.09 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     3.92 ms
+  p90     10.75 ms
+  p99     17.96 ms
+  p99.9   24.77 ms
+  p99.99  32.64 ms
+  max     39.09 ms
+
+generator's own lateness: p50 283 ns, p99 4.36 ms, max 15.35 ms
+
+### nredis, 4 cores: 20000 req/s (peak 56,942)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     704.5 us    95% CI [700.4 us, 708.6 us]  in 10 of 10 s
+  p90     1.15 ms     95% CI [1.14 ms, 1.15 ms]  in 10 of 10 s
+  p99     N/A: generator was 272.4 us late here, over 1/10 of the 1.72 ms measured
+  p99.9   N/A: generator was 598.0 us late here, over 1/10 of the 2.41 ms measured
+  p99.99  N/A: generator was 942.1 us late here, over 1/10 of the 3.88 ms measured
+  max     6.41 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     684.0 us
+  p90     1.11 ms
+  p99     1.67 ms
+  p99.9   2.33 ms
+  p99.99  3.87 ms
+  max     6.40 ms
+
+generator's own lateness: p50 180 ns, p99 272.4 us, max 1.17 ms
+
+### nredis, 4 cores: 28471 req/s (peak 56,942)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503  target 28471 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 284710 scheduled, 284710 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.25 ms     95% CI [1.25 ms, 1.25 ms]  in 10 of 10 s
+  p90     3.42 ms     95% CI [3.41 ms, 3.46 ms]  in 10 of 10 s
+  p99     12.85 ms    95% CI [12.65 ms, 13.04 ms]  in 9 of 10 s
+  p99.9   24.12 ms    95% CI [23.72 ms, 24.38 ms]  in 5 of 10 s
+  p99.99  28.44 ms    95% CI [28.18 ms, 28.70 ms]  in 2 of 10 s
+  max     31.72 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.22 ms
+  p90     3.39 ms
+  p99     12.85 ms
+  p99.9   23.99 ms
+  p99.99  28.44 ms
+  max     31.72 ms
+
+generator's own lateness: p50 212 ns, p99 464.9 us, max 2.65 ms
+
+### nredis, 4 cores: 51248 req/s (peak 56,942)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503  target 51248 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 512480 scheduled, 512480 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     4.59 ms     95% CI [4.59 ms, 4.62 ms]  in 10 of 10 s
+  p90     10.94 ms    95% CI [10.88 ms, 10.94 ms]  in 10 of 10 s
+  p99     N/A: generator was 2.36 ms late here, over 1/10 of the 19.27 ms measured
+  p99.9   N/A: generator was 5.05 ms late here, over 1/10 of the 28.44 ms measured
+  p99.99  N/A: generator was 7.67 ms late here, over 1/10 of the 36.18 ms measured
+  max     49.37 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     4.46 ms
+  p90     10.81 ms
+  p99     19.14 ms
+  p99.9   28.44 ms
+  p99.99  36.18 ms
+  max     49.36 ms
+
+generator's own lateness: p50 305 ns, p99 2.36 ms, max 8.49 ms
+
+### kosh, 8 cores: 20000 req/s (peak 42,283)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.11 ms     95% CI [1.10 ms, 1.11 ms]  in 10 of 10 s
+  p90     1.84 ms     95% CI [1.83 ms, 1.84 ms]  in 10 of 10 s
+  p99     N/A: generator was 450.6 us late here, over 1/10 of the 2.80 ms measured
+  p99.9   N/A: generator was 843.8 us late here, over 1/10 of the 3.88 ms measured
+  p99.99  N/A: generator was 1.32 ms late here, over 1/10 of the 5.54 ms measured
+  max     8.54 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.06 ms
+  p90     1.77 ms
+  p99     2.74 ms
+  p99.9   3.80 ms
+  p99.99  5.54 ms
+  max     8.52 ms
+
+generator's own lateness: p50 246 ns, p99 450.6 us, max 2.77 ms
+
+### kosh, 8 cores: 21141 req/s (peak 42,283)
+kosh-loadgen  127.0.0.1:7500  target 21141 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 211410 scheduled, 211410 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.17 ms     95% CI [1.16 ms, 1.17 ms]  in 10 of 10 s
+  p90     1.97 ms     95% CI [1.96 ms, 1.97 ms]  in 10 of 10 s
+  p99     N/A: generator was 487.4 us late here, over 1/10 of the 3.05 ms measured
+  p99.9   N/A: generator was 962.6 us late here, over 1/10 of the 4.42 ms measured
+  p99.99  N/A: generator was 1.67 ms late here, over 1/10 of the 5.87 ms measured
+  max     6.96 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.13 ms
+  p90     1.91 ms
+  p99     2.98 ms
+  p99.9   4.29 ms
+  p99.99  5.77 ms
+  max     6.95 ms
+
+generator's own lateness: p50 234 ns, p99 487.4 us, max 2.81 ms
+
+### kosh, 8 cores: 38054 req/s (peak 42,283)
+kosh-loadgen  127.0.0.1:7500  target 38054 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 380540 scheduled, 380540 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     5.37 ms     95% CI [5.34 ms, 5.37 ms]  in 10 of 10 s
+  p90     14.42 ms    95% CI [14.35 ms, 14.48 ms]  in 10 of 10 s
+  p99     N/A: generator was 5.21 ms late here, over 1/10 of the 25.17 ms measured
+  p99.9   N/A: generator was 17.17 ms late here, over 1/10 of the 36.18 ms measured
+  p99.99  N/A: generator was 20.97 ms late here, over 1/10 of the 44.83 ms measured
+  max     52.80 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     5.14 ms
+  p90     13.96 ms
+  p99     24.51 ms
+  p99.9   35.91 ms
+  p99.99  44.56 ms
+  max     52.80 ms
+
+generator's own lateness: p50 353 ns, p99 5.21 ms, max 22.35 ms
+
+### redis8, 8 cores, io-threads 8: 20000 req/s (peak 43,872)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.28 ms     95% CI [1.28 ms, 1.28 ms]  in 10 of 10 s
+  p90     2.02 ms     95% CI [2.02 ms, 2.02 ms]  in 10 of 10 s
+  p99     N/A: generator was 337.9 us late here, over 1/10 of the 2.93 ms measured
+  p99.9   N/A: generator was 643.1 us late here, over 1/10 of the 3.95 ms measured
+  p99.99  N/A: generator was 860.2 us late here, over 1/10 of the 5.57 ms measured
+  max     7.13 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.25 ms
+  p90     1.98 ms
+  p99     2.90 ms
+  p99.9   3.90 ms
+  p99.99  5.54 ms
+  max     7.12 ms
+
+generator's own lateness: p50 217 ns, p99 337.9 us, max 1.11 ms
+
+### redis8, 8 cores, io-threads 8: 21936 req/s (peak 43,872)
+kosh-loadgen  127.0.0.1:7500  target 21936 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 219360 scheduled, 219360 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.37 ms     95% CI [1.37 ms, 1.38 ms]  in 10 of 10 s
+  p90     2.31 ms     95% CI [2.29 ms, 2.31 ms]  in 10 of 10 s
+  p99     N/A: generator was 704.5 us late here, over 1/10 of the 3.56 ms measured
+  p99.9   N/A: generator was 1.30 ms late here, over 1/10 of the 4.78 ms measured
+  p99.99  N/A: generator was 1.85 ms late here, over 1/10 of the 6.59 ms measured
+  max     8.26 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.31 ms
+  p90     2.21 ms
+  p99     3.41 ms
+  p99.9   4.69 ms
+  p99.99  6.46 ms
+  max     8.12 ms
+
+generator's own lateness: p50 267 ns, p99 704.5 us, max 2.82 ms
+
+### redis8, 8 cores, io-threads 8: 39485 req/s (peak 43,872)
+kosh-loadgen  127.0.0.1:7500  target 39485 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 394850 scheduled, 394850 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     5.24 ms     95% CI [5.21 ms, 5.28 ms]  in 10 of 10 s
+  p90     13.57 ms    95% CI [13.50 ms, 13.57 ms]  in 10 of 10 s
+  p99     N/A: generator was 3.70 ms late here, over 1/10 of the 24.64 ms measured
+  p99.9   N/A: generator was 11.40 ms late here, over 1/10 of the 36.96 ms measured
+  p99.99  N/A: generator was 15.40 ms late here, over 1/10 of the 51.12 ms measured
+  max     61.93 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     5.01 ms
+  p90     13.24 ms
+  p99     24.38 ms
+  p99.9   36.70 ms
+  p99.99  50.86 ms
+  max     61.93 ms
+
+generator's own lateness: p50 321 ns, p99 3.70 ms, max 16.77 ms
+
+### valkey, 8 cores, io-threads 8: 20000 req/s (peak 30,343)
+kosh-loadgen  127.0.0.1:7500  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     794.6 us    95% CI [794.6 us, 798.7 us]  in 10 of 10 s
+  p90     1.34 ms     95% CI [1.33 ms, 1.34 ms]  in 10 of 10 s
+  p99     N/A: generator was 264.2 us late here, over 1/10 of the 2.10 ms measured
+  p99.9   N/A: generator was 585.7 us late here, over 1/10 of the 3.03 ms measured
+  p99.99  N/A: generator was 950.3 us late here, over 1/10 of the 4.52 ms measured
+  max     6.61 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     778.2 us
+  p90     1.30 ms
+  p99     2.06 ms
+  p99.9   2.97 ms
+  p99.99  4.52 ms
+  max     6.60 ms
+
+generator's own lateness: p50 208 ns, p99 264.2 us, max 1.32 ms
+
+### valkey, 8 cores, io-threads 8: 15171 req/s (peak 30,343)
+kosh-loadgen  127.0.0.1:7500  target 15171 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 151710 scheduled, 151710 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     643.1 us    95% CI [643.1 us, 643.1 us]  in 10 of 10 s
+  p90     983.0 us    95% CI [978.9 us, 987.1 us]  in 10 of 10 s
+  p99     1.54 ms     95% CI [1.52 ms, 1.56 ms]  in 10 of 10 s
+  p99.9   N/A: generator was 407.6 us late here, over 1/10 of the 2.38 ms measured
+  p99.99  N/A: generator was 675.8 us late here, over 1/10 of the 3.47 ms measured
+  max     4.49 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     634.9 us
+  p90     970.8 us
+  p99     1.52 ms
+  p99.9   2.36 ms
+  p99.99  3.46 ms
+  max     4.49 ms
+
+generator's own lateness: p50 151 ns, p99 99.8 us, max 961.8 us
+
+### valkey, 8 cores, io-threads 8: 27308 req/s (peak 30,343)
+kosh-loadgen  127.0.0.1:7500  target 27308 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 273080 scheduled, 273080 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     2.74 ms     95% CI [2.72 ms, 2.74 ms]  in 10 of 10 s
+  p90     9.70 ms     95% CI [9.63 ms, 9.76 ms]  in 10 of 10 s
+  p99     N/A: generator was 2.46 ms late here, over 1/10 of the 19.79 ms measured
+  p99.9   N/A: generator was 8.72 ms late here, over 1/10 of the 26.48 ms measured
+  p99.99  N/A: generator was 13.30 ms late here, over 1/10 of the 30.67 ms measured
+  max     38.30 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     2.62 ms
+  p90     9.44 ms
+  p99     19.66 ms
+  p99.9   26.48 ms
+  p99.99  30.67 ms
+  max     38.29 ms
+
+generator's own lateness: p50 311 ns, p99 2.46 ms, max 14.34 ms
+
+### nredis, 8 cores: 20000 req/s (peak 56,200)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503,7504,7505,7506,7507  target 20000 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 200000 scheduled, 200000 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.01 ms     95% CI [1.01 ms, 1.02 ms]  in 10 of 10 s
+  p90     1.64 ms     95% CI [1.63 ms, 1.64 ms]  in 10 of 10 s
+  p99     N/A: generator was 299.0 us late here, over 1/10 of the 2.46 ms measured
+  p99.9   N/A: generator was 626.7 us late here, over 1/10 of the 3.47 ms measured
+  p99.99  N/A: generator was 925.7 us late here, over 1/10 of the 4.88 ms measured
+  max     8.09 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     987.1 us
+  p90     1.61 ms
+  p99     2.42 ms
+  p99.9   3.41 ms
+  p99.99  4.78 ms
+  max     8.09 ms
+
+generator's own lateness: p50 227 ns, p99 299.0 us, max 1.49 ms
+
+### nredis, 8 cores: 28099 req/s (peak 56,200)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503,7504,7505,7506,7507  target 28099 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 280990 scheduled, 280990 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     1.11 ms     95% CI [1.11 ms, 1.11 ms]  in 10 of 10 s
+  p90     3.10 ms     95% CI [3.08 ms, 3.13 ms]  in 10 of 10 s
+  p99     11.27 ms    95% CI [11.14 ms, 11.40 ms]  in 7 of 10 s
+  p99.9   20.97 ms    95% CI [20.58 ms, 21.50 ms]  in 5 of 10 s
+  p99.99  26.87 ms    95% CI [26.35 ms, 27.39 ms]  in 5 of 10 s
+  max     30.66 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     1.03 ms
+  p90     2.95 ms
+  p99     11.21 ms
+  p99.9   20.97 ms
+  p99.99  26.87 ms
+  max     30.65 ms
+
+generator's own lateness: p50 289 ns, p99 888.8 us, max 3.51 ms
+
+### nredis, 8 cores: 50579 req/s (peak 56,200)
+kosh-loadgen  127.0.0.1:7500,7501,7502,7503,7504,7505,7506,7507  target 50579 req/s, 64 connections, 2 thread(s), 10 s measured after 2 s warm-up, 10% SET
+requests: 505790 scheduled, 505790 answered, 0 error replies, 0 unanswered, 0 connections lost
+
+latency from the intended send time (what a client waited):
+  p50     5.54 ms     95% CI [5.54 ms, 5.57 ms]  in 10 of 10 s
+  p90     14.81 ms    95% CI [14.75 ms, 14.88 ms]  in 10 of 10 s
+  p99     N/A: generator was 4.69 ms late here, over 1/10 of the 29.23 ms measured
+  p99.9   N/A: generator was 11.93 ms late here, over 1/10 of the 48.50 ms measured
+  p99.99  N/A: generator was 17.17 ms late here, over 1/10 of the 70.78 ms measured
+  max     84.10 ms
+
+latency from the moment the kernel took the request (what a send-timed tool reports):
+  p50     5.21 ms
+  p90     14.48 ms
+  p99     28.97 ms
+  p99.9   47.97 ms
+  p99.99  70.78 ms
+  max     84.10 ms
+
+generator's own lateness: p50 361 ns, p99 4.69 ms, max 18.89 ms

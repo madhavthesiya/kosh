@@ -119,6 +119,11 @@ public:
     // Returns false, with the AOF untouched, if that fails (see lastError()).
     [[nodiscard]] bool rewrite(const std::vector<std::string>& commands);
 
+    // Writes a whole small file so that a crash leaves the old one or the new
+    // one, never part of either: to "<path>.tmp", synced, renamed over `path`,
+    // then the directory synced. Returns why it failed, or "" if it worked.
+    [[nodiscard]] static std::string writeFileAtomically(const std::string& path, std::string_view contents);
+
     // Cuts the file to its first `size` bytes; false if that fails (see lastError())
     [[nodiscard]] bool truncate(size_t size);
 

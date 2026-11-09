@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,7 +55,8 @@ const int kKeyDigits = 12;
 
 struct Config {
     std::string host = "127.0.0.1";
-    std::string port = "6379";
+    std::string port = "6379";          // or, with --ports, the list as given
+    std::vector<std::string> ports;     // one per server instance
     uint64_t rate = 0;
     uint64_t connections = 8;
     uint64_t threads = 1;
@@ -132,13 +134,15 @@ struct Result {
 class RequestBuilder {
 public:
     RequestBuilder(const Config& config, uint64_t seed)
-        : keyspace_(config.keyspace), setRatio_(config.setRatio), rng_(seed),
+        : keyspace_(config.keyspace), instances_(config.ports.size()), setRatio_(config.setRatio), rng_(seed),
           value_(config.valueSize, 'x'),
           lengthPrefix_("$" + std::to_string(4 + kKeyDigits) + "\r\n"),
           valueHeader_("$" + std::to_string(config.valueSize) + "\r\n") {}
 
-    void buildRandom(std::string& out) {
-        const uint64_t key = rng_() % keyspace_;
+    // A key of this instance: the instance of key k is k modulo the number of
+    // instances, as a client that shards its keys itself would do it
+    void buildRandom(std::string& out, uint64_t instance) {
+        const uint64_t key = (rng_() % (keyspace_ / instances_)) * instances_ + instance;
         const bool isSet = setRatio_ > 0.0 && coin_(rng_) < setRatio_;
         if(isSet) buildSet(out, key);
         else buildGet(out, key);
@@ -167,6 +171,7 @@ private:
     }
 
     uint64_t keyspace_;
+    uint64_t instances_;
     double setRatio_;
     std::mt19937_64 rng_;
     std::uniform_real_distribution<double> coin_{0.0, 1.0};
@@ -246,7 +251,7 @@ private:
         while(!c.blocked && !c.dead) {
             if(c.outOffset == c.out.size()) {
                 if(c.sent == c.scheduled) return;
-                requests_.buildRandom(c.out);
+                requests_.buildRandom(c.out, c.index % config_.ports.size());
                 c.outOffset = 0;
                 c.sent++;
             }
@@ -348,12 +353,12 @@ private:
     Result result_;
 };
 
-int connectTo(const Config& config) {
+int connectTo(const Config& config, const std::string& port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* found = nullptr;
-    if(getaddrinfo(config.host.c_str(), config.port.c_str(), &hints, &found) != 0) return -1;
+    if(getaddrinfo(config.host.c_str(), port.c_str(), &hints, &found) != 0) return -1;
     int fd = -1;
     for(addrinfo* a = found; a != nullptr; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -370,20 +375,22 @@ int connectTo(const Config& config) {
     return fd;
 }
 
-// Writes every key once, in batches, so that GETs find values of the real size.
-bool prefill(const Config& config) {
-    const int fd = connectTo(config);
+// Writes every key of one instance once, in batches, so that GETs find values
+// of the real size.
+bool prefillInstance(const Config& config, size_t instance) {
+    const int fd = connectTo(config, config.ports[instance]);
     if(fd < 0) return false;
+    const uint64_t instances = config.ports.size();
     RequestBuilder builder(config, config.seed);
     ReplyScanner scanner;
     std::string one, batch;
     std::vector<char> buffer(64 * 1024);
     bool ok = true;
-    for(uint64_t key = 0; key < config.keyspace && ok;) {
+    for(uint64_t key = instance; key < config.keyspace && ok;) {
         batch.clear();
-        const uint64_t count = std::min<uint64_t>(1000, config.keyspace - key);
-        for(uint64_t i = 0; i < count; i++) {
-            builder.buildSet(one, key + i);
+        uint64_t count = 0;
+        for(; count < 1000 && key < config.keyspace; count++, key += instances) {
+            builder.buildSet(one, key);
             batch += one;
         }
         size_t offset = 0;
@@ -401,10 +408,16 @@ bool prefill(const Config& config) {
                 if(isError) ok = false;
             }) && ok;
         }
-        key += count;
     }
     close(fd);
     return ok;
+}
+
+bool prefill(const Config& config) {
+    for(size_t instance = 0; instance < config.ports.size(); instance++) {
+        if(!prefillInstance(config, instance)) return false;
+    }
+    return true;
 }
 
 std::string formatNs(uint64_t ns) {
@@ -472,6 +485,8 @@ void usage() {
         "Usage: kosh-loadgen --rate REQ_PER_SEC [options]\n"
         "  --host H         server address (default 127.0.0.1)\n"
         "  --port P         server port (default 6379)\n"
+        "  --ports P,P,...  several separate servers: connections are dealt to them in\n"
+        "                   turn, and each gets its own share of the keys\n"
         "  --connections N  connections in all (default 8)\n"
         "  --threads N      threads, each spinning on a core (default 1)\n"
         "  --duration S     seconds measured (default 30)\n"
@@ -503,7 +518,14 @@ bool parseArgs(int argc, char** argv, Config& config) {
         const char* value = argv[++i];
         bool ok = true;
         if(name == "--host") config.host = value;
-        else if(name == "--port") config.port = value;
+        else if(name == "--port") { config.port = value; config.ports.clear(); }
+        else if(name == "--ports") {
+            config.port = value;
+            config.ports.clear();
+            std::stringstream list(value);
+            for(std::string port; std::getline(list, port, ',');) config.ports.push_back(port);
+            ok = !config.ports.empty();
+        }
         else if(name == "--rate") ok = parseUint(value, config.rate);
         else if(name == "--connections") ok = parseUint(value, config.connections);
         else if(name == "--threads") ok = parseUint(value, config.threads);
@@ -522,10 +544,12 @@ bool parseArgs(int argc, char** argv, Config& config) {
         else ok = false;
         if(!ok) return false;
     }
+    if(config.ports.empty()) config.ports.push_back(config.port);
     return config.rate >= 1 && config.rate <= 1000000000 && config.connections >= 1 &&
            config.threads >= 1 && config.threads <= config.connections &&
+           config.connections >= config.ports.size() &&
            config.duration >= 1 && config.duration <= 86400 && config.warmup <= 86400 &&
-           config.keyspace >= 1;
+           config.keyspace >= config.ports.size();
 }
 
 } // namespace
@@ -555,7 +579,7 @@ int main(int argc, char** argv) {
             if(round >= perThread[t].size()) continue;
             Conn& c = perThread[t][round];
             c.index = index++;
-            c.fd = connectTo(config);
+            c.fd = connectTo(config, config.ports[c.index % config.ports.size()]);
             if(c.fd < 0 || fcntl(c.fd, F_SETFL, O_NONBLOCK) < 0) {
                 std::fprintf(stderr, "kosh-loadgen: can't connect to %s:%s\n", config.host.c_str(), config.port.c_str());
                 return 2;
