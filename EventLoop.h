@@ -90,6 +90,7 @@ private:
         uint64_t slots_head = 0;
         uint64_t slots_tail = 0;
         size_t slot_bytes = 0;           // replies waiting in slots
+        uint64_t send_after = 0;         // replies wait until this slot's turn: see holdReplies()
 
         size_t pendingReplies() const { return static_cast<size_t>(slots_tail - slots_head); }
         ReplySlot& slot(uint64_t number) { return slots[number & (slots.size() - 1)]; }
@@ -198,6 +199,7 @@ private:
     void releaseLargeArgs(size_t argc);              // Bound the memory args_ keeps
     SendStatus sendReplies(socket_t fd, Client& client);
     void updateInterest(socket_t fd, Client& client);
+    bool holdReplies(const Client& client) const;
     void removeClient(socket_t fd);                  // Cleanup on disconnect
 
     // Most a client's incomplete command may occupy (Redis's client-query-buffer-limit)

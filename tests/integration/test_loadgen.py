@@ -242,6 +242,19 @@ class FailureTest(unittest.TestCase):
             first.stop()
             second.stop()
 
+    # Replies wait only for the commands outstanding when the last ones left. One
+    # connection that never stops sending always has commands outstanding, so if
+    # replies waited for none to be, it would hear nothing until it stopped.
+    def test_a_stream_on_one_connection_keeps_getting_replies(self):
+        server = ServerProcess("--threads", "4", "--appendonly", "no")
+        try:
+            status, data, out = run_loadgen(server.port, "--rate", 20000, "--duration", 2, "--warmup", 0,
+                                            "--connections", 1, "--set-ratio", 0)
+        finally:
+            server.stop()
+        self.assertEqual(status, 0, out)
+        self.assertLess(percentile(data["actual"], "p50")["value_ns"] / 1e9, 0.2, out)
+
     def test_bad_arguments(self):
         for args in (["--rate", "0"], ["--rate", "-5"], ["--rate", "100", "--connections", "1", "--threads", "2"],
                      ["--rate", "100", "--set-ratio", "2"], ["--nonsense", "1"],

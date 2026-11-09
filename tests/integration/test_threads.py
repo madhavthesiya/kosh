@@ -507,6 +507,25 @@ def test_replies_in_flight_are_bounded():
     server.stop()
 
 
+# Sending each piece as it arrives costs a system call per piece, and throughput:
+# a client should read a pipeline's replies in one go
+def test_a_pipelines_replies_arrive_together():
+    server = Server("--threads", "4")
+    client = Client(server.port)
+    batch = b"".join(encode("GET", f"together{i}") for i in range(16))      # on every thread, all missing
+    whole = 0
+    rounds = 300
+    for _ in range(rounds):
+        client.sock.sendall(batch)
+        data = client.sock.recv(65536)
+        whole += len(data) == 16 * 5
+        while len(data) < 16 * 5:
+            data += client.sock.recv(65536)
+    check(whole >= rounds * 0.95, f"the replies came in one piece ({whole} of {rounds} times)")
+    client.close()
+    server.stop()
+
+
 # What ends a connection comes after every reply to the commands before it
 def test_quit_comes_after_replies_on_other_threads():
     server = Server("--threads", "4")

@@ -12,9 +12,15 @@ For each core budget:
                 hardest baseline)
 and once each kosh-main (before threads) and redis7 (for continuity).
 
-Part 1, peak throughput: memtier, closed loop, pipeline 1 and 16. The rounds
-are interleaved and rotated, so that a machine changing speed affects every
-server alike. Server CPU per request comes from /proc.
+Part 1, peak throughput: redis-benchmark, closed loop, pipeline 1 and 16. The
+rounds are interleaved and rotated, so that a machine changing speed affects
+every server alike. Server CPU per request comes from /proc.
+
+Why so many connections (400 at pipeline 1, 1,600 at 16): each connection does
+one round trip at a time, and on this VM a round trip takes milliseconds, so
+with 48 connections every server sat near the same ceiling and none of them
+could show what more threads do. Measured: Kosh at 4 threads and pipeline 16 went
+from about 290,000 requests/s with 48 connections to 520,000 with 1,600.
 
 Part 2, latency: kosh-loadgen, open loop, at a common rate and at 50% and 90%
 of each server's own peak. It prints a percentile only if it can support it.
@@ -22,10 +28,12 @@ of each server's own peak. It prints a percentile only if it can support it.
 Everything is pinned: the servers on CPUs 0 to C-1, the load generators on 8-17.
 Each server gets the same cores, keys, values and persistence setting.
 
-Usage: shard_bench.py --out DIR [--rounds 3] [--seconds 8] [--trial]
+Usage: shard_bench.py --out DIR [--rounds 3] [--trial]
 Binaries are found under --builds and --tools; see the defaults.
 """
 import argparse
+import csv
+import io
 import json
 import os
 import pathlib
@@ -45,9 +53,9 @@ CORES = [1, 2, 4, 8]
 # What each project's config file suggests for 4 and 8 cores (counting the main thread)
 IO_THREADS = {"redis8": {1: [1], 2: [2], 4: [4, 3], 8: [8, 7]},
               "valkey": {1: [1], 2: [2], 4: [4, 3], 8: [8, 6]}}
-WORKLOADS = [("GET", "0:1", 1, False), ("SET", "1:0", 1, False),
-             ("GET", "0:1", 16, False), ("SET", "1:0", 16, False),
-             ("SET", "1:0", 16, True)]     # with the AOF on, everysec
+# Operation, pipeline, connections, requests, AOF on (everysec)
+WORKLOADS = [("GET", 1, 400, 300000, False), ("GET", 16, 1600, 3000000, False),
+             ("SET", 16, 1600, 3000000, False), ("SET", 16, 1600, 3000000, True)]
 
 
 class Paths:
@@ -60,7 +68,7 @@ class Paths:
         self.redis8 = tools / "redis-src/8.10.3/src/redis-server"
         self.valkey = tools / "valkey-src/8.1.11/src/valkey-server"
         self.redis7 = pathlib.Path("/usr/bin/redis-server")
-        self.memtier = tools / "memtier/install/bin/memtier_benchmark"
+        self.benchmark = pathlib.Path("/usr/bin/redis-benchmark")
 
 
 def configs():
@@ -162,36 +170,37 @@ class Servers:
         self.tmp.cleanup()
 
 
-def memtier(paths, port, keys, *args):
-    return subprocess.Popen(["taskset", "-c", CLIENT_CPUS, str(paths.memtier), "-s", "127.0.0.1", "-p", str(port),
-                             "--hide-histogram", "-d", str(VALUE_SIZE), f"--key-maximum={keys}", *args],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def benchmark(paths, port, op, pipeline, connections, requests, keys, threads):
+    return subprocess.Popen(["taskset", "-c", CLIENT_CPUS, str(paths.benchmark), "-p", str(port), "-t", op.lower(),
+                             "-P", str(pipeline), "-c", str(connections), "--threads", str(threads), "-n", str(requests),
+                             "-r", str(keys), "-d", str(VALUE_SIZE), "--csv"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
 
-def totals(output):
-    lines = [l for l in output.replace("\r", "\n").split("\n") if l.startswith("Totals")]
-    if not lines:
-        raise RuntimeError("memtier printed no totals: " + output[-300:])
-    return float(lines[-1].split()[1])
+def requests_per_second(process):
+    output, _ = process.communicate(timeout=240)
+    rows = list(csv.reader(io.StringIO(output)))
+    if not rows:
+        raise RuntimeError("redis-benchmark printed nothing")
+    return float(rows[-1][1])
 
 
-def peak_cell(paths, config, workload, seconds):
-    _, ratio, pipeline, aof = workload
+def peak_cell(paths, config, workload, scale):
+    op, pipeline, connections, requests, aof = workload
+    requests //= scale
     servers = Servers(paths, config, aof)
     try:
         count = len(servers.ports)
         keys = KEYS // count
-        for fill in [memtier(paths, port, keys, "-t", "1", "-c", "1", "--pipeline=64", "--ratio=1:0", "--key-pattern=P:P",
-                             "-n", "allkeys") for port in servers.ports]:
-            fill.communicate(timeout=120)
-        cpu_before = servers.cpu_seconds()
-        # 48 connections in all, whatever the number of instances
         threads = max(1, 8 // count)
-        runs = [memtier(paths, port, keys, "-t", str(threads), "-c", "6", f"--pipeline={pipeline}", f"--ratio={ratio}",
-                        "--key-pattern=R:R", f"--test-time={seconds}", "--distinct-client-seed") for port in servers.ports]
-        ops = sum(totals(run.communicate(timeout=seconds + 60)[0]) for run in runs)
+        for fill in [benchmark(paths, port, "SET", 16, max(1, 48 // count), 300000 // scale // count, keys, threads) for port in servers.ports]:
+            requests_per_second(fill)
+        cpu_before = servers.cpu_seconds()
+        # The same connections and requests in all, whatever the number of instances
+        runs = [benchmark(paths, port, op, pipeline, connections // count, requests // count, keys, threads) for port in servers.ports]
+        ops = sum(requests_per_second(run) for run in runs)
         cpu = servers.cpu_seconds() - cpu_before
-        return {"ops": ops, "cpu_us_per_op": cpu * 1e6 / (ops * seconds) if ops else None}
+        return {"ops": ops, "cpu_us_per_op": cpu * 1e6 / requests}
     finally:
         servers.stop()
 
@@ -202,7 +211,7 @@ def open_loop(paths, config, rate, seconds, out):
         json_path = out / f"open-{config[0]}-{config[1]}-{config[2]}-{rate}.json"
         ports = ",".join(str(p) for p in servers.ports)
         done = subprocess.run(["taskset", "-c", CLIENT_CPUS, str(paths.loadgen), "--ports", ports, "--rate", str(rate),
-                               "--connections", "32", "--threads", "2", "--duration", str(seconds), "--warmup", "2",
+                               "--connections", "64", "--threads", "2", "--duration", str(seconds), "--warmup", "2",
                                "--keyspace", str(KEYS), "--set-ratio", "0.1", "--json", str(json_path)],
                               capture_output=True, text=True, timeout=seconds + 120)
         return done.stdout
@@ -214,7 +223,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--seconds", type=int, default=8)
     parser.add_argument("--builds", default=str(HOME / "mr-dev/quiet-builds"))
     parser.add_argument("--tools", default=str(HOME / "mr-dev"))
     parser.add_argument("--trial", action="store_true", help="one of everything, briefly, to check that it all runs")
@@ -225,15 +233,16 @@ def main():
 
     chosen = configs()
     workloads = WORKLOADS
+    scale = 1
     if args.trial:
-        args.rounds, args.seconds = 1, 2
+        args.rounds, scale = 1, 10
         wanted = {("kosh", 4, 0), ("locked", 2, 0), ("redis8", 4, 3), ("valkey", 4, 3), ("nredis", 2, 0), ("kosh-main", 1, 0), ("redis7", 1, 0)}
         chosen = [c for c in chosen if c in wanted]
-        workloads = [WORKLOADS[0], WORKLOADS[4]]
+        workloads = [WORKLOADS[0], WORKLOADS[3]]
 
     cells = [(config, workload) for config in chosen for workload in workloads
-             if not (config[0] == "locked" and workload[3])]        # the locked map is compared with the AOF off
-    print(f"{len(cells)} cells, {args.rounds} rounds, {args.seconds} s each", flush=True)
+             if not (config[0] == "locked" and workload[4])]        # the locked map is compared with the AOF off
+    print(f"{len(cells)} cells, {args.rounds} rounds", flush=True)
     print("load before:", open("/proc/loadavg").read().strip(), flush=True)
     raw = open(out / "peak.jsonl", "w")
     results = {}
@@ -241,21 +250,21 @@ def main():
         shift = round_ * 7 % len(cells)
         for config, workload in cells[shift:] + cells[:shift]:
             try:
-                cell = peak_cell(paths, config, workload, args.seconds)
+                cell = peak_cell(paths, config, workload, scale)
             except Exception as error:      # one failure mustn't cost the session
                 print(f"FAILED {label(config)} {workload}: {error}", flush=True)
-                raw.write(json.dumps({"round": round_, "config": config, "workload": workload[:3], "aof": workload[3], "error": str(error)}) + "\n")
+                raw.write(json.dumps({"round": round_, "config": config, "workload": workload[:3], "aof": workload[4], "error": str(error)}) + "\n")
                 raw.flush()
                 continue
             results.setdefault((config, workload), []).append(cell["ops"])
-            raw.write(json.dumps({"round": round_, "config": config, "workload": workload[:3], "aof": workload[3], **cell}) + "\n")
+            raw.write(json.dumps({"round": round_, "config": config, "workload": workload[:3], "aof": workload[4], **cell}) + "\n")
             raw.flush()
-            print(f"round {round_} {label(config)}: {workload[0]} P={workload[2]} aof={workload[3]}: {cell['ops']:,.0f}", flush=True)
+            print(f"round {round_} {label(config)}: {workload[0]} P={workload[1]} aof={workload[4]}: {cell['ops']:,.0f}", flush=True)
 
     print("\nmedian ops/s (fastest - slowest)", flush=True)
     lines = []
     for (config, workload), values in results.items():
-        lines.append(f"{label(config):32} {workload[0]} P={workload[2]:<2} aof={'on ' if workload[3] else 'off'}: "
+        lines.append(f"{label(config):32} {workload[0]} P={workload[1]:<2} aof={'on ' if workload[4] else 'off'}: "
                      f"{statistics.median(values):>10,.0f}  ({min(values):,.0f} - {max(values):,.0f})")
     (out / "peak-summary.txt").write_text("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)
@@ -266,7 +275,7 @@ def main():
     with open(out / "open-loop.txt", "w") as text:
         for config in latency_configs:
             values = results.get((config, WORKLOADS[0]))
-            peak = statistics.median(values) if values else 100000
+            peak = statistics.median(values) if values else 40000
             for rate in (20000, int(peak * 0.5), int(peak * 0.9)):
                 header = f"\n### {label(config)}: {rate} req/s (peak {peak:,.0f})\n"
                 try:
