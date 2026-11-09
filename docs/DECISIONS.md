@@ -183,7 +183,7 @@ The server is single-threaded, so such a `SET` makes every client wait: about 80
 
 **First solution (Phase 4):** The table was sized for `--maxkeys` at startup (`reserve()`), as low-latency systems preallocate, so it never rehashed while serving: the slowest insert dropped to 0.15–0.33 ms. The cost was 8 bytes of buckets per key of capacity, up front, and a cap (4,194,304 keys), beyond which the stall came back.
 
-**Solution now (Phase 4B):** a hash table of its own, [`KeyTable.h`](../KeyTable.h), that grows incrementally, as Redis's dict does: it allocates a table twice the size and moves one bucket chain per insert or erase, and lookups check both tables meanwhile. Nothing is sized up front and there is no cap. Growing to 1,000,000 keys, the slowest insert took 272–405 µs, at scattered positions ([results](../bench/results/after-memory-fixes/insert-latency.md)). Getting there took a second hunt: Challenge 15.
+**Solution now (Phase 4B):** a hash table of its own, [`KeyTable.h`](../src/KeyTable.h), that grows incrementally, as Redis's dict does: it allocates a table twice the size and moves one bucket chain per insert or erase, and lookups check both tables meanwhile. Nothing is sized up front and there is no cap. Growing to 1,000,000 keys, the slowest insert took 272–405 µs, at scattered positions ([results](../bench/results/after-memory-fixes/insert-latency.md)). Getting there took a second hunt: Challenge 15.
 
 ### Challenge 14: A Test That Failed Once in Eight Runs
 

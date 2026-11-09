@@ -131,11 +131,11 @@ jobs:
       - name: clang-tidy
         run: |
           cmake -B build -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          run-clang-tidy-18 -quiet -p build -clang-tidy-binary clang-tidy-18 "^$PWD/[A-Za-z_]+\.cpp\$"
+          run-clang-tidy-18 -quiet -p build -clang-tidy-binary clang-tidy-18 "^$PWD/src/[A-Za-z_]+\.cpp\$"
       - name: cppcheck
         run: |
           cppcheck --std=c++17 --language=c++ --enable=warning,performance,portability \
-                   --inline-suppr --error-exitcode=1 -q -D__linux__ -U_WIN32 ./*.cpp
+                   --inline-suppr --error-exitcode=1 -q -D__linux__ -U_WIN32 src/*.cpp
 
   fuzz:
     name: Fuzz (libFuzzer, ASan + UBSan) and corpus coverage
@@ -173,7 +173,7 @@ jobs:
           cmake --build cov -j --target fuzz_commands
           LLVM_PROFILE_FILE=cov.profraw cov/fuzz_commands tests/fuzz/corpus found
           "$llvm/llvm-profdata" merge -o cov.profdata cov.profraw
-          sources=(RespParser.h Commands.cpp Integer.h InMemoryStorage.cpp KeyTable.h)
+          sources=(src/RespParser.h src/Commands.cpp src/Integer.h src/InMemoryStorage.cpp src/KeyTable.h)
           "$llvm/llvm-cov" report cov/fuzz_commands -instr-profile=cov.profdata "${sources[@]}" | tee coverage.txt
           "$llvm/llvm-cov" show cov/fuzz_commands -instr-profile=cov.profdata -format=html \
                            -output-dir=coverage-html "${sources[@]}"

@@ -15,8 +15,8 @@
 // With either fence in Wakeup.h removed, this reported lost wakeups on x86
 // within 100,000 messages, because a load can overtake an earlier store there.
 
-#include "../SpscRing.h"
-#include "../Wakeup.h"
+#include "../src/SpscRing.h"
+#include "../src/Wakeup.h"
 
 #include <poll.h>
 

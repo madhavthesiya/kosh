@@ -19,16 +19,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
-#include "../Poller.h"
-#include "../KeyTable.h"
-#include "../SipHash.h"
-#include "../InMemoryStorage.h"
-#include "../RedisLite.h"
-#include "../RespParser.h"
-#include "../Commands.h"
-#include "../Integer.h"
-#include "../Glob.h"
-#include "../Version.h"
+#include "../src/Poller.h"
+#include "../src/KeyTable.h"
+#include "../src/SipHash.h"
+#include "../src/InMemoryStorage.h"
+#include "../src/RedisLite.h"
+#include "../src/RespParser.h"
+#include "../src/Commands.h"
+#include "../src/Integer.h"
+#include "../src/Glob.h"
+#include "../src/Version.h"
 
 int passed = 0;
 int failed = 0;

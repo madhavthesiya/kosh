@@ -10,6 +10,11 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 
 ## [Unreleased]
 
+### Changed
+
+- The source files moved from the repository's root to `src/`. The code
+  itself didn't change.
+
 ## [4.0.0] - 2026-11-09
 
 A new major version because the server's design changed: it can now run on

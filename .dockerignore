@@ -2,7 +2,6 @@
 # password file or AOF) stays out of the build context.
 *
 !CMakeLists.txt
-!*.cpp
-!*.h
+!src/
 !bench/*.cpp
 !tests/

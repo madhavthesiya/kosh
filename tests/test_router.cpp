@@ -1,8 +1,8 @@
 // Router: which shard owns a key, and the command table's record of where keys are.
 
-#include "../AofManifest.h"
-#include "../Commands.h"
-#include "../Router.h"
+#include "../src/AofManifest.h"
+#include "../src/Commands.h"
+#include "../src/Router.h"
 
 #include <iostream>
 #include <set>

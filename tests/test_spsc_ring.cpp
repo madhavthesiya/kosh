@@ -7,7 +7,7 @@
 // pointers to data the producer wrote without any atomics, so if the ring's
 // ordering didn't carry that data across, TSan reports a race on it.
 
-#include "../SpscRing.h"
+#include "../src/SpscRing.h"
 
 #include <cstdint>
 #include <deque>

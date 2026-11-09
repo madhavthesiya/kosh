@@ -35,7 +35,7 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](../tests/compat/co
 
 Every failure was checked. All but 13 test commands Kosh doesn't have (sorted sets, streams, Pub/Sub, `KEYS`, `RENAME` and more). The 13 that test a command Kosh has use an option it doesn't support (`EXPIRE`/`PEXPIRE`/`PEXPIREAT` with `NX`/`XX`/`GT`/`LT`; `SET` with `NX`/`XX`/`GET`/`KEEPTTL`; `LPOP`/`RPOP` with a count), or set up their key with a missing command (`scan with TYPE` starts with `GEOADD`). All are listed under Known Limitations.
 
-**Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](../Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
+**Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](../src/Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
 
 **Client libraries**, tested through their own APIs ([`tests/integration/test_clients.py`](../tests/integration/test_clients.py)):
 

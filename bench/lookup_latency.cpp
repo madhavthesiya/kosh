@@ -27,8 +27,8 @@
 // measurements of both are interleaved within each repeat, so they compare
 // in the same binary, at the same moment.
 
-#include "../InMemoryStorage.h"
-#include "../KeyTable.h"
+#include "../src/InMemoryStorage.h"
+#include "../src/KeyTable.h"
 
 #include <algorithm>
 #include <chrono>

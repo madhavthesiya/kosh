@@ -32,7 +32,7 @@ from pathlib import Path
 
 import benchlib as bl
 
-SOURCES = ["bench/lookup_latency.cpp", "InMemoryStorage.cpp", "AOFLogger.cpp"]
+SOURCES = ["bench/lookup_latency.cpp", "src/InMemoryStorage.cpp", "src/AOFLogger.cpp"]
 FLAGS = ["-std=c++17", "-O2", "-g", "-DNDEBUG", "-pthread"]
 
 

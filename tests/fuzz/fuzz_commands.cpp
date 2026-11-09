@@ -23,9 +23,9 @@
 // clock (TTL), so comparing replies would flag time, not bugs. The two-read
 // pass takes AUTH's and QUIT's effects from it, in order.
 
-#include "../../Commands.h"
-#include "../../InMemoryStorage.h"
-#include "../../RespParser.h"
+#include "../../src/Commands.h"
+#include "../../src/InMemoryStorage.h"
+#include "../../src/RespParser.h"
 
 #include <cstdint>
 #include <cstdio>

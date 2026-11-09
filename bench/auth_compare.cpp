@@ -14,7 +14,7 @@
 // Build: cmake --build build --target auth_compare
 // Run:   taskset -c 2 ./build/auth_compare [--length N] [--calls N] [--rounds R]
 
-#include "../Commands.h"
+#include "../src/Commands.h"
 
 #include <algorithm>
 #include <chrono>

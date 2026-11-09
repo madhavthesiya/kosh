@@ -10,10 +10,10 @@
 // Build: cmake --build build-bench --target alloc_count
 // Run:   ./build-bench/alloc_count
 
-#include "../AOFLogger.h"
-#include "../Commands.h"
-#include "../InMemoryStorage.h"
-#include "../RespParser.h"
+#include "../src/AOFLogger.h"
+#include "../src/Commands.h"
+#include "../src/InMemoryStorage.h"
+#include "../src/RespParser.h"
 
 #include <cstdio>
 #include <cstdlib>
