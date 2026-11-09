@@ -1,6 +1,26 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <a href="RUNNING.md">Running</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <a href="COMMANDS.md">Commands</a> &nbsp;·&nbsp;
+  <a href="COMPATIBILITY.md">Compatibility</a> &nbsp;·&nbsp;
+  <a href="TESTING.md">Testing</a> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <b>History</b>
+</p>
+
 # From Mini-Redis to Kosh
 
 How the project grew, stage by stage. Every number links to or comes from the results kept in [`bench/results`](../bench/results). Releases are in the [changelog](../CHANGELOG.md), and the reasoning behind each change is in [Decisions](DECISIONS.md).
+
+**On this page:** [The original Mini-Redis](#the-original-mini-redis) &nbsp;·&nbsp; [The hardening](#the-hardening) &nbsp;·&nbsp; [What was left out on purpose](#what-was-left-out-on-purpose)
 
 ## The original Mini-Redis
 
@@ -41,3 +61,9 @@ From October 2026 the project went through a plan with one rule: nothing is clai
 - Cross-thread atomic transactions, and changing the thread count between restarts.
 
 The [known limitations](COMPATIBILITY.md#known-limitations) list what is missing and what a fix would take.
+
+<br>
+
+<p align="center">
+  <sub><a href="BENCHMARKS.md">← Benchmarks</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="../README.md">Kosh →</a></sub>
+</p>

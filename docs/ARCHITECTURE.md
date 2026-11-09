@@ -1,36 +1,37 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <a href="RUNNING.md">Running</a> &nbsp;·&nbsp;
+  <b>Architecture</b> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <a href="COMMANDS.md">Commands</a> &nbsp;·&nbsp;
+  <a href="COMPATIBILITY.md">Compatibility</a> &nbsp;·&nbsp;
+  <a href="TESTING.md">Testing</a> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="HISTORY.md">History</a>
+</p>
+
 # Architecture
 
 How Kosh is built: the layers, the event loop, the AOF, the key table, and several threads.
 
-## Architecture
+**On this page:** [The layers](#the-layers) &nbsp;·&nbsp; [Layered design](#layered-design) &nbsp;·&nbsp; [Core features](#core-features) &nbsp;·&nbsp; [TCP server with RESP protocol](#1-tcp-server-with-resp-protocol) &nbsp;·&nbsp; [Event loop with non-blocking I/O](#2-event-loop-with-non-blocking-io) &nbsp;·&nbsp; [AOF persistence](#3-aof-persistence) &nbsp;·&nbsp; [The key table and eviction](#4-the-key-table-and-eviction) &nbsp;·&nbsp; [Thread safety](#5-thread-safety) &nbsp;·&nbsp; [Several threads](#several-threads)
 
-```mermaid
-flowchart TD
-    Client1["redis-cli / Client 1"]
-    Client2["redis-cli / Client 2"]
-    Client3["redis-cli / Client N"]
+## The layers
 
-    Server["TCP Server\n<i>epoll event loop</i>\nI/O multiplexing · RESP protocol"]
-    Storage["InMemoryStorage\n<i>KeyTable · std::variant · shared_mutex</i>\nSIEVE / LRU · TTL · Type dispatch"]
-    AOF["AOFLogger\n<i>Binary RESP format</i>\nAppend-only file"]
-
-    Client1 --> Server
-    Client2 --> Server
-    Client3 --> Server
-    Server --> Storage
-    Storage --> AOF
-
-    style Client1 fill:#3b82f6,color:#fff,stroke:none
-    style Client2 fill:#3b82f6,color:#fff,stroke:none
-    style Client3 fill:#3b82f6,color:#fff,stroke:none
-    style Server fill:#6366f1,color:#fff,stroke:none
-    style Storage fill:#8b5cf6,color:#fff,stroke:none
-    style AOF fill:#a855f7,color:#fff,stroke:none
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/request-path-dark.svg">
+  <img alt="A request goes from the client through the event loop, RESP parser, command table and storage engine to the AOF logger. Replies leave only after the records are with the OS." src="assets/request-path-light.svg" width="100%">
+</picture>
 
 **An event loop per thread.** By default there is one: it waits on all sockets, with `epoll` on Linux (`select()` elsewhere), and runs each command to completion, so commands never race each other. Sockets are non-blocking, so the thread never waits on any one client. Redis's main thread uses the same model. With `--threads N` there is one per thread, each owning a share of the keys: see [Several threads](#several-threads).
 
-### Layered Design
+### Layered design
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
@@ -46,18 +47,17 @@ flowchart TD
 | **Threads** | `SpscRing.h`, `Wakeup.h`, `Router.h` | The queue between two threads, waking a sleeping one, which thread owns a key |
 | **Entry points** | `server_main.cpp`, `main.cpp` | Server (command-line flags) and interactive CLI |
 
+## Core features
 
-## Core Features
-
-### 1. TCP Server with RESP Protocol
+### 1. TCP server with RESP protocol
 
 Works with `redis-cli` and `redis-benchmark`: it answers the `COMMAND`, `CLIENT` and `CONFIG GET` calls they make at startup. It supports:
-- **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`) — binary-safe, length-prefixed
-- **Inline commands** (`PING\r\n`) — for telnet/debugging
-- **Per-client receive buffers** — handles TCP stream reassembly correctly
-- **Pipelining** — runs every complete command found in each read, and sends all their replies with one `send()`
-- **Protocol errors** — malformed input gets `-ERR Protocol error: …` and the connection is closed, as in Redis. Limits from Redis's defaults: bulk strings up to 512 MB, inline commands up to 64 KB, 1 GB of unfinished input per client
-- **`TCP_NODELAY`** — disables Nagle's algorithm, so small replies aren't held back to be batched
+- **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`): binary-safe, length-prefixed
+- **Inline commands** (`PING\r\n`): for telnet and debugging
+- **Per-client receive buffers:** handles TCP stream reassembly correctly
+- **Pipelining:** runs every complete command found in each read, and sends all their replies with one `send()`
+- **Protocol errors:** malformed input gets `-ERR Protocol error: …` and the connection is closed, as in Redis. Limits from Redis's defaults: bulk strings up to 512 MB, inline commands up to 64 KB, 1 GB of unfinished input per client
+- **`TCP_NODELAY`:** disables Nagle's algorithm, so small replies aren't held back to be batched
 
 ```bash
 # Connect with redis-cli
@@ -68,7 +68,7 @@ OK
 "hello world"
 ```
 
-### 2. Event Loop with Non-Blocking I/O
+### 2. Event loop with non-blocking I/O
 
 ```
 Before: accept() → handle client → BLOCKS → accept() next
@@ -88,7 +88,7 @@ After:  wait until some sockets are ready → handle those, never waiting on any
 - **Clean shutdown:** Ctrl+C or `SIGTERM` sets an atomic flag, the loop stops, connections and the AOF are closed, and the process exits with code 0.
 - **SIGPIPE ignored (Linux/macOS):** a client that disconnects early can't kill the server. Writes to it fail with `EPIPE` instead (see Challenge 7).
 
-### 3. AOF Persistence
+### 3. AOF persistence
 
 Every write command is appended to `appendonly.aof` in **binary RESP format**:
 
@@ -102,41 +102,22 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 |---------|---------|
 | Durability | Every write command's record reaches the OS before its reply is sent, so it survives a crash of the process. When it reaches the disk, which is what survives a power cut, is set by `--appendfsync`, as in Redis: `always` (synced before the reply), `everysec` (by a background thread once a second; the default) or `no` (when the OS decides). |
 | Group commit | The records of every command in one pass of the event loop go out in one `write()`, and with `always` one `fdatasync()`. Measured with `strace`: 100,000 pipelined `SET`s took 132 `write()` calls, where they took 100,002; with `always`, one sync covers about 390 `SET`s at pipeline 16 and 25 without pipelining. |
-| Binary safety | RESP format — spaces, newlines, any byte in values |
+| Binary safety | RESP format: spaces, newlines, any byte in values |
 | Expiry times | Logged as absolute Unix times in milliseconds (`SET … PXAT`, `PEXPIREAT`), as Redis does, so a key that expired while the server was down stays expired. AOFs with the older `SETEX`/`EXPIRE` records still load. |
 | Removals | Every key the server removes on its own, by eviction or because it expired, is logged as a `DEL`. Replay then rebuilds exactly the keys, values and TTLs the server held (see Challenge 11). The eviction order isn't rebuilt from the log: reads aren't logged. |
 | One record per command | `MSET` and a `DEL` of several keys are each one record, so a crash mid-write leaves all of the command or none of it, as Redis's AOF does. `MSET` makes room for its keys after its record, so the evictions' `DEL`s come after it in the file, in the order replay reads them. `INCR`, `DECR` and `DECRBY` are logged as `INCRBY` with the delta: the operation, as Redis logs it, which leaves the TTL's own record as it was. |
 | Replay on startup | Each record runs through the same command table as client commands. While loading, nothing expires, nothing is evicted and nothing is logged; afterwards, keys beyond `--maxkeys` are evicted, and those evictions are logged. Takes time linear in the file size. |
 | Damaged file | An incomplete last record, or a transaction without its `EXEC`, left by a crash mid-write, is cut off with a warning, as Redis's `aof-load-truncated` does. Damage before the end stops startup with the byte offset of the damage and the `truncate` command that keeps everything before it. |
 | Failed writes | If a write fails (a full disk), the bytes not written wait in memory, in order, and are written once the file takes them. Meanwhile, write commands get `-MISCONF Errors writing to the AOF file: …` and reads keep working, as in Redis; a failed `everysec` sync does the same. With `always`, a failed write or sync can no longer be made good, so the server sends none of the waiting replies and stops with exit code 1, as Redis does. |
-| Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. It writes the keys oldest first, so loading the new file rebuilds the eviction order. Despite the name, it runs in the foreground; see [Known Limitations](COMPATIBILITY.md#known-limitations). |
+| Compaction | `BGREWRITEAOF` writes the data to a temporary file, `fsync`s it, renames it over the AOF and `fsync`s the directory, so a crash at any point leaves a complete AOF. It writes the keys oldest first, so loading the new file rebuilds the eviction order. Despite the name, it runs in the foreground; see [Known limitations](COMPATIBILITY.md#known-limitations). |
 | Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file; `--appendfsync` the sync policy |
 
-### 4. The Key Table and Eviction
+### 4. The key table and eviction
 
-```mermaid
-graph LR
-    subgraph Table["KeyTable: buckets of one 64-byte cache line"]
-        B["metadata · 7 hash tags · 7 entry pointers"]
-    end
-
-    subgraph Entry["One allocation per key"]
-        V["CacheEntry: value · expiry · newer/older links · flags"]
-        K["the key's bytes"]
-    end
-
-    subgraph Queue["Eviction queue, through the entries"]
-        N["newest"] --> M["..."] --> O["oldest"]
-    end
-
-    B --> V
-    V --- K
-    V -.->|links| Queue
-
-    style Table fill:#1e293b,color:#e2e8f0,stroke:#334155
-    style Entry fill:#1e293b,color:#e2e8f0,stroke:#334155
-    style Queue fill:#1e293b,color:#e2e8f0,stroke:#334155
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/key-table-dark.svg">
+  <img alt="A key table bucket holds a metadata byte, seven one-byte tags and seven pointers. Each pointer leads to one allocation holding the value, expiry, eviction links, flags and the key's bytes. The eviction queue runs through those entries." src="assets/key-table-light.svg" width="100%">
+</picture>
 
 **The key table** (`KeyTable.h`, after Valkey 8.1's design):
 - **A bucket is one 64-byte cache line:** a metadata byte, a one-byte hash tag per slot, and 7 pointers to entries.
@@ -148,12 +129,12 @@ graph LR
   - Nothing is sized up front, and no insert moves every key: growing to 1,000,000 keys, the slowest insert took 272–405 µs (Challenge 13).
   - Big tables are mapped from the OS, the old one is given back as the rehash goes, and freed child buckets are reused (Challenge 15).
 - **Entries never move:** the table holds pointers, so the eviction queue and the expiry index can point at entries.
-- **Keys are hashed with SipHash-1-3 under a random key per process** (`SipHash.h`), as Python and Rust's `HashMap` do (Redis uses SipHash-1-2). Clients choose the keys. With `std::hash`, whose seed is fixed, anyone can compute keys that all land in one bucket, and then every insert walks one long chain: inserting n keys costs O(n²) ("hash flooding"). [`bench/hash_flood.cpp`](../bench/hash_flood.cpp) builds such keys and measures both the attack and the keyed hash's cost ([results](../bench/results/hash-flooding/README.md)): 40,000 colliding keys, found in 32 s on one core, take 370× as long to insert with `std::hash` as with SipHash; for ordinary keys SipHash costs 7.8 ns more per hash, and 1.10–1.15× per lookup one at a time (up to 1.92× when lookups overlap, at 1M keys). End to end, in a paired session of 4 commits, [Phase 4C as a whole showed no detectable slowdown](../bench/results/phase-4c/README.md); one SET test was 7% slower after the SipHash commit, far more than the hash itself can cost (about 10 ns per SET), so that isn't claimed as its cost. The lookup times above predate the keyed hash: they were measured with `std::hash`.
+- **Keys are hashed with SipHash-1-3 under a random key per process** (`SipHash.h`), as Python and Rust's `HashMap` do (Redis uses SipHash-1-2). Clients choose the keys. With `std::hash`, whose seed is fixed, anyone can compute keys that all land in one bucket, and then every insert walks one long chain: inserting n keys costs O(n²) ("hash flooding"). [`bench/hash_flood.cpp`](../bench/hash_flood.cpp) builds such keys and measures both the attack and the keyed hash's cost ([results](../bench/results/hash-flooding/README.md)): 40,000 colliding keys, found in 32 s on one core, take 370× as long to insert with `std::hash` as with SipHash; for ordinary keys SipHash costs 7.8 ns more per hash, and 1.10–1.15× per lookup one at a time (up to 1.92× when lookups overlap, at 1M keys). End to end, in a paired session of 4 commits, [the 3.0.0 work as a whole showed no detectable slowdown](../bench/results/phase-4c/README.md); one SET test was 7% slower after the SipHash commit, far more than the hash itself can cost (about 10 ns per SET), so that isn't claimed as its cost. The lookup times above predate the keyed hash: they were measured with `std::hash`.
 
 **One allocation per key:** each key is a `CacheEntry` with the key's bytes right after it.
 - With 16-byte keys and 3-byte values, that is 113 bytes per key at 800,000 keys against Redis's 120 (resident memory).
 - At 1,000,000 keys it is 124 against 116, because the table is in the middle of growing there.
-- Before Phase 4B it was 312: four allocations per key, with the key stored twice.
+- Before the memory work (`v2.5-memory`) it was 312: four allocations per key, with the key stored twice.
 
 **Eviction: SIEVE by default, LRU on request** (`--eviction sieve|lru`):
 - Capacity is set with `--maxkeys` (default 10,000). The eviction queue runs through the entries themselves (an intrusive list), newest at the front.
@@ -171,9 +152,9 @@ graph LR
   - When a new key needs room, expired keys are removed from the front of the index first, and a live key is evicted only when none is left.
   - Only as many are removed as are needed, so one insert never sweeps a large backlog.
 
-### 5. Thread Safety
+### 5. Thread safety
 
-`std::shared_mutex` (reader-writer lock) — concurrent reads, exclusive writes.
+`std::shared_mutex` (reader-writer lock): concurrent reads, exclusive writes.
 
 | Method | Lock Type | Why |
 |--------|-----------|-----|
@@ -187,8 +168,12 @@ graph LR
 
 Neither mode of the server contends for this lock: with one thread there is no one to contend with, and with several each thread has its own storage. It exists so the storage engine is safe to use from several threads directly, which the stress tests do.
 
-
 ## Several threads
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/threads-dark.svg">
+  <img alt="Clients connect to one of N threads. Each thread owns its keys and its AOF file, and threads exchange batches through lock-free rings." src="assets/threads-light.svg" width="100%">
+</picture>
 
 With `--threads N` (Linux, `epoll`), each thread has its own event loop, its own key table, its own eviction queue and its own AOF file. No thread touches another's keys. With one thread, the default, none of the machinery below is used.
 
@@ -209,3 +194,9 @@ With `--threads N` (Linux, `epoll`), each thread has its own event loop, its own
 **The AOF.** One file per thread (`<aof>.shard-i`), because one shared file would make every thread queue on one lock. A thread writes its file before it publishes the replies to the commands it ran, so a reply still means what it means with one thread. `<aof>.manifest` holds the thread count and the routing key. It is written last and atomically, so a manifest means every file exists, and a missing file is lost data. Replay checks that each key belongs to its file. The thread count can't change between restarts: a key's thread depends on it, and moving keys between files would need a rewrite of all of them.
 
 Measured against Redis 8, Valkey 8.1 and N Redis processes in [`bench/results/shard-per-core`](../bench/results/shard-per-core/README.md).
+
+<br>
+
+<p align="center">
+  <sub><a href="RUNNING.md">← Running</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="DECISIONS.md">Decisions →</a></sub>
+</p>

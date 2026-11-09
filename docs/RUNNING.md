@@ -1,8 +1,28 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <b>Running</b> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <a href="COMMANDS.md">Commands</a> &nbsp;·&nbsp;
+  <a href="COMPATIBILITY.md">Compatibility</a> &nbsp;·&nbsp;
+  <a href="TESTING.md">Testing</a> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="HISTORY.md">History</a>
+</p>
+
 # Running it
 
 Building Kosh, its options, passwords and Docker.
 
-## Build & Run
+**On this page:** [Build and run](#build-and-run) &nbsp;·&nbsp; [Build and test (CMake)](#build-and-test-cmake) &nbsp;·&nbsp; [Run the server](#run-the-server) &nbsp;·&nbsp; [Run with Docker](#run-with-docker) &nbsp;·&nbsp; [Sanitizers (GCC/Clang)](#sanitizers-gccclang) &nbsp;·&nbsp; [Interactive CLI](#interactive-cli) &nbsp;·&nbsp; [Without CMake](#without-cmake) &nbsp;·&nbsp; [Project structure](#project-structure)
+
+## Build and run
 
 **Prerequisites:**
 - A C++17 compiler with `<charconv>`, e.g. GCC 8 or newer. Tested with GCC 13 on Ubuntu 24.04.
@@ -74,7 +94,6 @@ docker run -d --name kosh -v kosh-data:/data -p 6379:6379 \
 
 The password file must be readable by uid 65532.
 
-
 ### Sanitizers (GCC/Clang)
 
 ```bash
@@ -89,6 +108,7 @@ cmake --build build-tsan -j --target test_threads
 setarch "$(uname -m)" -R ./build-tsan/test_threads
 ```
 
+> [!NOTE]
 > GCC 13's ThreadSanitizer stops with `unexpected memory mapping` on Linux kernels with high address-space randomisation (e.g. Ubuntu 24.04, WSL2). `setarch -R` disables randomisation for that one process.
 
 ### Interactive CLI
@@ -109,15 +129,14 @@ g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp src/InMemoryStorage.cpp
 
 On Windows (MinGW), add `-lws2_32` to the server and unit-test commands for Winsock.
 
-
-## Project Structure
+## Project structure
 
 ```
 kosh/
 ├── src/                          # The server and the CLI
 │   ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 │   ├── main.cpp                  # CLI entry point (interactive mode)
-│   ├── Server.h / .cpp           # TCP server — listening socket, accepting clients, start and stop
+│   ├── Server.h / .cpp           # TCP server: listening socket, accepting clients, start and stop
 │   ├── EventLoop.h / .cpp        # One thread's event loop, per-client buffers, RESP I/O, forwarding
 │   ├── SpscRing.h                # The queue between two threads
 │   ├── Wakeup.h                  # Waking a thread that may be asleep
@@ -126,13 +145,13 @@ kosh/
 │   ├── Poller.h / .cpp           # Readiness interface: epoll (Linux) and select()
 │   ├── Socket.h                  # Winsock / BSD socket differences (header-only)
 │   ├── RespParser.h              # RESP protocol parser + serializer (header-only)
-│   ├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
-│   ├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
+│   ├── Commands.h / .cpp         # Command table: dispatch for the server and AOF replay
+│   ├── RedisLite.h / .cpp        # Controller: input validation, command routing (CLI)
 │   ├── StorageInterface.h        # Abstract interface (pure virtual base class)
-│   ├── InMemoryStorage.h / .cpp  # Storage engine — entries, eviction (SIEVE/LRU), TTL, variant types, AOF
-│   ├── KeyTable.h                # Hash table — cache-line buckets, incremental rehashing (header-only)
+│   ├── InMemoryStorage.h / .cpp  # Storage engine: entries, eviction (SIEVE/LRU), TTL, variant types, AOF
+│   ├── KeyTable.h                # Hash table: cache-line buckets, incremental rehashing (header-only)
 │   ├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
-│   ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
+│   ├── AOFLogger.h / .cpp        # Append-only file: appends, crash-safe rewrite, failed writes
 │   ├── Result.h                  # Result type with error codes
 │   ├── Integer.h                 # Integers as Redis reads them (arguments, and INCR's values)
 │   ├── Glob.h                    # Redis's glob patterns, for SCAN's MATCH (header-only)
@@ -165,3 +184,9 @@ kosh/
     └── windows/
         └── port_test.ps1          # How the server takes its port, run on Windows
 ```
+
+<br>
+
+<p align="center">
+  <sub><a href="../README.md">← Kosh</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="ARCHITECTURE.md">Architecture →</a></sub>
+</p>

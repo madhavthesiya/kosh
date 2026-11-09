@@ -1,10 +1,28 @@
+<p align="center">
+  <a href="../README.md"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Kosh" src="assets/logo-light.svg" height="32">
+  </picture></a>
+</p>
+
+<p align="center">
+  <a href="RUNNING.md">Running</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="DECISIONS.md">Decisions</a> &nbsp;·&nbsp;
+  <a href="COMMANDS.md">Commands</a> &nbsp;·&nbsp;
+  <b>Compatibility</b> &nbsp;·&nbsp;
+  <a href="TESTING.md">Testing</a> &nbsp;·&nbsp;
+  <a href="BENCHMARKS.md">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="HISTORY.md">History</a>
+</p>
+
 # Compatibility and limitations
 
 What Kosh does the same as Redis, measured, and what it doesn't do.
 
-## Compatibility with Redis
+**On this page:** [Compatibility with Redis](#compatibility-with-redis) &nbsp;·&nbsp; [Known limitations](#known-limitations)
 
-Run with several threads as well: at 4 threads, 169 of 170 cases are identical to Redis. Cases using `MSET`, `MULTI` or `SCAN` aren't sent to either server there, as those differ by design and depend on which thread a key lands on; [`tests/integration/test_threads.py`](../tests/integration/test_threads.py) covers them.
+## Compatibility with Redis
 
 Measured, not assumed: [`tests/compat/compare_with_redis.py`](../tests/compat/compare_with_redis.py) sends the same command sequences to Redis 7.0.15 and to Kosh, and compares the replies byte for byte. `ctest` runs it wherever `redis-server` is installed.
 
@@ -27,13 +45,15 @@ Measured, not assumed: [`tests/compat/compare_with_redis.py`](../tests/compat/co
 
 `HELLO`'s server name, version and connection id are masked before comparing: they differ by design.
 
+**At 4 threads**, 169 of 170 cases are identical to Redis. Cases using `MSET`, `MULTI` or `SCAN` aren't sent to either server there, as those differ by design and depend on which thread a key lands on; [`tests/integration/test_threads.py`](../tests/integration/test_threads.py) covers them.
+
 **Redis's whole command set**, by version: CI runs tair-opensource's [resp-compatibility](https://github.com/tair-opensource/resp-compatibility) suite (pinned at `5e90c25`) against Kosh on every push. It measures how much of each Redis version a server covers, so most of it tests commands Kosh doesn't have:
 
 | Redis version | 1.0.0 | 2.8.0 | 3.2.0 | 4.0.0 | 5.0.0 | 6.0.0 | 6.2.0 | 7.0.0 | 7.2.0 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Tests passed | 28 of 50 | 48 of 150 | 48 of 184 | 51 of 196 | 51 of 220 | 51 of 228 | 54 of 295 | 54 of 350 | 54 of 352 |
 
-Every failure was checked. All but 13 test commands Kosh doesn't have (sorted sets, streams, Pub/Sub, `KEYS`, `RENAME` and more). The 13 that test a command Kosh has use an option it doesn't support (`EXPIRE`/`PEXPIRE`/`PEXPIREAT` with `NX`/`XX`/`GT`/`LT`; `SET` with `NX`/`XX`/`GET`/`KEEPTTL`; `LPOP`/`RPOP` with a count), or set up their key with a missing command (`scan with TYPE` starts with `GEOADD`). All are listed under Known Limitations.
+Every failure was checked. All but 13 test commands Kosh doesn't have (sorted sets, streams, Pub/Sub, `KEYS`, `RENAME` and more). The 13 that test a command Kosh has use an option it doesn't support (`EXPIRE`/`PEXPIRE`/`PEXPIREAT` with `NX`/`XX`/`GT`/`LT`; `SET` with `NX`/`XX`/`GET`/`KEEPTTL`; `LPOP`/`RPOP` with a count), or set up their key with a missing command (`scan with TYPE` starts with `GEOADD`). All are listed under [Known limitations](#known-limitations).
 
 **Deep patterns:** a glob matcher recurses once per `*` it has to try, so a client's pattern of 100,000 `a*` could run a server's stack out. Upstream Redis 7.0.15's source has no limit; the Redis 7.0.15 that Ubuntu 24.04 ships carries a later fix that stops at 1,000 levels, and Kosh stops at the same depth ([`Glob.h`](../src/Glob.h)). Measured on both: `a*` × 1,001 matches a key of 1,001 `a`s, × 1,002 doesn't; the comparison above includes both.
 
@@ -41,9 +61,9 @@ Every failure was checked. All but 13 test commands Kosh doesn't have (sorted se
 
 | Client | Version | RESP2 | RESP3 | With a password |
 |---|---|:-:|:-:|:-:|
-| redis-py | 8.1.0 | ✅ | ✅ | ✅ |
-| node-redis | 6.3.1 | ✅ | ✅ | ✅ |
-| `redis-cli`, `redis-benchmark` | 7.0.15 | ✅ | — | — |
+| redis-py | 8.1.0 | Yes | Yes | Yes |
+| node-redis | 6.3.1 | Yes | Yes | Yes |
+| `redis-cli`, `redis-benchmark` | 7.0.15 | Yes | – | – |
 
 Both libraries open every connection with `HELLO 3`, and gave up on Kosh before it had one; redis-py's `pipeline()` needs `MULTI`/`EXEC`.
 
@@ -55,8 +75,7 @@ Both libraries open every connection with `HELLO 3`, and gave up on Kosh before 
 
 **Not supported yet:** `WATCH`, `KEYS`, `SSCAN`/`HSCAN`, `SELECT` (one database), sorted sets, Pub/Sub, Lua scripts, streams, IPv6, TLS. A command Kosh doesn't have gets Redis's unknown-command error.
 
-
-## Known Limitations
+## Known limitations
 
 Found while reviewing the code. Each fix starts with a test that reproduces the problem.
 
@@ -102,11 +121,8 @@ Found while reviewing the code. Each fix starts with a test that reproduces the 
 
 **Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), TLS.
 
----
+<br>
 
-<div align="center">
-
-**Made by [Madhav Thesiya](https://www.linkedin.com/in/madhavthesiya/)** — If this was useful, drop a ⭐<br>
-**© 2026 Madhav Thesiya. Released under the [MIT License](../LICENSE).**
-
-</div>
+<p align="center">
+  <sub><a href="COMMANDS.md">← Commands</a> &nbsp;&nbsp;|&nbsp;&nbsp; <a href="TESTING.md">Testing →</a></sub>
+</p>

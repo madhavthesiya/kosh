@@ -14,6 +14,8 @@ Earlier milestones were tagged by name (`v1-correct`, `v2-fast`,
 
 - The source files moved from the repository's root to `src/`. The code
   itself didn't change.
+- The README and the pages in `docs/` share one layout, with figures drawn by
+  `docs/assets/make_figures.py`. No result changed.
 
 ## [4.0.0] - 2026-11-09
 
