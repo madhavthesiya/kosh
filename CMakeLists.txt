@@ -208,6 +208,11 @@ if(Python3_FOUND)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
                          $<TARGET_FILE:kosh-server>)
         set_tests_properties(integration_tests_select PROPERTIES ENVIRONMENT "KOSH_POLLER=select")
+        # The same suite with several threads; a test that depends on one says why
+        add_test(NAME integration_tests_threads
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(integration_tests_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
         add_test(NAME shard_aof_tests
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_shard_aof.py
                          $<TARGET_FILE:kosh-server>)
@@ -223,6 +228,12 @@ if(Python3_FOUND)
     add_test(NAME client_library_tests
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
                      $<TARGET_FILE:kosh-server>)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME client_library_tests_threads
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_clients.py
+                         $<TARGET_FILE:kosh-server>)
+        set_tests_properties(client_library_tests_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
+    endif()
     # The same commands to real Redis and to Kosh, replies compared byte for
     # byte; registered only where redis-server is installed
     find_program(REDIS_SERVER redis-server)
@@ -230,6 +241,12 @@ if(Python3_FOUND)
         add_test(NAME redis_compatibility
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
                          --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME redis_compatibility_threads
+                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compat/compare_with_redis.py
+                             --kosh $<TARGET_FILE:kosh-server> --redis ${REDIS_SERVER})
+            set_tests_properties(redis_compatibility_threads PROPERTIES ENVIRONMENT "KOSH_THREADS=4")
+        endif()
     endif()
 else()
     message(STATUS "Python 3 not found: integration tests will not be registered")

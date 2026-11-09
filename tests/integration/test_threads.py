@@ -677,6 +677,46 @@ def test_keys_on_several_threads_are_refused():
     server.stop()
 
 
+# ---- Bad input
+
+# The fuzz target goes through the parser and the command table on one thread.
+# This sends such input through routing, forwarding and split commands.
+def test_garbage_and_random_commands():
+    server = Server("--threads", "4")
+    corpus = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fuzz", "corpus")
+    inputs = []
+    for name in sorted(os.listdir(corpus)):
+        with open(os.path.join(corpus, name), "rb") as f:
+            inputs.append(f.read())
+    rng = random.Random(9)
+    names = ["GET", "SET", "DEL", "EXISTS", "MGET", "MSET", "MULTI", "EXEC", "DISCARD", "SCAN", "DBSIZE", "INFO",
+             "FLUSHALL", "HELLO", "CLIENT", "AUTH", "QUIT", "PING", "LPUSH", "LRANGE", "HSET", "HGETALL", "SADD",
+             "EXPIRE", "TTL", "INCR", "BGREWRITEAOF", "NOSUCH", "COMMAND", "CONFIG"]
+    pieces = [b"", b"{", b"}", b"{}", b"{t}", b"a{b}c", b"0", b"-1", b"18446744073709551615", b"\x00\xff", b"3", b"x" * 300, b"*", b"COUNT", b"MATCH"]
+    for _ in range(400 if UNDER_TSAN else 2000):
+        commands = []
+        for _ in range(rng.randrange(1, 12)):
+            parts = [rng.choice(names).encode()] + [rng.choice(pieces) for _ in range(rng.randrange(0, 6))]
+            commands.append(encode(*parts))
+        inputs.append(b"".join(commands))
+    for index, data in enumerate(inputs):
+        client = Client(server.port)
+        try:
+            client.sock.sendall(data)
+            if index % 3 == 0:
+                client.sock.settimeout(0.02)
+                client.sock.recv(65536)
+        except OSError:
+            pass
+        client.close()
+    time.sleep(0.2)
+    check(server.process.poll() is None, "the server survived")
+    client = Client(server.port)
+    check(client.call("PING") == b"+PONG", "and still answers")
+    client.close()
+    server.stop()
+
+
 # ---- Commands that span threads
 
 def read_array_of(client, count):

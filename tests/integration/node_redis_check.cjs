@@ -42,8 +42,8 @@ async function main() {
     assert.equal(await client.set("k2", "v"), "OK");
     assert.equal(await client.exists(["t", "k2", "missing"]), 2);
     assert.equal(await client.del(["t", "k2", "missing"]), 2);
-    assert.equal(await client.mSet({ m1: "1", m2: "2" }), "OK");
-    assert.deepEqual(await client.mGet(["m1", "missing", "m2"]), ["1", null, "2"]);
+    assert.equal(await client.mSet({ "{m}1": "1", "{m}2": "2" }), "OK");
+    assert.deepEqual(await client.mGet(["{m}1", "missing", "{m}2"]), ["1", null, "2"]);
 
     // Counters
     assert.equal(await client.incr("c"), 1);
