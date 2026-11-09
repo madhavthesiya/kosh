@@ -24,6 +24,7 @@
 // Run:   ./build-bench/eviction_sim zipf:0.99 csv:twitter_cluster52.csv
 
 #include "../InMemoryStorage.h"
+#include "../Router.h"
 
 #include <algorithm>
 #include <charconv>
@@ -33,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -51,6 +53,7 @@ struct Options {
     std::string dump_trace;
     std::vector<std::string> traces;
     std::vector<EvictionPolicy> policies{EvictionPolicy::LRU};
+    std::vector<size_t> threads;    // split the capacity across this many threads; empty: one, no column
 };
 
 const char* policyName(EvictionPolicy p) {
@@ -164,8 +167,18 @@ struct SimResult {
     double ns_per_request;
 };
 
-SimResult simulate(const Trace& t, size_t capacity, EvictionPolicy policy) {
-    InMemoryStorage storage(capacity, nullptr, policy);
+// With several threads, each owns a share of the capacity and evicts on its own,
+// as the server does: a request goes to the storage of its key's thread. The
+// routing key is fixed, so that a run can be repeated exactly.
+SimResult simulate(const Trace& t, size_t capacity, EvictionPolicy policy, size_t threads) {
+    std::vector<std::unique_ptr<InMemoryStorage>> stores;
+    for(size_t i = 0; i < threads; i++) {
+        stores.push_back(std::make_unique<InMemoryStorage>(capacity / threads + (i < capacity % threads ? 1 : 0), nullptr, policy));
+    }
+    SipKey routing_key;
+    routing_key.k0 = 1;
+    routing_key.k1 = 2;
+    const Router router(threads, routing_key);
     std::string key;
     key.reserve(16);
     const std::string value = "x";
@@ -173,6 +186,7 @@ SimResult simulate(const Trace& t, size_t capacity, EvictionPolicy policy) {
     auto start = Clock::now();
     for(uint32_t id : t.ids) {
         formatKey(key, id);
+        InMemoryStorage& storage = *stores[router.shardOf(key)];
         if(!storage.readString(key, [](const std::string&) {}).success) {
             misses++;
             storage.set(key, value);
@@ -202,6 +216,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if(a == "--requests" && v)   { opt.requests = std::strtoull(v, nullptr, 10); i++; }
         else if(a == "--universe" && v)   { opt.universe = std::strtoull(v, nullptr, 10); i++; }
         else if(a == "--key-column" && v) { opt.key_column = std::atoi(v); i++; }
+        else if(a == "--threads" && v) {
+            for(double n : parseList(v)) opt.threads.push_back(static_cast<size_t>(n));
+            i++;
+        }
         else if(a == "--dump-trace" && v) { opt.dump_trace = v; i++; }
         else if(a == "--eviction" && v) {
             std::string e = v;
@@ -227,7 +245,7 @@ int main(int argc, char** argv) {
     Options opt;
     if(!parseArgs(argc, argv, opt)) {
         std::fprintf(stderr, "usage: %s [--capacities 0.001,0.01,0.1] [--requests N] [--universe N]\n"
-                             "       [--key-column N] [--dump-trace PATH] [--eviction lru|sieve|both] TRACE...\n"
+                             "       [--key-column N] [--dump-trace PATH] [--eviction lru|sieve|both] [--threads 1,2,4,8] TRACE...\n"
                              "TRACE: zipf:ALPHA | zipfscan:ALPHA | csv:PATH\n", argv[0]);
         return 2;
     }
@@ -236,8 +254,13 @@ int main(int argc, char** argv) {
     std::printf("Each request is a GET, and a miss is followed by a SET of the key. Capacity "
                 "in keys, as a fraction of the trace's distinct keys. Synthetic traces: %zu "
                 "requests over %zu keys.\n\n", opt.requests, opt.universe);
-    std::printf("| Trace | Eviction | Requests | Distinct keys | Capacity | Keys | Misses | Miss ratio | ns per request |\n");
-    std::printf("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    if(opt.threads.empty()) {
+        std::printf("| Trace | Eviction | Requests | Distinct keys | Capacity | Keys | Misses | Miss ratio | ns per request |\n");
+        std::printf("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    } else {
+        std::printf("| Trace | Eviction | Threads | Requests | Distinct keys | Capacity | Keys | Misses | Miss ratio |\n");
+        std::printf("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    }
 
     // A default-constructed ofstream converts to true, so test the option,
     // not the stream, to decide whether to write the trace
@@ -270,7 +293,16 @@ int main(int argc, char** argv) {
         for(double fraction : opt.capacities) {
             size_t capacity = std::max<size_t>(1, static_cast<size_t>(fraction * static_cast<double>(t.distinct)));
             for(EvictionPolicy policy : opt.policies) {
-                SimResult r = simulate(t, capacity, policy);
+                for(size_t threads : opt.threads) {
+                    if(threads > capacity) continue;    // as the server refuses it
+                    SimResult r = simulate(t, capacity, policy, threads);
+                    std::printf("| %s | %s | %zu | %zu | %zu | %g | %zu | %zu | %.4f |\n", t.name.c_str(), policyName(policy),
+                                threads, t.ids.size(), t.distinct, fraction, r.capacity, r.misses,
+                                static_cast<double>(r.misses) / static_cast<double>(t.ids.size()));
+                    std::fflush(stdout);
+                }
+                if(!opt.threads.empty()) continue;
+                SimResult r = simulate(t, capacity, policy, 1);
                 std::printf("| %s | %s | %zu | %zu | %g | %zu | %zu | %.4f | %.0f |\n", t.name.c_str(),
                             policyName(policy), t.ids.size(), t.distinct, fraction, r.capacity,
                             r.misses, static_cast<double>(r.misses) / static_cast<double>(t.ids.size()),
