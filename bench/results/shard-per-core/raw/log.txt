@@ -1,0 +1,469 @@
+96 cells, 3 rounds
+load before: 1.02 1.35 0.89 1/288 1522
+round 0 kosh, 1 core: GET P=1 aof=False: 132,509
+round 0 kosh, 1 core: GET P=16 aof=False: 995,025
+round 0 kosh, 1 core: SET P=16 aof=False: 584,340
+round 0 kosh, 1 core: SET P=16 aof=True: 628,009
+round 0 locked, 1 core: GET P=1 aof=False: 92,025
+round 0 locked, 1 core: GET P=16 aof=False: 796,601
+round 0 locked, 1 core: SET P=16 aof=False: 518,762
+round 0 redis8, 1 core, io-threads 1: GET P=1 aof=False: 40,750
+round 0 redis8, 1 core, io-threads 1: GET P=16 aof=False: 397,456
+round 0 redis8, 1 core, io-threads 1: SET P=16 aof=False: 384,369
+round 0 redis8, 1 core, io-threads 1: SET P=16 aof=True: 239,006
+round 0 valkey, 1 core, io-threads 1: GET P=1 aof=False: 42,295
+round 0 valkey, 1 core, io-threads 1: GET P=16 aof=False: 340,716
+round 0 valkey, 1 core, io-threads 1: SET P=16 aof=False: 278,087
+round 0 valkey, 1 core, io-threads 1: SET P=16 aof=True: 254,216
+round 0 kosh, 2 cores: GET P=1 aof=False: 51,230
+round 0 kosh, 2 cores: GET P=16 aof=False: 394,997
+round 0 kosh, 2 cores: SET P=16 aof=False: 419,287
+round 0 kosh, 2 cores: SET P=16 aof=True: 381,098
+round 0 locked, 2 cores: GET P=1 aof=False: 47,551
+round 0 locked, 2 cores: GET P=16 aof=False: 358,038
+round 0 locked, 2 cores: SET P=16 aof=False: 338,677
+round 0 redis8, 2 cores, io-threads 2: GET P=1 aof=False: 37,936
+round 0 redis8, 2 cores, io-threads 2: GET P=16 aof=False: 382,263
+round 0 redis8, 2 cores, io-threads 2: SET P=16 aof=False: 297,649
+round 0 redis8, 2 cores, io-threads 2: SET P=16 aof=True: 179,845
+round 0 valkey, 2 cores, io-threads 2: GET P=1 aof=False: 42,295
+round 0 valkey, 2 cores, io-threads 2: GET P=16 aof=False: 322,789
+round 0 valkey, 2 cores, io-threads 2: SET P=16 aof=False: 210,025
+round 0 valkey, 2 cores, io-threads 2: SET P=16 aof=True: 196,117
+round 0 nredis, 2 cores: GET P=1 aof=False: 44,996
+round 0 nredis, 2 cores: GET P=16 aof=False: 519,723
+round 0 nredis, 2 cores: SET P=16 aof=False: 477,416
+round 0 nredis, 2 cores: SET P=16 aof=True: 314,390
+round 0 kosh, 4 cores: GET P=1 aof=False: 51,751
+round 0 kosh, 4 cores: GET P=16 aof=False: 694,284
+round 0 kosh, 4 cores: SET P=16 aof=False: 508,216
+round 0 kosh, 4 cores: SET P=16 aof=True: 435,287
+round 0 locked, 4 cores: GET P=1 aof=False: 51,697
+round 0 locked, 4 cores: GET P=16 aof=False: 305,002
+round 0 locked, 4 cores: SET P=16 aof=False: 349,610
+round 0 redis8, 4 cores, io-threads 4: GET P=1 aof=False: 49,702
+round 0 redis8, 4 cores, io-threads 4: GET P=16 aof=False: 494,071
+round 0 redis8, 4 cores, io-threads 4: SET P=16 aof=False: 384,123
+round 0 redis8, 4 cores, io-threads 4: SET P=16 aof=True: 213,797
+round 0 redis8, 4 cores, io-threads 3: GET P=1 aof=False: 59,666
+round 0 redis8, 4 cores, io-threads 3: GET P=16 aof=False: 564,122
+round 0 redis8, 4 cores, io-threads 3: SET P=16 aof=False: 277,881
+round 0 redis8, 4 cores, io-threads 3: SET P=16 aof=True: 259,763
+round 0 valkey, 4 cores, io-threads 4: GET P=1 aof=False: 49,423
+round 0 valkey, 4 cores, io-threads 4: GET P=16 aof=False: 211,924
+round 0 valkey, 4 cores, io-threads 4: SET P=16 aof=False: 209,732
+round 0 valkey, 4 cores, io-threads 4: SET P=16 aof=True: 154,647
+round 0 valkey, 4 cores, io-threads 3: GET P=1 aof=False: 51,831
+round 0 valkey, 4 cores, io-threads 3: GET P=16 aof=False: 226,586
+round 0 valkey, 4 cores, io-threads 3: SET P=16 aof=False: 248,942
+round 0 valkey, 4 cores, io-threads 3: SET P=16 aof=True: 156,666
+round 0 nredis, 4 cores: GET P=1 aof=False: 56,339
+round 0 nredis, 4 cores: GET P=16 aof=False: 733,852
+round 0 nredis, 4 cores: SET P=16 aof=False: 518,036
+round 0 nredis, 4 cores: SET P=16 aof=True: 337,877
+round 0 kosh, 8 cores: GET P=1 aof=False: 42,058
+round 0 kosh, 8 cores: GET P=16 aof=False: 577,034
+round 0 kosh, 8 cores: SET P=16 aof=False: 423,729
+round 0 kosh, 8 cores: SET P=16 aof=True: 404,749
+round 0 locked, 8 cores: GET P=1 aof=False: 49,383
+round 0 locked, 8 cores: GET P=16 aof=False: 284,091
+round 0 locked, 8 cores: SET P=16 aof=False: 297,796
+round 0 redis8, 8 cores, io-threads 8: GET P=1 aof=False: 43,789
+round 0 redis8, 8 cores, io-threads 8: GET P=16 aof=False: 562,852
+round 0 redis8, 8 cores, io-threads 8: SET P=16 aof=False: 311,526
+round 0 redis8, 8 cores, io-threads 8: SET P=16 aof=True: 234,137
+round 0 redis8, 8 cores, io-threads 7: GET P=1 aof=False: 44,111
+round 0 redis8, 8 cores, io-threads 7: GET P=16 aof=False: 587,774
+round 0 redis8, 8 cores, io-threads 7: SET P=16 aof=False: 415,743
+round 0 redis8, 8 cores, io-threads 7: SET P=16 aof=True: 243,744
+round 0 valkey, 8 cores, io-threads 8: GET P=1 aof=False: 30,343
+round 0 valkey, 8 cores, io-threads 8: GET P=16 aof=False: 289,519
+round 0 valkey, 8 cores, io-threads 8: SET P=16 aof=False: 217,944
+round 0 valkey, 8 cores, io-threads 8: SET P=16 aof=True: 166,122
+round 0 valkey, 8 cores, io-threads 6: GET P=1 aof=False: 34,888
+round 0 valkey, 8 cores, io-threads 6: GET P=16 aof=False: 349,528
+round 0 valkey, 8 cores, io-threads 6: SET P=16 aof=False: 243,784
+round 0 valkey, 8 cores, io-threads 6: SET P=16 aof=True: 154,329
+round 0 nredis, 8 cores: GET P=1 aof=False: 55,448
+round 0 nredis, 8 cores: GET P=16 aof=False: 683,188
+round 0 nredis, 8 cores: SET P=16 aof=False: 375,166
+round 0 nredis, 8 cores: SET P=16 aof=True: 473,733
+round 0 kosh-main, 1 core: GET P=1 aof=False: 44,280
+round 0 kosh-main, 1 core: GET P=16 aof=False: 397,720
+round 0 kosh-main, 1 core: SET P=16 aof=False: 426,318
+round 0 kosh-main, 1 core: SET P=16 aof=True: 350,672
+round 0 redis7, 1 core: GET P=1 aof=False: 39,793
+round 0 redis7, 1 core: GET P=16 aof=False: 239,846
+round 0 redis7, 1 core: SET P=16 aof=False: 322,789
+round 0 redis7, 1 core: SET P=16 aof=True: 212,811
+round 1 redis8, 1 core, io-threads 1: GET P=1 aof=False: 36,197
+round 1 redis8, 1 core, io-threads 1: GET P=16 aof=False: 331,712
+round 1 redis8, 1 core, io-threads 1: SET P=16 aof=False: 282,725
+round 1 redis8, 1 core, io-threads 1: SET P=16 aof=True: 265,981
+round 1 valkey, 1 core, io-threads 1: GET P=1 aof=False: 35,170
+round 1 valkey, 1 core, io-threads 1: GET P=16 aof=False: 238,739
+round 1 valkey, 1 core, io-threads 1: SET P=16 aof=False: 331,748
+round 1 valkey, 1 core, io-threads 1: SET P=16 aof=True: 216,076
+round 1 kosh, 2 cores: GET P=1 aof=False: 51,796
+round 1 kosh, 2 cores: GET P=16 aof=False: 458,926
+round 1 kosh, 2 cores: SET P=16 aof=False: 457,945
+round 1 kosh, 2 cores: SET P=16 aof=True: 372,024
+round 1 locked, 2 cores: GET P=1 aof=False: 54,025
+round 1 locked, 2 cores: GET P=16 aof=False: 361,141
+round 1 locked, 2 cores: SET P=16 aof=False: 306,686
+round 1 redis8, 2 cores, io-threads 2: GET P=1 aof=False: 38,565
+round 1 redis8, 2 cores, io-threads 2: GET P=16 aof=False: 351,824
+round 1 redis8, 2 cores, io-threads 2: SET P=16 aof=False: 260,010
+round 1 redis8, 2 cores, io-threads 2: SET P=16 aof=True: 229,991
+round 1 valkey, 2 cores, io-threads 2: GET P=1 aof=False: 37,337
+round 1 valkey, 2 cores, io-threads 2: GET P=16 aof=False: 298,626
+round 1 valkey, 2 cores, io-threads 2: SET P=16 aof=False: 254,388
+round 1 valkey, 2 cores, io-threads 2: SET P=16 aof=True: 175,871
+round 1 nredis, 2 cores: GET P=1 aof=False: 36,912
+round 1 nredis, 2 cores: GET P=16 aof=False: 433,616
+round 1 nredis, 2 cores: SET P=16 aof=False: 411,495
+round 1 nredis, 2 cores: SET P=16 aof=True: 266,975
+round 1 kosh, 4 cores: GET P=1 aof=False: 53,792
+round 1 kosh, 4 cores: GET P=16 aof=False: 694,766
+round 1 kosh, 4 cores: SET P=16 aof=False: 514,492
+round 1 kosh, 4 cores: SET P=16 aof=True: 353,107
+round 1 locked, 4 cores: GET P=1 aof=False: 53,860
+round 1 locked, 4 cores: GET P=16 aof=False: 314,037
+round 1 locked, 4 cores: SET P=16 aof=False: 361,446
+round 1 redis8, 4 cores, io-threads 4: GET P=1 aof=False: 51,706
+round 1 redis8, 4 cores, io-threads 4: GET P=16 aof=False: 732,243
+round 1 redis8, 4 cores, io-threads 4: SET P=16 aof=False: 408,608
+round 1 redis8, 4 cores, io-threads 4: SET P=16 aof=True: 206,242
+round 1 redis8, 4 cores, io-threads 3: GET P=1 aof=False: 38,105
+round 1 redis8, 4 cores, io-threads 3: GET P=16 aof=False: 454,339
+round 1 redis8, 4 cores, io-threads 3: SET P=16 aof=False: 281,822
+round 1 redis8, 4 cores, io-threads 3: SET P=16 aof=True: 271,764
+round 1 valkey, 4 cores, io-threads 4: GET P=1 aof=False: 56,476
+round 1 valkey, 4 cores, io-threads 4: GET P=16 aof=False: 214,562
+round 1 valkey, 4 cores, io-threads 4: SET P=16 aof=False: 243,863
+round 1 valkey, 4 cores, io-threads 4: SET P=16 aof=True: 157,778
+round 1 valkey, 4 cores, io-threads 3: GET P=1 aof=False: 59,137
+round 1 valkey, 4 cores, io-threads 3: GET P=16 aof=False: 277,958
+round 1 valkey, 4 cores, io-threads 3: SET P=16 aof=False: 225,615
+round 1 valkey, 4 cores, io-threads 3: SET P=16 aof=True: 154,345
+round 1 nredis, 4 cores: GET P=1 aof=False: 56,942
+round 1 nredis, 4 cores: GET P=16 aof=False: 777,595
+round 1 nredis, 4 cores: SET P=16 aof=False: 581,047
+round 1 nredis, 4 cores: SET P=16 aof=True: 456,555
+round 1 kosh, 8 cores: GET P=1 aof=False: 42,283
+round 1 kosh, 8 cores: GET P=16 aof=False: 600,120
+round 1 kosh, 8 cores: SET P=16 aof=False: 352,568
+round 1 kosh, 8 cores: SET P=16 aof=True: 313,381
+round 1 locked, 8 cores: GET P=1 aof=False: 47,581
+round 1 locked, 8 cores: GET P=16 aof=False: 284,118
+round 1 locked, 8 cores: SET P=16 aof=False: 243,982
+round 1 redis8, 8 cores, io-threads 8: GET P=1 aof=False: 45,393
+round 1 redis8, 8 cores, io-threads 8: GET P=16 aof=False: 579,598
+round 1 redis8, 8 cores, io-threads 8: SET P=16 aof=False: 330,797
+round 1 redis8, 8 cores, io-threads 8: SET P=16 aof=True: 243,704
+round 1 redis8, 8 cores, io-threads 7: GET P=1 aof=False: 45,565
+round 1 redis8, 8 cores, io-threads 7: GET P=16 aof=False: 316,857
+round 1 redis8, 8 cores, io-threads 7: SET P=16 aof=False: 391,032
+round 1 redis8, 8 cores, io-threads 7: SET P=16 aof=True: 229,815
+round 1 valkey, 8 cores, io-threads 8: GET P=1 aof=False: 30,516
+round 1 valkey, 8 cores, io-threads 8: GET P=16 aof=False: 339,443
+round 1 valkey, 8 cores, io-threads 8: SET P=16 aof=False: 265,041
+round 1 valkey, 8 cores, io-threads 8: SET P=16 aof=True: 155,384
+round 1 valkey, 8 cores, io-threads 6: GET P=1 aof=False: 43,834
+round 1 valkey, 8 cores, io-threads 6: GET P=16 aof=False: 312,793
+round 1 valkey, 8 cores, io-threads 6: SET P=16 aof=False: 248,839
+round 1 valkey, 8 cores, io-threads 6: SET P=16 aof=True: 154,139
+round 1 nredis, 8 cores: GET P=1 aof=False: 56,200
+round 1 nredis, 8 cores: GET P=16 aof=False: 749,804
+round 1 nredis, 8 cores: SET P=16 aof=False: 386,189
+round 1 nredis, 8 cores: SET P=16 aof=True: 462,829
+round 1 kosh-main, 1 core: GET P=1 aof=False: 39,735
+round 1 kosh-main, 1 core: GET P=16 aof=False: 397,351
+round 1 kosh-main, 1 core: SET P=16 aof=False: 410,903
+round 1 kosh-main, 1 core: SET P=16 aof=True: 350,713
+round 1 redis7, 1 core: GET P=1 aof=False: 36,263
+round 1 redis7, 1 core: GET P=16 aof=False: 238,777
+round 1 redis7, 1 core: SET P=16 aof=False: 331,785
+round 1 redis7, 1 core: SET P=16 aof=True: 215,657
+round 1 kosh, 1 core: GET P=1 aof=False: 45,921
+round 1 kosh, 1 core: GET P=16 aof=False: 397,931
+round 1 kosh, 1 core: SET P=16 aof=False: 411,692
+round 1 kosh, 1 core: SET P=16 aof=True: 268,890
+round 1 locked, 1 core: GET P=1 aof=False: 47,680
+round 1 locked, 1 core: GET P=16 aof=False: 411,353
+round 1 locked, 1 core: SET P=16 aof=False: 301,235
+round 2 valkey, 1 core, io-threads 1: SET P=16 aof=True: 259,875
+round 2 kosh, 2 cores: GET P=1 aof=False: 47,604
+round 2 kosh, 2 cores: GET P=16 aof=False: 340,098
+round 2 kosh, 2 cores: SET P=16 aof=False: 458,155
+round 2 kosh, 2 cores: SET P=16 aof=True: 397,456
+round 2 locked, 2 cores: GET P=1 aof=False: 54,191
+round 2 locked, 2 cores: GET P=16 aof=False: 293,858
+round 2 locked, 2 cores: SET P=16 aof=False: 410,397
+round 2 redis8, 2 cores, io-threads 2: GET P=1 aof=False: 39,899
+round 2 redis8, 2 cores, io-threads 2: GET P=16 aof=False: 288,268
+round 2 redis8, 2 cores, io-threads 2: SET P=16 aof=False: 341,336
+round 2 redis8, 2 cores, io-threads 2: SET P=16 aof=True: 254,496
+round 2 valkey, 2 cores, io-threads 2: GET P=1 aof=False: 30,966
+round 2 valkey, 2 cores, io-threads 2: GET P=16 aof=False: 306,435
+round 2 valkey, 2 cores, io-threads 2: SET P=16 aof=False: 217,976
+round 2 valkey, 2 cores, io-threads 2: SET P=16 aof=True: 186,904
+round 2 nredis, 2 cores: GET P=1 aof=False: 58,195
+round 2 nredis, 2 cores: GET P=16 aof=False: 331,555
+round 2 nredis, 2 cores: SET P=16 aof=False: 418,198
+round 2 nredis, 2 cores: SET P=16 aof=True: 322,355
+round 2 kosh, 4 cores: GET P=1 aof=False: 51,751
+round 2 kosh, 4 cores: GET P=16 aof=False: 686,813
+round 2 kosh, 4 cores: SET P=16 aof=False: 532,954
+round 2 kosh, 4 cores: SET P=16 aof=True: 491,884
+round 2 locked, 4 cores: GET P=1 aof=False: 56,487
+round 2 locked, 4 cores: GET P=16 aof=False: 276,549
+round 2 locked, 4 cores: SET P=16 aof=False: 372,439
+round 2 redis8, 4 cores, io-threads 4: GET P=1 aof=False: 54,201
+round 2 redis8, 4 cores, io-threads 4: GET P=16 aof=False: 404,694
+round 2 redis8, 4 cores, io-threads 4: SET P=16 aof=False: 424,268
+round 2 redis8, 4 cores, io-threads 4: SET P=16 aof=True: 277,855
+round 2 redis8, 4 cores, io-threads 3: GET P=1 aof=False: 54,025
+round 2 redis8, 4 cores, io-threads 3: GET P=16 aof=False: 495,131
+round 2 redis8, 4 cores, io-threads 3: SET P=16 aof=False: 440,464
+round 2 redis8, 4 cores, io-threads 3: SET P=16 aof=True: 203,335
+round 2 valkey, 4 cores, io-threads 4: GET P=1 aof=False: 47,259
+round 2 valkey, 4 cores, io-threads 4: GET P=16 aof=False: 298,835
+round 2 valkey, 4 cores, io-threads 4: SET P=16 aof=False: 181,653
+round 2 valkey, 4 cores, io-threads 4: SET P=16 aof=True: 184,072
+round 2 valkey, 4 cores, io-threads 3: GET P=1 aof=False: 56,338
+round 2 valkey, 4 cores, io-threads 3: GET P=16 aof=False: 372,763
+round 2 valkey, 4 cores, io-threads 3: SET P=16 aof=False: 314,597
+round 2 valkey, 4 cores, io-threads 3: SET P=16 aof=True: 160,026
+round 2 nredis, 4 cores: GET P=1 aof=False: 62,952
+round 2 nredis, 4 cores: GET P=16 aof=False: 800,439
+round 2 nredis, 4 cores: SET P=16 aof=False: 570,801
+round 2 nredis, 4 cores: SET P=16 aof=True: 322,537
+round 2 kosh, 8 cores: GET P=1 aof=False: 47,348
+round 2 kosh, 8 cores: GET P=16 aof=False: 650,900
+round 2 kosh, 8 cores: SET P=16 aof=False: 464,540
+round 2 kosh, 8 cores: SET P=16 aof=True: 411,918
+round 2 locked, 8 cores: GET P=1 aof=False: 42,005
+round 2 locked, 8 cores: GET P=16 aof=False: 290,698
+round 2 locked, 8 cores: SET P=16 aof=False: 298,270
+round 2 redis8, 8 cores, io-threads 8: GET P=1 aof=False: 43,872
+round 2 redis8, 8 cores, io-threads 8: GET P=16 aof=False: 469,778
+round 2 redis8, 8 cores, io-threads 8: SET P=16 aof=False: 304,538
+round 2 redis8, 8 cores, io-threads 8: SET P=16 aof=True: 291,234
+round 2 redis8, 8 cores, io-threads 7: GET P=1 aof=False: 45,725
+round 2 redis8, 8 cores, io-threads 7: GET P=16 aof=False: 388,651
+round 2 redis8, 8 cores, io-threads 7: SET P=16 aof=False: 474,383
+round 2 redis8, 8 cores, io-threads 7: SET P=16 aof=True: 259,943
+round 2 valkey, 8 cores, io-threads 8: GET P=1 aof=False: 29,595
+round 2 valkey, 8 cores, io-threads 8: GET P=16 aof=False: 297,236
+round 2 valkey, 8 cores, io-threads 8: SET P=16 aof=False: 183,273
+round 2 valkey, 8 cores, io-threads 8: SET P=16 aof=True: 181,170
+round 2 valkey, 8 cores, io-threads 6: GET P=1 aof=False: 43,605
+round 2 valkey, 8 cores, io-threads 6: GET P=16 aof=False: 275,457
+round 2 valkey, 8 cores, io-threads 6: SET P=16 aof=False: 277,393
+round 2 valkey, 8 cores, io-threads 6: SET P=16 aof=True: 160,394
+round 2 nredis, 8 cores: GET P=1 aof=False: 60,028
+round 2 nredis, 8 cores: GET P=16 aof=False: 793,535
+round 2 nredis, 8 cores: SET P=16 aof=False: 514,234
+round 2 nredis, 8 cores: SET P=16 aof=True: 335,505
+round 2 kosh-main, 1 core: GET P=1 aof=False: 47,763
+round 2 kosh-main, 1 core: GET P=16 aof=False: 426,136
+round 2 kosh-main, 1 core: SET P=16 aof=False: 302,176
+round 2 kosh-main, 1 core: SET P=16 aof=True: 350,836
+round 2 redis7, 1 core: GET P=1 aof=False: 36,210
+round 2 redis7, 1 core: GET P=16 aof=False: 232,720
+round 2 redis7, 1 core: SET P=16 aof=False: 341,375
+round 2 redis7, 1 core: SET P=16 aof=True: 254,259
+round 2 kosh, 1 core: GET P=1 aof=False: 32,468
+round 2 kosh, 1 core: GET P=16 aof=False: 411,749
+round 2 kosh, 1 core: SET P=16 aof=False: 425,411
+round 2 kosh, 1 core: SET P=16 aof=True: 239,808
+round 2 locked, 1 core: GET P=1 aof=False: 45,963
+round 2 locked, 1 core: GET P=16 aof=False: 411,805
+round 2 locked, 1 core: SET P=16 aof=False: 397,720
+round 2 redis8, 1 core, io-threads 1: GET P=1 aof=False: 41,243
+round 2 redis8, 1 core, io-threads 1: GET P=16 aof=False: 341,413
+round 2 redis8, 1 core, io-threads 1: SET P=16 aof=False: 372,486
+round 2 redis8, 1 core, io-threads 1: SET P=16 aof=True: 290,951
+round 2 valkey, 1 core, io-threads 1: GET P=1 aof=False: 41,226
+round 2 valkey, 1 core, io-threads 1: GET P=16 aof=False: 313,840
+round 2 valkey, 1 core, io-threads 1: SET P=16 aof=False: 340,754
+
+median ops/s (fastest - slowest)
+kosh, 1 core                     GET P=1  aof=off:     45,921  (32,468 - 132,509)
+kosh, 1 core                     GET P=16 aof=off:    411,749  (397,931 - 995,025)
+kosh, 1 core                     SET P=16 aof=off:    425,411  (411,692 - 584,340)
+kosh, 1 core                     SET P=16 aof=on :    268,890  (239,808 - 628,009)
+locked, 1 core                   GET P=1  aof=off:     47,680  (45,963 - 92,025)
+locked, 1 core                   GET P=16 aof=off:    411,805  (411,353 - 796,601)
+locked, 1 core                   SET P=16 aof=off:    397,720  (301,235 - 518,762)
+redis8, 1 core, io-threads 1     GET P=1  aof=off:     40,750  (36,197 - 41,243)
+redis8, 1 core, io-threads 1     GET P=16 aof=off:    341,413  (331,712 - 397,456)
+redis8, 1 core, io-threads 1     SET P=16 aof=off:    372,486  (282,725 - 384,369)
+redis8, 1 core, io-threads 1     SET P=16 aof=on :    265,981  (239,006 - 290,951)
+valkey, 1 core, io-threads 1     GET P=1  aof=off:     41,226  (35,170 - 42,295)
+valkey, 1 core, io-threads 1     GET P=16 aof=off:    313,840  (238,739 - 340,716)
+valkey, 1 core, io-threads 1     SET P=16 aof=off:    331,748  (278,087 - 340,754)
+valkey, 1 core, io-threads 1     SET P=16 aof=on :    254,216  (216,076 - 259,875)
+kosh, 2 cores                    GET P=1  aof=off:     51,230  (47,604 - 51,796)
+kosh, 2 cores                    GET P=16 aof=off:    394,997  (340,098 - 458,926)
+kosh, 2 cores                    SET P=16 aof=off:    457,945  (419,287 - 458,155)
+kosh, 2 cores                    SET P=16 aof=on :    381,098  (372,024 - 397,456)
+locked, 2 cores                  GET P=1  aof=off:     54,025  (47,551 - 54,191)
+locked, 2 cores                  GET P=16 aof=off:    358,038  (293,858 - 361,141)
+locked, 2 cores                  SET P=16 aof=off:    338,677  (306,686 - 410,397)
+redis8, 2 cores, io-threads 2    GET P=1  aof=off:     38,565  (37,936 - 39,899)
+redis8, 2 cores, io-threads 2    GET P=16 aof=off:    351,824  (288,268 - 382,263)
+redis8, 2 cores, io-threads 2    SET P=16 aof=off:    297,649  (260,010 - 341,336)
+redis8, 2 cores, io-threads 2    SET P=16 aof=on :    229,991  (179,845 - 254,496)
+valkey, 2 cores, io-threads 2    GET P=1  aof=off:     37,337  (30,966 - 42,295)
+valkey, 2 cores, io-threads 2    GET P=16 aof=off:    306,435  (298,626 - 322,789)
+valkey, 2 cores, io-threads 2    SET P=16 aof=off:    217,976  (210,025 - 254,388)
+valkey, 2 cores, io-threads 2    SET P=16 aof=on :    186,904  (175,871 - 196,117)
+nredis, 2 cores                  GET P=1  aof=off:     44,996  (36,912 - 58,195)
+nredis, 2 cores                  GET P=16 aof=off:    433,616  (331,555 - 519,723)
+nredis, 2 cores                  SET P=16 aof=off:    418,198  (411,495 - 477,416)
+nredis, 2 cores                  SET P=16 aof=on :    314,390  (266,975 - 322,355)
+kosh, 4 cores                    GET P=1  aof=off:     51,751  (51,751 - 53,792)
+kosh, 4 cores                    GET P=16 aof=off:    694,284  (686,813 - 694,766)
+kosh, 4 cores                    SET P=16 aof=off:    514,492  (508,216 - 532,954)
+kosh, 4 cores                    SET P=16 aof=on :    435,287  (353,107 - 491,884)
+locked, 4 cores                  GET P=1  aof=off:     53,860  (51,697 - 56,487)
+locked, 4 cores                  GET P=16 aof=off:    305,002  (276,549 - 314,037)
+locked, 4 cores                  SET P=16 aof=off:    361,446  (349,610 - 372,439)
+redis8, 4 cores, io-threads 4    GET P=1  aof=off:     51,706  (49,702 - 54,201)
+redis8, 4 cores, io-threads 4    GET P=16 aof=off:    494,071  (404,694 - 732,243)
+redis8, 4 cores, io-threads 4    SET P=16 aof=off:    408,608  (384,123 - 424,268)
+redis8, 4 cores, io-threads 4    SET P=16 aof=on :    213,797  (206,242 - 277,855)
+redis8, 4 cores, io-threads 3    GET P=1  aof=off:     54,025  (38,105 - 59,666)
+redis8, 4 cores, io-threads 3    GET P=16 aof=off:    495,131  (454,339 - 564,122)
+redis8, 4 cores, io-threads 3    SET P=16 aof=off:    281,822  (277,881 - 440,464)
+redis8, 4 cores, io-threads 3    SET P=16 aof=on :    259,763  (203,335 - 271,764)
+valkey, 4 cores, io-threads 4    GET P=1  aof=off:     49,423  (47,259 - 56,476)
+valkey, 4 cores, io-threads 4    GET P=16 aof=off:    214,562  (211,924 - 298,835)
+valkey, 4 cores, io-threads 4    SET P=16 aof=off:    209,732  (181,653 - 243,863)
+valkey, 4 cores, io-threads 4    SET P=16 aof=on :    157,778  (154,647 - 184,072)
+valkey, 4 cores, io-threads 3    GET P=1  aof=off:     56,338  (51,831 - 59,137)
+valkey, 4 cores, io-threads 3    GET P=16 aof=off:    277,958  (226,586 - 372,763)
+valkey, 4 cores, io-threads 3    SET P=16 aof=off:    248,942  (225,615 - 314,597)
+valkey, 4 cores, io-threads 3    SET P=16 aof=on :    156,666  (154,345 - 160,026)
+nredis, 4 cores                  GET P=1  aof=off:     56,942  (56,339 - 62,952)
+nredis, 4 cores                  GET P=16 aof=off:    777,595  (733,852 - 800,439)
+nredis, 4 cores                  SET P=16 aof=off:    570,801  (518,036 - 581,047)
+nredis, 4 cores                  SET P=16 aof=on :    337,877  (322,537 - 456,555)
+kosh, 8 cores                    GET P=1  aof=off:     42,283  (42,058 - 47,348)
+kosh, 8 cores                    GET P=16 aof=off:    600,120  (577,034 - 650,900)
+kosh, 8 cores                    SET P=16 aof=off:    423,729  (352,568 - 464,540)
+kosh, 8 cores                    SET P=16 aof=on :    404,749  (313,381 - 411,918)
+locked, 8 cores                  GET P=1  aof=off:     47,581  (42,005 - 49,383)
+locked, 8 cores                  GET P=16 aof=off:    284,118  (284,091 - 290,698)
+locked, 8 cores                  SET P=16 aof=off:    297,796  (243,982 - 298,270)
+redis8, 8 cores, io-threads 8    GET P=1  aof=off:     43,872  (43,789 - 45,393)
+redis8, 8 cores, io-threads 8    GET P=16 aof=off:    562,852  (469,778 - 579,598)
+redis8, 8 cores, io-threads 8    SET P=16 aof=off:    311,526  (304,538 - 330,797)
+redis8, 8 cores, io-threads 8    SET P=16 aof=on :    243,704  (234,137 - 291,234)
+redis8, 8 cores, io-threads 7    GET P=1  aof=off:     45,565  (44,111 - 45,725)
+redis8, 8 cores, io-threads 7    GET P=16 aof=off:    388,651  (316,857 - 587,774)
+redis8, 8 cores, io-threads 7    SET P=16 aof=off:    415,743  (391,032 - 474,383)
+redis8, 8 cores, io-threads 7    SET P=16 aof=on :    243,744  (229,815 - 259,943)
+valkey, 8 cores, io-threads 8    GET P=1  aof=off:     30,343  (29,595 - 30,516)
+valkey, 8 cores, io-threads 8    GET P=16 aof=off:    297,236  (289,519 - 339,443)
+valkey, 8 cores, io-threads 8    SET P=16 aof=off:    217,944  (183,273 - 265,041)
+valkey, 8 cores, io-threads 8    SET P=16 aof=on :    166,122  (155,384 - 181,170)
+valkey, 8 cores, io-threads 6    GET P=1  aof=off:     43,605  (34,888 - 43,834)
+valkey, 8 cores, io-threads 6    GET P=16 aof=off:    312,793  (275,457 - 349,528)
+valkey, 8 cores, io-threads 6    SET P=16 aof=off:    248,839  (243,784 - 277,393)
+valkey, 8 cores, io-threads 6    SET P=16 aof=on :    154,329  (154,139 - 160,394)
+nredis, 8 cores                  GET P=1  aof=off:     56,200  (55,448 - 60,028)
+nredis, 8 cores                  GET P=16 aof=off:    749,804  (683,188 - 793,535)
+nredis, 8 cores                  SET P=16 aof=off:    386,189  (375,166 - 514,234)
+nredis, 8 cores                  SET P=16 aof=on :    462,829  (335,505 - 473,733)
+kosh-main, 1 core                GET P=1  aof=off:     44,280  (39,735 - 47,763)
+kosh-main, 1 core                GET P=16 aof=off:    397,720  (397,351 - 426,136)
+kosh-main, 1 core                SET P=16 aof=off:    410,903  (302,176 - 426,318)
+kosh-main, 1 core                SET P=16 aof=on :    350,713  (350,672 - 350,836)
+redis7, 1 core                   GET P=1  aof=off:     36,263  (36,210 - 39,793)
+redis7, 1 core                   GET P=16 aof=off:    238,777  (232,720 - 239,846)
+redis7, 1 core                   SET P=16 aof=off:    331,785  (322,789 - 341,375)
+redis7, 1 core                   SET P=16 aof=on :    215,657  (212,811 - 254,259)
+
+== open loop
+### kosh, 1 core: 20000 req/s (peak 45,921)
+### kosh, 1 core: 22960 req/s (peak 45,921)
+### kosh, 1 core: 41328 req/s (peak 45,921)
+### redis8, 1 core, io-threads 1: 20000 req/s (peak 40,750)
+### redis8, 1 core, io-threads 1: 20374 req/s (peak 40,750)
+### redis8, 1 core, io-threads 1: 36674 req/s (peak 40,750)
+### valkey, 1 core, io-threads 1: 20000 req/s (peak 41,226)
+### valkey, 1 core, io-threads 1: 20612 req/s (peak 41,226)
+### valkey, 1 core, io-threads 1: 37103 req/s (peak 41,226)
+### kosh, 4 cores: 20000 req/s (peak 51,751)
+### kosh, 4 cores: 25875 req/s (peak 51,751)
+### kosh, 4 cores: 46575 req/s (peak 51,751)
+### redis8, 4 cores, io-threads 4: 20000 req/s (peak 51,706)
+### redis8, 4 cores, io-threads 4: 25853 req/s (peak 51,706)
+### redis8, 4 cores, io-threads 4: 46535 req/s (peak 51,706)
+### valkey, 4 cores, io-threads 4: 20000 req/s (peak 49,423)
+### valkey, 4 cores, io-threads 4: 24711 req/s (peak 49,423)
+### valkey, 4 cores, io-threads 4: 44481 req/s (peak 49,423)
+### nredis, 4 cores: 20000 req/s (peak 56,942)
+### nredis, 4 cores: 28471 req/s (peak 56,942)
+### nredis, 4 cores: 51248 req/s (peak 56,942)
+### kosh, 8 cores: 20000 req/s (peak 42,283)
+### kosh, 8 cores: 21141 req/s (peak 42,283)
+### kosh, 8 cores: 38054 req/s (peak 42,283)
+### redis8, 8 cores, io-threads 8: 20000 req/s (peak 43,872)
+### redis8, 8 cores, io-threads 8: 21936 req/s (peak 43,872)
+### redis8, 8 cores, io-threads 8: 39485 req/s (peak 43,872)
+### valkey, 8 cores, io-threads 8: 20000 req/s (peak 30,343)
+### valkey, 8 cores, io-threads 8: 15171 req/s (peak 30,343)
+### valkey, 8 cores, io-threads 8: 27308 req/s (peak 30,343)
+### nredis, 8 cores: 20000 req/s (peak 56,200)
+### nredis, 8 cores: 28099 req/s (peak 56,200)
+### nredis, 8 cores: 50579 req/s (peak 56,200)
+
+== ring_bench
+15 rounds of 300 ms each, median of the rounds (fastest - slowest), pinned to CPUs 0 2 4 6 8 10 12 14
+
+one-way, ns per message
+  shared-line           7.2 ns   (5.1 - 13.5)
+  padded                7.0 ns   (4.9 - 9.8)
+  cached-only           8.6 ns   (5.2 - 14.5)
+  padded+cached         6.1 ns   (4.4 - 7.8)
+  padded128             5.1 ns   (3.6 - 7.3)
+  mutex-inbox         195.9 ns   (136.6 - 282.7)
+
+ping-pong, ns per round trip
+  shared-line         302.2 ns   (260.1 - 409.0)
+  padded              263.4 ns   (230.7 - 398.7)
+  cached-only         324.6 ns   (253.4 - 473.7)
+  padded+cached       246.3 ns   (209.7 - 366.9)
+  padded128           189.6 ns   (160.1 - 257.7)
+  mutex-inbox         950.4 ns   (754.5 - 1324.6)
+
+all-to-all, 2 threads, ns per message delivered (across all threads)
+  shared-line          23.5 ns   (17.0 - 53.0)
+  padded               38.3 ns   (29.8 - 45.6)
+  cached-only          29.4 ns   (22.8 - 57.6)
+  padded+cached        15.6 ns   (13.0 - 18.9)
+  padded128            12.4 ns   (10.3 - 15.3)
+  mutex-inbox         128.3 ns   (113.7 - 171.8)
+
+all-to-all, 4 threads, ns per message delivered (across all threads)
+  shared-line          18.2 ns   (15.5 - 22.8)
+  padded               16.1 ns   (12.6 - 20.3)
+  cached-only          20.1 ns   (15.4 - 25.9)
+  padded+cached        14.6 ns   (12.7 - 18.9)
+  padded128            14.3 ns   (11.8 - 17.0)
+  mutex-inbox          94.6 ns   (68.6 - 114.3)
+
+all-to-all, 8 threads, ns per message delivered (across all threads)
+  shared-line          11.6 ns   (8.3 - 13.0)
+  padded               10.9 ns   (8.2 - 12.8)
+  cached-only          12.5 ns   (8.8 - 15.3)
+  padded+cached         9.0 ns   (7.0 - 10.9)
+  padded128             9.1 ns   (6.4 - 10.3)
+  mutex-inbox         105.6 ns   (66.8 - 117.3)
+
+load after: 3.57 4.22 5.38 1/282 12438
+DONE

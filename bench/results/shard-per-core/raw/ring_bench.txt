@@ -1,0 +1,41 @@
+15 rounds of 300 ms each, median of the rounds (fastest - slowest), pinned to CPUs 0 2 4 6 8 10 12 14
+
+one-way, ns per message
+  shared-line           7.2 ns   (5.1 - 13.5)
+  padded                7.0 ns   (4.9 - 9.8)
+  cached-only           8.6 ns   (5.2 - 14.5)
+  padded+cached         6.1 ns   (4.4 - 7.8)
+  padded128             5.1 ns   (3.6 - 7.3)
+  mutex-inbox         195.9 ns   (136.6 - 282.7)
+
+ping-pong, ns per round trip
+  shared-line         302.2 ns   (260.1 - 409.0)
+  padded              263.4 ns   (230.7 - 398.7)
+  cached-only         324.6 ns   (253.4 - 473.7)
+  padded+cached       246.3 ns   (209.7 - 366.9)
+  padded128           189.6 ns   (160.1 - 257.7)
+  mutex-inbox         950.4 ns   (754.5 - 1324.6)
+
+all-to-all, 2 threads, ns per message delivered (across all threads)
+  shared-line          23.5 ns   (17.0 - 53.0)
+  padded               38.3 ns   (29.8 - 45.6)
+  cached-only          29.4 ns   (22.8 - 57.6)
+  padded+cached        15.6 ns   (13.0 - 18.9)
+  padded128            12.4 ns   (10.3 - 15.3)
+  mutex-inbox         128.3 ns   (113.7 - 171.8)
+
+all-to-all, 4 threads, ns per message delivered (across all threads)
+  shared-line          18.2 ns   (15.5 - 22.8)
+  padded               16.1 ns   (12.6 - 20.3)
+  cached-only          20.1 ns   (15.4 - 25.9)
+  padded+cached        14.6 ns   (12.7 - 18.9)
+  padded128            14.3 ns   (11.8 - 17.0)
+  mutex-inbox          94.6 ns   (68.6 - 114.3)
+
+all-to-all, 8 threads, ns per message delivered (across all threads)
+  shared-line          11.6 ns   (8.3 - 13.0)
+  padded               10.9 ns   (8.2 - 12.8)
+  cached-only          12.5 ns   (8.8 - 15.3)
+  padded+cached         9.0 ns   (7.0 - 10.9)
+  padded128             9.1 ns   (6.4 - 10.3)
+  mutex-inbox         105.6 ns   (66.8 - 117.3)

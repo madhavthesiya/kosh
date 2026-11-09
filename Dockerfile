@@ -4,7 +4,7 @@
 #   docker run -d --name kosh -p 127.0.0.1:6379:6379 kosh --protected-mode no
 #   redis-cli ping
 #
-# See "Run with Docker" in README.md for passwords and keeping the data.
+# See "Run with Docker" in docs/RUNNING.md for passwords and keeping the data.
 
 # --- Build stage: compiler, CMake, sources. None of it ships. ---
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
@@ -22,7 +22,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 
 # --- Run stage: glibc and libstdc++, no shell, no package manager. ---
 # glibc, not Alpine's musl: every number in the README was measured with
-# glibc's allocator, and the allocator already caused one stall (README,
+# glibc's allocator, and the allocator already caused one stall (docs/DECISIONS.md,
 # Challenge 15). musl's is a different allocator, not measured here.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/build/kosh-server /usr/local/bin/kosh-server

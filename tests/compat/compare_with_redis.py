@@ -318,9 +318,9 @@ GROUPS = {
 
 # Differences Kosh makes on purpose, and why
 EXPECTED = {
-    ("Transactions", "WATCH inside MULTI"): "WATCH isn't supported (see the README's Known Limitations)",
+    ("Transactions", "WATCH inside MULTI"): "WATCH isn't supported (see docs/COMPATIBILITY.md)",
     ("PTTL, PEXPIRE, PERSIST, DBSIZE", "wrong arity"): "EXPIRE and PEXPIRE take no options (Redis 7.0's NX, XX, GT, LT): "
-        "a third argument is an arity error, not Redis's 'Unsupported option' (see the README's Known Limitations)",
+        "a third argument is an arity error, not Redis's 'Unsupported option' (see docs/COMPATIBILITY.md)",
 }
 
 
