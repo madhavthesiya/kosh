@@ -10,7 +10,7 @@ On a laptop VM with 4 fast cores: 694,000 GET/s at 4 threads, 1.4× Redis 8 with
 
 *Kosh (कोश) is Sanskrit and Hindi for a treasury. Formerly Mini-Redis.*
 
-**This is a learning project, not production software.** It has no replication, Lua, Pub/Sub, sorted sets or TLS. [What it doesn't do](docs/COMPATIBILITY.md#known-limitations). For production, use Redis or Valkey. Use Kosh to see how a server like this is built and proven, or run `kosh-loadgen` to test any Redis-compatible server.
+**Not a Redis replacement.** It has no replication, Lua, Pub/Sub, sorted sets or TLS. [What it doesn't do](docs/COMPATIBILITY.md#known-limitations). For production, use Redis or Valkey. Use Kosh to see how a server like this is built and proven, or run `kosh-loadgen` to test any Redis-compatible server.
 
 **What's in it:** strings, lists, sets and hashes; TTLs; `MULTI`/`EXEC`; `SCAN`; `INFO`; an append-only file with three sync policies; SIEVE or LRU eviction; `AUTH` and protected mode; `epoll` on Linux and `select()` elsewhere; a Docker image, and binaries for Linux and Windows. [All commands](docs/COMMANDS.md).
 

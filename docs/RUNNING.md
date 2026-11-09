@@ -101,10 +101,10 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 
 ```bash
 # Linux / macOS
-g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp EventLoop.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-server
-g++ -std=c++17 -O2 -pthread main.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o kosh-cli
-g++ -std=c++17 -O2 -pthread tests/test_main.cpp Poller.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_tests
-g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp AOFLogger.cpp RedisLite.cpp -o run_thread_tests
+g++ -std=c++17 -O2 -pthread src/server_main.cpp src/Server.cpp src/EventLoop.cpp src/Poller.cpp src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp src/RedisLite.cpp -o kosh-server
+g++ -std=c++17 -O2 -pthread src/main.cpp src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp src/RedisLite.cpp -o kosh-cli
+g++ -std=c++17 -O2 -pthread tests/test_main.cpp src/Poller.cpp src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp src/RedisLite.cpp -o run_tests
+g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp src/RedisLite.cpp -o run_thread_tests
 ```
 
 On Windows (MinGW), add `-lws2_32` to the server and unit-test commands for Winsock.
@@ -114,27 +114,29 @@ On Windows (MinGW), add `-lws2_32` to the server and unit-test commands for Wins
 
 ```
 kosh/
-├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
-├── main.cpp                  # CLI entry point (interactive mode)
-├── Server.h / .cpp           # TCP server — listening socket, accepting clients, start and stop
-├── EventLoop.h / .cpp        # One thread's event loop, per-client buffers, RESP I/O, forwarding
-├── SpscRing.h                # The queue between two threads
-├── Wakeup.h                  # Waking a thread that may be asleep
-├── Router.h                  # Which thread owns a key
-├── AofManifest.h             # What the AOF files of several threads mean
-├── Poller.h / .cpp           # Readiness interface: epoll (Linux) and select()
-├── Socket.h                  # Winsock / BSD socket differences (header-only)
-├── RespParser.h              # RESP protocol parser + serializer (header-only)
-├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
-├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
-├── StorageInterface.h        # Abstract interface (pure virtual base class)
-├── InMemoryStorage.h / .cpp  # Storage engine — entries, eviction (SIEVE/LRU), TTL, variant types, AOF
-├── KeyTable.h                # Hash table — cache-line buckets, incremental rehashing (header-only)
-├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
-├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
-├── Result.h                  # Result type with error codes
-├── Integer.h                 # Integers as Redis reads them (arguments, and INCR's values)
-├── Version.h                 # Kosh's version (--version, HELLO, INFO)
+├── src/                          # The server and the CLI
+│   ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
+│   ├── main.cpp                  # CLI entry point (interactive mode)
+│   ├── Server.h / .cpp           # TCP server — listening socket, accepting clients, start and stop
+│   ├── EventLoop.h / .cpp        # One thread's event loop, per-client buffers, RESP I/O, forwarding
+│   ├── SpscRing.h                # The queue between two threads
+│   ├── Wakeup.h                  # Waking a thread that may be asleep
+│   ├── Router.h                  # Which thread owns a key
+│   ├── AofManifest.h             # What the AOF files of several threads mean
+│   ├── Poller.h / .cpp           # Readiness interface: epoll (Linux) and select()
+│   ├── Socket.h                  # Winsock / BSD socket differences (header-only)
+│   ├── RespParser.h              # RESP protocol parser + serializer (header-only)
+│   ├── Commands.h / .cpp         # Command table — dispatch for the server and AOF replay
+│   ├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
+│   ├── StorageInterface.h        # Abstract interface (pure virtual base class)
+│   ├── InMemoryStorage.h / .cpp  # Storage engine — entries, eviction (SIEVE/LRU), TTL, variant types, AOF
+│   ├── KeyTable.h                # Hash table — cache-line buckets, incremental rehashing (header-only)
+│   ├── SipHash.h                 # SipHash, the key table's keyed hash (header-only)
+│   ├── AOFLogger.h / .cpp        # Append-only file — appends, crash-safe rewrite, failed writes
+│   ├── Result.h                  # Result type with error codes
+│   ├── Integer.h                 # Integers as Redis reads them (arguments, and INCR's values)
+│   ├── Glob.h                    # Redis's glob patterns, for SCAN's MATCH (header-only)
+│   └── Version.h                 # Kosh's version (--version, HELLO, INFO)
 ├── SECURITY.md               # What Kosh defends against, what it doesn't, how to report a flaw
 ├── CHANGELOG.md              # What changed in each release
 ├── Dockerfile                # Multi-stage build; runs as a non-root user (.dockerignore: a whitelist)

@@ -16,8 +16,8 @@
 // Build: cmake --build build --target hash_flood
 // Run:   taskset -c 2 ./build/hash_flood [--max-keys N] [--rounds R]
 
-#include "../KeyTable.h"
-#include "../SipHash.h"
+#include "../src/KeyTable.h"
+#include "../src/SipHash.h"
 
 #include <algorithm>
 #include <chrono>

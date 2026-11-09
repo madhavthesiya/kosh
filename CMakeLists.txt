@@ -43,24 +43,24 @@ find_package(Threads REQUIRED)
 
 # Main executable (CLI mode)
 add_executable(kosh-cli
-    main.cpp
-    Commands.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
-    RedisLite.cpp
+    src/main.cpp
+    src/Commands.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
+    src/RedisLite.cpp
 )
 target_link_libraries(kosh-cli Threads::Threads)
 
 # Server executable (TCP + RESP mode)
 add_executable(kosh-server
-    server_main.cpp
-    Server.cpp
-    EventLoop.cpp
-    Poller.cpp
-    Commands.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
-    RedisLite.cpp
+    src/server_main.cpp
+    src/Server.cpp
+    src/EventLoop.cpp
+    src/Poller.cpp
+    src/Commands.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
+    src/RedisLite.cpp
 )
 target_link_libraries(kosh-server Threads::Threads)
 if(WIN32)
@@ -70,11 +70,11 @@ endif()
 # Unit tests
 add_executable(tests
     tests/test_main.cpp
-    Poller.cpp
-    Commands.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
-    RedisLite.cpp
+    src/Poller.cpp
+    src/Commands.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
+    src/RedisLite.cpp
 )
 target_link_libraries(tests Threads::Threads)
 if(WIN32)
@@ -84,9 +84,9 @@ endif()
 # Thread safety stress test
 add_executable(test_threads
     tests/test_thread_safety.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
-    RedisLite.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
+    src/RedisLite.cpp
 )
 target_link_libraries(test_threads Threads::Threads)
 
@@ -95,47 +95,47 @@ add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
 target_link_libraries(test_spsc_ring Threads::Threads)
 
 # Which thread owns a key, and where the command table says the keys are
-add_executable(test_router tests/test_router.cpp Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+add_executable(test_router tests/test_router.cpp src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp)
 target_link_libraries(test_router Threads::Threads)
 
 # Prints sizeof() of the storage types and the heap cost of one key (see bench/README.md)
 add_executable(memory_layout
     bench/memory_layout.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(memory_layout Threads::Threads)
 
 # Times every insert of a new key, to find the storage engine's worst case (see bench/README.md)
 add_executable(insert_latency
     bench/insert_latency.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(insert_latency Threads::Threads)
 
 # Times lookups in the storage engine as the table outgrows the caches (see bench/README.md)
 add_executable(lookup_latency
     bench/lookup_latency.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(lookup_latency Threads::Threads)
 
 # Miss ratio of the engine's eviction on cache traces (see bench/README.md)
 add_executable(eviction_sim
     bench/eviction_sim.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(eviction_sim Threads::Threads)
 
 # Counts heap allocations per request, layer by layer (see bench/README.md)
 add_executable(alloc_count
     bench/alloc_count.cpp
-    Commands.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/Commands.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(alloc_count Threads::Threads)
 
@@ -145,9 +145,9 @@ add_executable(hash_flood bench/hash_flood.cpp)
 # Times a password check by where the guess goes wrong (see bench/README.md)
 add_executable(auth_compare
     bench/auth_compare.cpp
-    Commands.cpp
-    InMemoryStorage.cpp
-    AOFLogger.cpp
+    src/Commands.cpp
+    src/InMemoryStorage.cpp
+    src/AOFLogger.cpp
 )
 target_link_libraries(auth_compare Threads::Threads)
 
@@ -172,12 +172,12 @@ endif()
 option(KOSH_LIBFUZZER "Build fuzz_commands with libFuzzer (clang only)" OFF)
 if(KOSH_LIBFUZZER)
     add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp
-        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+        src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp)
     target_compile_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
     target_link_options(fuzz_commands PRIVATE -fsanitize=fuzzer)
 else()
     add_executable(fuzz_commands tests/fuzz/fuzz_commands.cpp tests/fuzz/standalone_main.cpp
-        Commands.cpp InMemoryStorage.cpp AOFLogger.cpp)
+        src/Commands.cpp src/InMemoryStorage.cpp src/AOFLogger.cpp)
 endif()
 target_link_libraries(fuzz_commands Threads::Threads)
 

@@ -23,7 +23,7 @@
 // Linux only (CPU pinning). Usage:
 //   ring_bench [--rounds 9] [--ms 300] [--cpus 0,2,4,6,8,10,12,14]
 
-#include "../SpscRing.h"
+#include "../src/SpscRing.h"
 
 #include <pthread.h>
 #include <sched.h>

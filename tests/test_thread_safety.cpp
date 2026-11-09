@@ -3,7 +3,7 @@
 #include <vector>
 #include <atomic>
 #include <cassert>
-#include "../InMemoryStorage.h"
+#include "../src/InMemoryStorage.h"
 
 std::atomic<int> errors{0};   // reset at the start of each test
 int failed_tests = 0;           // across all tests — decides the exit code

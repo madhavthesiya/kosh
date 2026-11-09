@@ -23,8 +23,8 @@
 // Build: cmake --build build-bench --target eviction_sim
 // Run:   ./build-bench/eviction_sim zipf:0.99 csv:twitter_cluster52.csv
 
-#include "../InMemoryStorage.h"
-#include "../Router.h"
+#include "../src/InMemoryStorage.h"
+#include "../src/Router.h"
 
 #include <algorithm>
 #include <charconv>

@@ -8,7 +8,7 @@
 // Build: cmake --build build-bench --target insert_latency
 // Run:   ./build-bench/insert_latency [keys] [repeats]
 
-#include "../InMemoryStorage.h"
+#include "../src/InMemoryStorage.h"
 
 #include <algorithm>
 #include <chrono>

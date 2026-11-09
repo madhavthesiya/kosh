@@ -6,7 +6,7 @@
 //
 // Usage: memory_layout [keys]    (default 1000000)
 
-#include "../InMemoryStorage.h"
+#include "../src/InMemoryStorage.h"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
